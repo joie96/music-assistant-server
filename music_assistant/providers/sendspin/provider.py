@@ -92,9 +92,12 @@ from music_assistant.providers.sendspin.bridge_role import (
 from music_assistant.providers.sendspin.constants import (
     CONF_ALLOW_LEGACY_CLIENTS,
     CONF_MIN_PIN_LENGTH,
+    CONF_SENDSPIN_MAX_BUFFER_MS,
     CONF_SENDSPIN_STATIC_DELAY,
     CONF_VIRTUAL_PLAYER_OWNER,
+    DEFAULT_SENDSPIN_MAX_BUFFER_MS,
     DEFAULT_MIN_PIN_LENGTH,
+    MAX_SENDSPIN_MAX_BUFFER_MS,
     VIRTUAL_PLAYER_ID_PREFIX,
 )
 from music_assistant.providers.sendspin.helpers import (
@@ -402,6 +405,14 @@ class SendspinProvider(PlayerProvider):
         """Return Config entries to configure this provider."""
         return (
             CONF_ENTRY_MANUAL_DISCOVERY_IPS,
+            ConfigEntry(
+                key=CONF_SENDSPIN_MAX_BUFFER_MS,
+                type=ConfigEntryType.INTEGER,
+                default_value=DEFAULT_SENDSPIN_MAX_BUFFER_MS,
+                range=(1_000, MAX_SENDSPIN_MAX_BUFFER_MS),
+                required=False,
+                advanced=True,
+            ),
             ConfigEntry(
                 key=CONF_ALLOW_LEGACY_CLIENTS,
                 type=ConfigEntryType.BOOLEAN,

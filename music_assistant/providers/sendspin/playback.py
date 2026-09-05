@@ -29,6 +29,7 @@ from music_assistant.providers.sendspin.bridge_role import (
     BRIDGE_SAMPLE_RATE,
     BridgePlayerRole,
 )
+from music_assistant.providers.sendspin.constants import DEFAULT_SENDSPIN_MAX_BUFFER_MS
 
 if TYPE_CHECKING:
     from music_assistant.helpers.dsp import ComplexFilter
@@ -73,8 +74,8 @@ _LOSSY_MAX_SAMPLE_RATE = 48000
 _PRODUCER_SLICE_US = 100_000
 # Max pending chunks between producer and committer before the producer blocks.
 _PRODUCER_BACKLOG_SIZE = 64
-# Backpressure threshold: push stream sleeps when buffered audio exceeds this.
-_PRODUCER_BUFFER_LIMIT_US = 30_000_000
+# Default backpressure threshold: push stream sleeps when buffered audio exceeds this.
+_DEFAULT_PRODUCER_BUFFER_LIMIT_US = DEFAULT_SENDSPIN_MAX_BUFFER_MS * 1_000
 # Start join promotion once catchup processor lag is within this window of the history tail.
 _JOIN_PROMOTE_ARM_WINDOW_US = 2_000_000
 # Accept catchup output within this margin of the promotion target.
@@ -85,6 +86,21 @@ _JOIN_PROMOTION_TIMEOUT_S = 15.0
 # This pre-history also warms up ffmpeg's internal filter buffers so the DSP
 # output has settled by the time the member's channel goes live.
 _HISTORY_KEEP_PAST_US = 1_000_000
+
+
+def apply_sendspin_buffer_limit(player: SendspinPlayer, buffer_limit_us: int) -> None:
+    """Apply the runtime sendspin tracker limit to active player roles."""
+    clamped_limit_us = max(0, int(buffer_limit_us))
+    clients_by_id = {player.api.client_id: player.api}
+    for client in player.api.group.clients:
+        clients_by_id[client.client_id] = client
+    for client in clients_by_id.values():
+        for role in client.roles_by_family("player"):
+            if not isinstance(role, PlayerV1Role):
+                continue
+            tracker = role.get_buffer_tracker()
+            if tracker is not None:
+                tracker.max_duration_us = clamped_limit_us
 
 
 class _BufferedFfmpegProcessor:
@@ -331,9 +347,14 @@ class SendspinPlaybackSession:
     to the live pipeline without an audible gap.
     """
 
-    def __init__(self, player: SendspinPlayer) -> None:
+    def __init__(
+        self,
+        player: SendspinPlayer,
+        producer_buffer_limit_us: int = _DEFAULT_PRODUCER_BUFFER_LIMIT_US,
+    ) -> None:
         """Initialize session coordinator bound to the owning player."""
         self.player = player
+        self._producer_buffer_limit_us = max(0, int(producer_buffer_limit_us))
         self.playback_task: asyncio.Task[None] | None = None
         self.pending_join_members: set[str] = set()
         self._state_lock = asyncio.Lock()
@@ -359,6 +380,10 @@ class SendspinPlaybackSession:
         self._sendspin_pcm_format: SendspinAudioFormat = _DEFAULT_SENDSPIN_PCM_FORMAT
         self._queue_id: str | None = None
         self._queue_session_id: str | None = None
+
+    def set_producer_buffer_limit_us(self, value: int) -> None:
+        """Set producer/committer buffer limit for newly started sessions."""
+        self._producer_buffer_limit_us = max(0, int(value))
 
     def flow_track_anchor_us(self, track_start_offset_us: int) -> int | None:
         """
@@ -567,7 +592,9 @@ class SendspinPlaybackSession:
         processor = _BufferedFfmpegProcessor(ffmpeg_obj, self._pcm_format)
         await processor.start()
         # Bounded queue sized to hold the full buffer duration with some headroom.
-        queue_size = (_PRODUCER_BUFFER_LIMIT_US // _PRODUCER_SLICE_US) + _PRODUCER_BACKLOG_SIZE
+        queue_size = (
+            self._producer_buffer_limit_us // _PRODUCER_SLICE_US
+        ) + _PRODUCER_BACKLOG_SIZE
         input_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=queue_size)
 
         async with self._state_lock:
@@ -762,6 +789,7 @@ class SendspinPlaybackSession:
                 "Sendspin session PCM format: %d Hz / F32",
                 self._pcm_format.sample_rate,
             )
+            apply_sendspin_buffer_limit(self.player, self._producer_buffer_limit_us)
             push_stream = self._create_push_stream()
             push_stream.set_live_source(self._is_live_source(media))
             async with self._state_lock:
@@ -896,7 +924,7 @@ class SendspinPlaybackSession:
                     # Stream stopped since it was replaced by another stream
                     self.player.logger.debug("Stopping commit loop due to stopped push stream")
                     break
-                await push_stream.sleep_to_limit_buffer(_PRODUCER_BUFFER_LIMIT_US)
+                await push_stream.sleep_to_limit_buffer(self._producer_buffer_limit_us)
                 commit_now_us = push_stream.now_us()
                 committed_history_chunk = _HistoryChunk(
                     start_time_us=int(commit_start_us),
@@ -1443,7 +1471,7 @@ class SendspinPlaybackSession:
             return
         self.player.logger.debug("Waiting for client buffer drain before stream/end")
         # Safety timeout: never wait longer than the max buffer depth.
-        deadline = time.monotonic() + (_PRODUCER_BUFFER_LIMIT_US / 1_000_000)
+        deadline = time.monotonic() + (self._producer_buffer_limit_us / 1_000_000)
         while time.monotonic() < deadline:
             t0 = time.monotonic()
             await ps.sleep_to_limit_buffer(0)

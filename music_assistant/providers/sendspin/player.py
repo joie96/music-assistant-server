@@ -93,13 +93,16 @@ from .constants import (
     CONF_PAIRING_METHOD,
     CONF_PAIRING_PIN,
     CONF_PAIRING_TOKEN,
+    CONF_SENDSPIN_MAX_BUFFER_MS,
     CONF_SENDSPIN_STATIC_DELAY,
     CONF_SOURCE_APPROVAL_DISMISSED,
     CONF_SOURCE_AUTOSTART_TARGET,
     CONF_SOURCE_INPUT_ACTION,
     CONNECT_METHOD_PAIR,
     CONNECT_METHOD_UNPAIRED,
+    DEFAULT_SENDSPIN_MAX_BUFFER_MS,
     DEFAULT_SENDSPIN_STATIC_DELAY,
+    MAX_SENDSPIN_MAX_BUFFER_MS,
     PAIR_METHOD_DYNAMIC_PIN,
     PAIR_METHOD_PIN,
     PAIR_METHOD_STATIC_PIN,
@@ -1227,7 +1230,10 @@ class SendspinPlayer(SendspinBasePlayer):
         super().__init__(provider, player_id, initial_hello)
         self._attr_can_group_with = {provider.instance_id}
         hello_payload = initial_hello or self.api.info
-        self.playback_session = SendspinPlaybackSession(self)
+        self.playback_session = SendspinPlaybackSession(
+            self,
+            producer_buffer_limit_us=self._get_sendspin_max_buffer_us(),
+        )
         self._attr_supported_features = {
             PlayerFeature.PLAY_MEDIA,
             PlayerFeature.SET_MEMBERS,
@@ -1453,6 +1459,8 @@ class SendspinPlayer(SendspinBasePlayer):
         ):
             cast_app_ready = bridge.reset_cast_app_ready()
 
+        # Apply updated provider config only to newly started playback sessions.
+        self.playback_session.set_producer_buffer_limit_us(self._get_sendspin_max_buffer_us())
         await self.playback_session.start(media)
         self.update_state()
 
@@ -1510,7 +1518,10 @@ class SendspinPlayer(SendspinBasePlayer):
                         )
                         await self.playback_session.transfer_to(new_owner)
                         new_owner.playback_session = self.playback_session
-                        self.playback_session = SendspinPlaybackSession(self)
+                        self.playback_session = SendspinPlaybackSession(
+                            self,
+                            producer_buffer_limit_us=self._get_sendspin_max_buffer_us(),
+                        )
 
             await self.api.group.remove_client(member_player.api)
             # An explicit removal ends playback for that member; a bridge among
@@ -1929,6 +1940,19 @@ class SendspinPlayer(SendspinBasePlayer):
                 audio_format,
                 self.display_name,
             )
+
+    def _get_sendspin_max_buffer_us(self) -> int:
+        """Return configured sendspin max pre-buffer limit in microseconds."""
+        configured = self.provider.config.get_value(
+            CONF_SENDSPIN_MAX_BUFFER_MS,
+            DEFAULT_SENDSPIN_MAX_BUFFER_MS,
+        )
+        try:
+            buffer_ms = int(configured)
+        except TypeError, ValueError:
+            buffer_ms = DEFAULT_SENDSPIN_MAX_BUFFER_MS
+        buffer_ms = max(1_000, min(buffer_ms, MAX_SENDSPIN_MAX_BUFFER_MS))
+        return buffer_ms * 1_000
 
     async def _apply_static_delay(self) -> None:
         """Read config and send set_static_delay command if supported."""
