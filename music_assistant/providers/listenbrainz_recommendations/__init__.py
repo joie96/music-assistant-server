@@ -168,7 +168,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
             clear_persisted_state=is_removed,
         )
 
-    async def recommendations(self) -> list[RecommendationFolder]:
+    async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders."""
         return self._recommendation_folders
 
