@@ -9,7 +9,7 @@ import unicodedata
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType, ImageType, MediaType
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import (
@@ -63,82 +63,62 @@ async def setup(
     return ListenBrainzRecommendationsProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,  # noqa: ARG001
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """Return Config entries to setup this provider."""
-    values = values or {}
-    return (
-        ConfigEntry(
-            key=CONF_USERNAME,
-            type=ConfigEntryType.STRING,
-            label="ListenBrainz Username",
-            required=True,
-            value=values.get(CONF_USERNAME),
-            description="Needed to build your personalized ListenBrainz recommendations.",
-        ),
-        ConfigEntry(
-            key=CONF_AUTH_TOKEN,
-            type=ConfigEntryType.SECURE_STRING,
-            label="ListenBrainz User Token",
-            required=True,
-            value=values.get(CONF_AUTH_TOKEN),
-            description=(
-                "ListenBrainz API token used for authenticated endpoints such as LB-Radio."
-            ),
-        ),
-        ConfigEntry(
-            key=CONF_API_BASE_URL,
-            type=ConfigEntryType.STRING,
-            label="Base URL",
-            required=False,
-            value=values.get(CONF_API_BASE_URL) or DEFAULT_API_BASE_URL,
-            description="ListenBrainz API base URL.",
-            advanced=True,
-        ),
-        ConfigEntry(
-            key=CONF_LB_RADIO_POP_BEGIN,
-            type=ConfigEntryType.INTEGER,
-            label="LB-Radio Pop Begin",
-            required=True,
-            default_value=75,
-            value=values.get(CONF_LB_RADIO_POP_BEGIN),
-            description="Lower popularity bound for LB-Radio tag requests (0-100).",
-            advanced=True,
-        ),
-        ConfigEntry(
-            key=CONF_LB_RADIO_POP_END,
-            type=ConfigEntryType.INTEGER,
-            label="LB-Radio Pop End",
-            required=True,
-            default_value=100,
-            value=values.get(CONF_LB_RADIO_POP_END),
-            description="Upper popularity bound for LB-Radio tag requests (0-100).",
-            advanced=True,
-        ),
-        ConfigEntry(
-            key=CONF_LB_RADIO_MODE,
-            type=ConfigEntryType.STRING,
-            label="LB-Radio Mode",
-            required=True,
-            default_value="easy",
-            value=values.get(CONF_LB_RADIO_MODE),
-            options=[
-                ConfigValueOption("Easy", "easy"),
-                ConfigValueOption("Medium", "medium"),
-                ConfigValueOption("Hard", "hard"),
-            ],
-            description="Difficulty mode used for LB-Radio artist recommendations. Easy is likely going to create a playlist with familiar music, and a hard playlist may expose you to less familiar music.",
-            advanced=True,
-        ),
-    )
-
-
 class ListenBrainzRecommendationsProvider(MetadataProvider):
     """ListenBrainz recommendations provider."""
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return configuration entries for this provider."""
+        return (
+            ConfigEntry(
+                key=CONF_USERNAME,
+                type=ConfigEntryType.STRING,
+                label="ListenBrainz Username",
+                required=True,
+                description="Needed to build your personalized ListenBrainz recommendations.",
+            ),
+            ConfigEntry(
+                key=CONF_AUTH_TOKEN,
+                type=ConfigEntryType.SECURE_STRING,
+                label="ListenBrainz User Token",
+                required=True,
+                description=(
+                    "ListenBrainz API token used for authenticated endpoints such as LB-Radio."
+                ),
+            ),
+            ConfigEntry(
+                key=CONF_API_BASE_URL,
+                type=ConfigEntryType.STRING,
+                label="Base URL",
+                default_value=DEFAULT_API_BASE_URL,
+                advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_LB_RADIO_POP_BEGIN,
+                type=ConfigEntryType.INTEGER,
+                label="LB-Radio Pop Begin",
+                default_value=75,
+                advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_LB_RADIO_POP_END,
+                type=ConfigEntryType.INTEGER,
+                label="LB-Radio Pop End",
+                default_value=100,
+                advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_LB_RADIO_MODE,
+                type=ConfigEntryType.STRING,
+                label="LB-Radio Mode",
+                default_value="easy",
+                options=[
+                    ConfigValueOption("Easy", "easy"),
+                    ConfigValueOption("Medium", "medium"),
+                    ConfigValueOption("Hard", "hard"),
+                ],
+                advanced=True,
+            ),
+        )
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -171,6 +151,16 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders."""
         return self._recommendation_folders
+
+    async def get_recommendation_items(self, item_id: str) -> UniqueList:
+        """Return the items in a recommendation folder.
+
+        :param item_id: Identifier of the recommendation folder.
+        """
+        for folder in self._recommendation_folders:
+            if folder.item_id == item_id:
+                return folder.items
+        return UniqueList()
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Return prebuilt playlist object for virtual playlists."""
