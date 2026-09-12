@@ -1,0 +1,12 @@
+{
+  "type": "metadata",
+  "domain": "listenbrainz_recommendations",
+  "stage": "experimental",
+  "name": "ListenBrainz Recommendations",
+  "description": "Builds personalized ListenBrainz recommendation folders (genre, artist and LB-Radio based) and resolves them against your active music providers.",
+  "codeowners": ["@music-assistant"],
+  "documentation": "https://music-assistant.io/music-providers/listenbrainz_recommendations/",
+  "multi_instance": true,
+  "builtin": false,
+  "requirements": []
+}
