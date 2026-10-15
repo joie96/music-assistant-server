@@ -84,7 +84,13 @@ class MashinPlayer(Player):
         )
         stage = "capture"
         try:
-            context = session.adapter.capture(media)
+            current = session.current
+            generation = session.generation
+            if current is None:
+                raise PlayerCommandFailed("No current stream for MA successor")
+            context = await session.adapter.capture_next(media, current.context)
+            if session.current is not current or session.generation != generation:
+                raise PlayerCommandFailed("Playback changed while resolving successor")
             self.logger.log(
                 VERBOSE_LOG_LEVEL,
                 "Next-track captured player=%s item=%s seek_seconds=%s duration=%s",

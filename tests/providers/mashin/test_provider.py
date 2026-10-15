@@ -26,7 +26,7 @@ from music_assistant_models.enums import (
     ProviderType,
     VolumeNormalizationMode,
 )
-from music_assistant_models.errors import AudioError
+from music_assistant_models.errors import AudioError, PlayerCommandFailed
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.provider import ProviderManifest
 
@@ -45,6 +45,9 @@ from music_assistant.providers.mashin.wire import ProtocolViolation
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+
+    from music_assistant_models.player import PlayerMedia
+    from music_assistant_models.queue_item import QueueItem
 
     from music_assistant.providers.mashin.adapter import MAAdapter, PlaybackContext
     from music_assistant.providers.mashin.provider import MashinDevice, MashinProvider
@@ -633,6 +636,91 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         self.mass.streams.audio.get_stream_details.assert_not_called()
         self.mass.streams.audio.get_audio_buffer.assert_not_called()
 
+    async def test_next_context_resolves_only_missing_details(self) -> None:
+        """A newly enqueued successor gains details without starting PCM production."""
+        for details_present in (False, True):
+            with self.subTest(details_present=details_present):
+                adapter, media, current = self._next_context(details_present=details_present)
+                context = await adapter.capture_next(media, current)
+                queues = self.mass.player_queues
+                assert context.item is queues.get_next_item.return_value
+                assert context.queue_item_id == "next_item"
+                assert context.seek_seconds == 0
+                if details_present:
+                    queues.load_next_queue_item.assert_not_awaited()
+                else:
+                    queues.load_next_queue_item.assert_awaited_once_with(
+                        "mashin_test", "current_item"
+                    )
+                self.mass.streams.audio.get_audio_buffer.assert_not_called()
+                self.mass.streams.audio.get_queue_item_stream.assert_not_called()
+
+    async def test_next_context_rejects_changed_session_during_resolution(self) -> None:
+        """Resolved details from an earlier queue session cannot authorize B."""
+        adapter, media, current = self._next_context()
+        queues = self.mass.player_queues
+
+        async def resolve(_queue_id: str, _current_item_id: str) -> QueueItem:
+            queues.queue_data_or_none.return_value.session_id = "replacement"
+            return cast("QueueItem", queues.get_next_item.return_value)
+
+        queues.load_next_queue_item.side_effect = resolve
+        with pytest.raises(ProtocolViolation, match="MA successor changed"):
+            await adapter.capture_next(media, current)
+
+    async def test_next_context_rejects_changed_successor_during_resolution(self) -> None:
+        """A queue edit during details loading invalidates the original successor."""
+        adapter, media, current = self._next_context()
+        queues = self.mass.player_queues
+
+        async def resolve(_queue_id: str, _current_item_id: str) -> QueueItem:
+            requested = queues.get_next_item.return_value
+            queues.get_next_item.return_value = Mock(queue_item_id="replacement")
+            return cast("QueueItem", requested)
+
+        queues.load_next_queue_item.side_effect = resolve
+        with pytest.raises(ProtocolViolation, match="MA successor changed"):
+            await adapter.capture_next(media, current)
+
+    async def test_next_context_rejects_substituted_or_unauthorized_successor(self) -> None:
+        """Skipped items never silently reuse the requested B identity."""
+        adapter, media, current = self._next_context()
+        queues = self.mass.player_queues
+        queues.load_next_queue_item.return_value = Mock(queue_item_id="different_item")
+        queues.load_next_queue_item.side_effect = None
+        with pytest.raises(ProtocolViolation, match="MA selected a different successor"):
+            await adapter.capture_next(media, current)
+        queues.load_next_queue_item.reset_mock()
+        media.queue_item_id = "unauthorized_item"
+        with pytest.raises(ProtocolViolation, match="Not the authorized MA successor"):
+            await adapter.capture_next(media, current)
+        queues.load_next_queue_item.assert_not_awaited()
+
+    async def test_enqueue_rejects_playback_change_during_details_resolution(self) -> None:
+        """A reset or stream replacement cannot send prepare_next after an await."""
+        device = await self._device("desktop")
+        session = device.session
+        for mutation in ("current", "generation"):
+            with self.subTest(mutation=mutation):
+
+                async def resolve(
+                    _media: PlayerMedia, _current: PlaybackContext, *, change: str = mutation
+                ) -> PlaybackContext:
+                    if change == "current":
+                        session.current = None
+                    else:
+                        session.generation += 1
+                    return cast("PlaybackContext", Mock())
+
+                with (
+                    patch.object(session, "current", Mock()),
+                    patch.object(session.adapter, "capture_next", AsyncMock(side_effect=resolve)),
+                    patch.object(session, "prepare", AsyncMock()) as prepare,
+                    pytest.raises(PlayerCommandFailed, match="Playback changed"),
+                ):
+                    await device.player.enqueue_next_media(Mock())
+                prepare.assert_not_awaited()
+
     async def test_pcm_source_uses_provider_pacing_without_repair_burst(self) -> None:
         """FFmpeg uses the Mashin budget and never grants a new repair burst."""
         module = importlib.import_module("music_assistant.providers.mashin.adapter")
@@ -824,6 +912,58 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         assert await source.read(8) == bytes(8)
         assert await source.read(8) == b""
         process.wait_with_timeout.assert_awaited_once_with(5)
+
+    def _next_context(
+        self, *, details_present: bool = False
+    ) -> tuple[MAAdapter, PlayerMedia, PlaybackContext]:
+        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        player = Mock(player_id="mashin_test")
+        player.state.group_members = []
+        adapter = module.MAAdapter(self.mass, player)
+        media = Mock(source_id="mashin_test", queue_item_id="next_item", queue_session_id="session")
+        current = module.PlaybackContext(
+            Mock(),
+            "mashin_test",
+            "current_item",
+            "session",
+            0,
+            Mock(available=True),
+            ("test", "current", "pcm", 48000, 32, 2, "", "", 300),
+        )
+        details = SimpleNamespace(
+            seek_position=0,
+            provider="test",
+            item_id="next",
+            audio_format=AudioFormat(
+                content_type=ContentType.PCM_F32LE, sample_rate=48000, channels=2
+            ),
+        )
+        item = Mock(
+            queue_item_id="next_item",
+            streamdetails=details if details_present else None,
+            media_type=MediaType.TRACK,
+            duration=201,
+            available=True,
+            extra_attributes={},
+            media_item=None,
+        )
+        queues = self.mass.player_queues
+        queues.queue_data_or_none.return_value = SimpleNamespace(
+            session_id="session", queue=SimpleNamespace(flow_mode=False)
+        )
+        queues.get_item.side_effect = lambda _queue_id, item_id: (
+            current.item if item_id == "current_item" else item
+        )
+        queues.get_next_item.return_value = item
+
+        async def resolve(_queue_id: str, _current_item_id: str) -> QueueItem:
+            item.streamdetails = details
+            return cast("QueueItem", item)
+
+        queues.load_next_queue_item = AsyncMock(side_effect=resolve)
+        self.mass.streams.get_crossfade_mode.return_value = CrossfadeMode.DISABLED
+        self.enterContext(patch.object(module, "overlay_active", return_value=False))
+        return cast("MAAdapter", adapter), cast("PlayerMedia", media), current
 
     async def _device(self, device_id: str) -> MashinDevice:
         device = await self.provider.registry.register(device_id, device_id)

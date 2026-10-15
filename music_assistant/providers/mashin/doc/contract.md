@@ -161,6 +161,13 @@ Command-Rueckkopplung.
 Player.enqueue_next_media registriert nur den echten MA-Nachfolger. Queueevents
 invalidieren B bei Remove/Replace/Shuffle/Repeat-Aenderung oder fehlendem Next;
 MA sendet nicht zwingend enqueue(null). Identischer Enqueue ist idempotent.
+Fehlen dessen StreamDetails, diese ueber MA load_next_queue_item aufloesen,
+ohne dabei im Mashin-Adapter einen PCM-Bezug oder eine Chunkproduktion zu starten.
+Vor dem Aufloesen Queue-Session und echten Nachfolger pruefen; danach dieselbe
+Session, denselben aktuellen Stream und denselben Nachfolger erneut validieren.
+Ein von MA uebersprungener oder ersetzter Titel darf nicht unter der angefragten
+B-Identitaet registriert werden. Den Seekursprung nach dem Aufloesen einmalig
+im Produktionskontext sichern; alle Audiofreigabebarrieren bleiben bestehen.
 
 Module nach Verantwortung: Registry/Lifecycle, Playeradapter, MA-PCM-/Pacingadapter,
 Chunkencoder/Lieferpuffer, Control-/Audiotransport und typisierte Wiremodelle.

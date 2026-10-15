@@ -12,7 +12,7 @@ from music_assistant_models.enums import (
     MediaType,
     VolumeNormalizationMode,
 )
-from music_assistant_models.errors import AudioError, LoginFailed, MediaNotFoundError
+from music_assistant_models.errors import AudioError, LoginFailed, MediaNotFoundError, QueueEmpty
 from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
@@ -131,6 +131,56 @@ class MAAdapter:
             item,
             self.source_identity(item),
         )
+
+    async def capture_next(self, media: PlayerMedia, current: PlaybackContext) -> PlaybackContext:
+        """Resolve missing details for the authorized MA successor and capture its context."""
+        if (
+            media.source_id != self.player.player_id
+            or media.source_id != current.queue_id
+            or media.queue_session_id != current.session_id
+            or not self.valid(current)
+        ):
+            raise ProtocolViolation("stale_playback", "Not the current MA queue session")
+        item = self.mass.player_queues.get_next_item(current.queue_id, current.queue_item_id)
+        if (
+            item is None
+            or item.queue_item_id != media.queue_item_id
+            or item.media_type != MediaType.TRACK
+            or not item.available
+        ):
+            raise ProtocolViolation("stale_playback", "Not the authorized MA successor")
+        if item.streamdetails is None:
+            self.player.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Next-track resolving details player=%s item=%s current_item=%s",
+                self.player.player_id,
+                item.queue_item_id,
+                current.queue_item_id,
+            )
+            try:
+                resolved = await self.mass.player_queues.load_next_queue_item(
+                    current.queue_id, current.queue_item_id
+                )
+            except QueueEmpty as err:
+                raise ProtocolViolation("media_unsupported", "No playable MA successor") from err
+            self.player.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Next-track details resolved player=%s requested_item=%s resolved_item=%s",
+                self.player.player_id,
+                item.queue_item_id,
+                resolved.queue_item_id,
+            )
+            if resolved is not item:
+                raise ProtocolViolation("stale_playback", "MA selected a different successor")
+        if (
+            not self.valid(current)
+            or self.mass.player_queues.get_next_item(current.queue_id, current.queue_item_id)
+            is not item
+        ):
+            raise ProtocolViolation(
+                "stale_playback", "MA successor changed while resolving details"
+            )
+        return self.capture(media)
 
     def valid(self, context: PlaybackContext, *, successor_of: str | None = None) -> bool:
         """Revalidate the captured session and optional actual MA successor."""
