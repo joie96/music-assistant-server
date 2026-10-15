@@ -105,6 +105,29 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             )
         assert len(self.provider.sockets) == 1
 
+    async def test_setup_uses_cached_build_revision_or_server_version(self) -> None:
+        """Setup does not require the optional build-info helper on older server bases."""
+        self.mass.version = "2.17.0"
+        for build, expected in (({"revision": "abc123"}, "abc123"), (None, "2.17.0")):
+            with self.subTest(build=build):
+                self.mass.build_info = build
+                with (
+                    patch(
+                        "music_assistant.providers.mashin.provider.check_ffmpeg_version",
+                        AsyncMock(),
+                    ),
+                    patch.object(self.provider, "get_setup_value", return_value=None),
+                ):
+                    await self.provider.handle_async_init()
+                assert self.provider.server_revision == expected
+        del self.mass.build_info
+        with (
+            patch("music_assistant.providers.mashin.provider.check_ffmpeg_version", AsyncMock()),
+            patch.object(self.provider, "get_setup_value", return_value=None),
+        ):
+            await self.provider.handle_async_init()
+        assert self.provider.server_revision == "2.17.0"
+
     async def test_each_client_gets_its_own_player_and_device_info(self) -> None:
         """Shared provider ownership does not imply shared player or transport state."""
         first, second = await self._device("desktop"), await self._device("phone")

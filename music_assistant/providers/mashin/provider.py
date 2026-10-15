@@ -15,7 +15,6 @@ from aiohttp import WSMsgType, web
 from music_assistant_models.enums import EventType
 from music_assistant_models.errors import SetupFailedError
 
-from music_assistant.helpers.build_info import get_official_build_info
 from music_assistant.helpers.ffmpeg import check_ffmpeg_version
 from music_assistant.models.player_provider import PlayerProvider
 
@@ -59,7 +58,7 @@ class MashinProvider(PlayerProvider):
         if self.max_sockets < 2:
             raise SetupFailedError("Invalid Mashin WebSocket admission limit")
         await check_ffmpeg_version()
-        build = await get_official_build_info()
+        build = getattr(self.mass, "build_info", None)
         self.server_revision = (
             build["revision"] if build and build.get("revision") else self.mass.version
         )
