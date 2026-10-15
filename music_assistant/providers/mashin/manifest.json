@@ -1,0 +1,11 @@
+{
+  "type": "player",
+  "domain": "mashin",
+  "name": "Mashin",
+  "description": "Authenticated playback for multiple independent Mashin clients.",
+  "codeowners": ["@ericb"],
+  "requirements": ["scipy==1.18.1"],
+  "multi_instance": false,
+  "builtin": false,
+  "icon": "mdi-speaker"
+}

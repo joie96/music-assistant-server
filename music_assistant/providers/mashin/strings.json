@@ -1,0 +1,23 @@
+{
+  "manifest": {
+    "description": "Authenticated playback for multiple independent Mashin clients."
+  },
+  "config_entries": {
+    "max_registered_devices": {
+      "label": "Maximum registered devices",
+      "description": "Provider-wide admission limit for new device identities. Existing devices can reconnect even above this limit."
+    },
+    "max_devices_per_user": {
+      "label": "Maximum devices per user",
+      "description": "Admission limit for new device identities belonging to one MA user. Existing ownership records are preserved."
+    },
+    "max_websocket_connections": {
+      "label": "Maximum WebSocket connections",
+      "description": "Provider-wide limit including Control, Audio and handshakes. Allow room for reconnecting clients."
+    },
+    "tls_proxy_ip": {
+      "label": "Trusted TLS proxy IP",
+      "description": "Optional exact socket IP of a trusted TLS reverse proxy. Only this peer may attest HTTPS via X-Forwarded-Proto."
+    }
+  }
+}
