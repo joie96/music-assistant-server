@@ -15,6 +15,7 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import AudioError, LoginFailed, MediaNotFoundError
 from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.controllers.streams.audio import overlay_active
 from music_assistant.helpers.ffmpeg import FFMpeg
 
@@ -55,6 +56,15 @@ class MAAdapter:
     def capture(self, media: PlayerMedia) -> PlaybackContext:
         """Validate real queue media and capture its seek context before any await."""
         if not media.source_id or not media.queue_item_id or not media.queue_session_id:
+            self.player.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Queue media capture rejected player=%s reason=missing_queue_identity "
+                "source_present=%s item_present=%s session_present=%s",
+                self.player.player_id,
+                bool(media.source_id),
+                bool(media.queue_item_id),
+                bool(media.queue_session_id),
+            )
             raise ProtocolViolation(
                 "media_unsupported", "Only authorized MA queue tracks are supported"
             )
@@ -75,9 +85,42 @@ class MAAdapter:
             or overlay_active(data.queue)
             or item.extra_attributes.get("playback_speed", 1.0) != 1.0
         ):
+            if self.player.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
+                self.player.logger.log(
+                    VERBOSE_LOG_LEVEL,
+                    "Queue media capture rejected player=%s queue=%s item=%s "
+                    "queue_present=%s session_matches=%s flow_mode=%s item_present=%s "
+                    "details_present=%s media_type=%s duration=%s available=%s "
+                    "grouped=%s source_matches_player=%s crossfade=%s overlay=%s speed=%s",
+                    self.player.player_id,
+                    media.source_id,
+                    media.queue_item_id,
+                    data is not None,
+                    data is not None and data.session_id == media.queue_session_id,
+                    data.queue.flow_mode if data is not None else None,
+                    item is not None,
+                    item is not None and item.streamdetails is not None,
+                    item.media_type if item is not None else None,
+                    item.duration if item is not None else None,
+                    item.available if item is not None else None,
+                    bool(self.player.state.group_members),
+                    media.source_id == self.player.player_id,
+                    self.mass.streams.get_crossfade_mode(data.queue) if data is not None else None,
+                    overlay_active(data.queue) if data is not None else None,
+                    item.extra_attributes.get("playback_speed", 1.0) if item is not None else None,
+                )
             raise ProtocolViolation("media_unsupported", "Unsupported playback or stale MA context")
         seek = item.streamdetails.seek_position
         if int(seek) != seek or seek < 0:
+            self.player.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Queue media capture rejected player=%s queue=%s item=%s "
+                "reason=invalid_seek seek_seconds=%s",
+                self.player.player_id,
+                media.source_id,
+                media.queue_item_id,
+                seek,
+            )
             raise ProtocolViolation("media_unsupported", "V1 requires a whole-second source seek")
         return PlaybackContext(
             media,

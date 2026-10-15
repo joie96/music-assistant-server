@@ -9,6 +9,7 @@ from music_assistant_models.enums import IdentifierType, PlaybackState, PlayerFe
 from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.player import DeviceInfo
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.models.player import Player
 
 from .wire import ProtocolViolation, integer
@@ -71,11 +72,45 @@ class MashinPlayer(Player):
 
     async def enqueue_next_media(self, media: PlayerMedia) -> None:
         """Register the actual MA successor without opening its source."""
+        session = self.mashin.session
+        self.logger.log(
+            VERBOSE_LOG_LEVEL,
+            "Next-track requested player=%s queue=%s item=%s current_item=%s next_item=%s",
+            self.player_id,
+            media.source_id,
+            media.queue_item_id,
+            session.current.context.queue_item_id if session.current is not None else None,
+            session.next.context.queue_item_id if session.next is not None else None,
+        )
+        stage = "capture"
         try:
-            context = self.mashin.session.adapter.capture(media)
-            await self.mashin.session.prepare(context)
+            context = session.adapter.capture(media)
+            self.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Next-track captured player=%s item=%s seek_seconds=%s duration=%s",
+                self.player_id,
+                context.queue_item_id,
+                context.seek_seconds,
+                context.item.duration,
+            )
+            stage = "prepare"
+            await session.prepare(context)
         except ProtocolViolation as err:
+            self.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Next-track rejected player=%s item=%s stage=%s reason=%s",
+                self.player_id,
+                media.queue_item_id,
+                stage,
+                str(err),
+            )
             raise PlayerCommandFailed(str(err)) from err
+        self.logger.log(
+            VERBOSE_LOG_LEVEL,
+            "Next-track prepare completed player=%s item=%s",
+            self.player_id,
+            context.queue_item_id,
+        )
 
     async def play(self) -> None:
         """Resume the current authorized stream without replacing it."""

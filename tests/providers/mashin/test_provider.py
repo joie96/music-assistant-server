@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 import sys
 import unittest
 from dataclasses import asdict
@@ -18,7 +19,9 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from music_assistant_models.config_entries import PlayerConfig, ProviderConfig
 from music_assistant_models.enums import (
     ContentType,
+    CrossfadeMode,
     IdentifierType,
+    MediaType,
     PlayerFeature,
     ProviderType,
     VolumeNormalizationMode,
@@ -579,6 +582,56 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 if device.cleanup_task is not None:
                     await asyncio.wait_for(device.cleanup_task, 1)
         self.mass.players.unregister.assert_awaited_once_with(device.player.player_id)
+
+    async def test_capture_verbose_identifies_rejected_queue_context(self) -> None:
+        """Rejected contexts log discriminating fields without exposing source URLs."""
+        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        player = Mock(player_id="mashin_test")
+        player.state.group_members = []
+        player.logger = logging.getLogger("mashin.test.capture")
+        adapter = module.MAAdapter(self.mass, player)
+        media = Mock(source_id="mashin_test", queue_item_id="next_item", queue_session_id="session")
+        self.mass.streams.get_crossfade_mode.return_value = CrossfadeMode.DISABLED
+        for condition, expected in (
+            ("details", "details_present=False"),
+            ("session", "session_matches=False"),
+            ("duration", "duration=0"),
+            ("flow", "flow_mode=True"),
+            ("missing_item", "item_present=False"),
+        ):
+            with self.subTest(condition=condition):
+                data = SimpleNamespace(session_id="session", queue=SimpleNamespace(flow_mode=False))
+                item = SimpleNamespace(
+                    streamdetails=None if condition == "details" else Mock(),
+                    media_type=MediaType.TRACK,
+                    duration=0 if condition == "duration" else 300,
+                    available=True,
+                    extra_attributes={},
+                    uri="https://example.invalid/private-audio?token=not-for-logs",
+                )
+                if condition == "session":
+                    data.session_id = "other"
+                if condition == "flow":
+                    data.queue.flow_mode = True
+                self.mass.player_queues.queue_data_or_none.return_value = data
+                self.mass.player_queues.get_item.return_value = (
+                    None if condition == "missing_item" else item
+                )
+                with (
+                    patch.object(module, "overlay_active", return_value=False),
+                    self.assertLogs(player.logger, level=5) as captured,
+                    pytest.raises(
+                        ProtocolViolation, match="Unsupported playback or stale MA context"
+                    ),
+                ):
+                    adapter.capture(media)
+                output = "\n".join(captured.output)
+                assert expected in output
+                assert "item=next_item" in output
+                assert item.uri not in output
+                assert "not-for-logs" not in output
+        self.mass.streams.audio.get_stream_details.assert_not_called()
+        self.mass.streams.audio.get_audio_buffer.assert_not_called()
 
     async def test_pcm_source_uses_provider_pacing_without_repair_burst(self) -> None:
         """FFmpeg uses the Mashin budget and never grants a new repair burst."""

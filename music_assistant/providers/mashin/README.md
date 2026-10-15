@@ -68,7 +68,9 @@ an inaudible transition.
 
 Use MA's standard provider log-level setting. DEBUG covers connection and playback
 diagnostics; VERBOSE (level 5) adds command/ACK identifiers and rate-limited transport
-summaries. Failures and prolonged sends produce warnings. Tokens, bindings, source
+summaries, next-track handover stages, and rejected queue-context fields (including
+stream-details presence, session match, duration and playback restrictions).
+Failures and prolonged sends produce warnings. Tokens, bindings, source
 URLs and audio payloads are not logged.
 
 ## Verification
