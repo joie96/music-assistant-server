@@ -309,10 +309,10 @@ class MashinDevice:
                             encode_message(kind, str(uuid4()), self.session.epoch, payload)
                         )
 
+                self.player.connected(True)
                 welcome = await self.session.connect(hello, send, self.provider.server_revision)
                 await send("welcome", welcome)
                 self._spawn(self.session.after_welcome())
-                self.player.connected(True)
             epoch = self.session.epoch
             worker = self._spawn(self._reports(socket, queue))
             pinger = self._spawn(self._pings(request, socket, expected, pong))

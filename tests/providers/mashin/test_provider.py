@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
     from music_assistant.providers.mashin.adapter import MAAdapter, PlaybackContext
     from music_assistant.providers.mashin.provider import MashinDevice, MashinProvider
+    from music_assistant.providers.mashin.session import SendControl
 
 
 class TestProvider(unittest.IsolatedAsyncioTestCase):
@@ -213,6 +214,64 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 ready = await asyncio.wait_for(audio.receive_json(), 1)
                 assert ready["type"] == "audio_ready"
                 assert self.provider.registry.devices["desktop"].session.buffer.ready
+
+    async def test_restart_reconciles_idle_state_with_available_player(self) -> None:
+        """A new client process can stop stale MA playback before receiving welcome."""
+        device = await self._device("desktop")
+        device.player.connected(False)
+        observed: list[bool] = []
+        connect = device.session.connect
+
+        async def reconcile(hello: Hello, send: SendControl, revision: str) -> Welcome:
+            observed.append(device.player.available)
+            await device._local_stop()
+            return await connect(hello, send, revision)
+
+        async def stop(player_id: str) -> None:
+            assert player_id == device.player.player_id
+            assert device.player.available
+
+        self.mass.player_queues.stop.side_effect = stop
+        app = web.Application()
+        app.router.add_get("/mashin/v1/control", self.provider._control_route)
+        with patch.object(device.session, "connect", side_effect=reconcile):
+            async with (
+                TestClient(TestServer(app)) as client,
+                client.ws_connect("/mashin/v1/control") as control,
+            ):
+                await control.send_json(
+                    {
+                        "protocol_version": 1,
+                        "type": "hello",
+                        "message_id": str(uuid4()),
+                        "connection_epoch": None,
+                        "payload": {
+                            "device_id": "desktop",
+                            "client_name": "Desktop",
+                            "client_version": "0.1.0",
+                            "resume_state": {
+                                "current_stream_id": None,
+                                "output_revision": 0,
+                                "output_state": "idle",
+                                "position_frame": 0,
+                                "volume_percent": 100,
+                                "is_muted": False,
+                                "next_revision": 0,
+                                "received_streams": [],
+                            },
+                            "capabilities": asdict(
+                                ClientCapabilities(
+                                    list(AudioProfileId), [48000], [16], 2, True, True, True
+                                )
+                            ),
+                            "audio_profile": "flac",
+                        },
+                    }
+                )
+                response = await asyncio.wait_for(control.receive_json(), 1)
+                assert response["type"] == "welcome"
+                assert observed == [True]
+                self.mass.player_queues.stop.assert_awaited_once_with(device.player.player_id)
 
     async def test_fallback_uses_own_queue_without_user_scopes(self) -> None:
         """LAN recovery can seek its player while retaining the requested pause."""
