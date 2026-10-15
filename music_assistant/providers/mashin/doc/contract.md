@@ -829,7 +829,8 @@ Client wartet ab hello-Sendebeginn hoechstens welcome_timeout_seconds auf ein
 gueltiges welcome. Provider begrenzt seine Handshake-/Reconciliationarbeit ab
 Empfang des gueltigen hello auf dieselbe Frist. Bei Timeout Control samt altem
 Audio sperren/schliessen und mit Backoff neu verbinden; keinen Sollzustand
-anwenden. Eine bereits laufende Controlverlust-Grace nicht neu beginnen.
+anwenden. Gueltigen Clientvorrat weiter ausgeben; weder Cache noch Reconnect-
+Backoff allein wegen des Antworttimeouts zuruecksetzen.
 hello-Wiederholung oder sonstige Frames setzen diese Frist nicht zurueck;
 verspaetetes welcome einer geschlossenen Verbindung ignorieren. Client kennt
 die feste V1-Frist bereits vor welcome.limits; kein zirkulaerer Handshake.
@@ -1743,16 +1744,24 @@ ACK/Sender/Pufferfreigabe unter eindeutiger Koordination; Pins nur fuer laufende
 Sendebloecke und vor ACK-Freigabe deren Ownership beachten. Keine Use-after-free.
 
 Bei reinem Audioverlust gueltigen Clientvorrat ausgeben und Audio neu binden.
-Clientseitige Controlverlustfeststellung gemaess Abschnitt 6 startet genau einmal
-die 30-s-Grace: bei fehlendem passenden Pong mit Ablauf seiner 15-s-Frist, bei
-Close oder Socketfehler sofort. Monotone Zeit verwenden; verspaetete Frames,
-alte Timer und Reconnectversuche setzen Beginn oder Dauer nicht zurueck.
+Clientseitige Controlverlustfeststellung gemaess Abschnitt 6 startet sofort
+Reconnect mit Backoff: bei fehlendem passenden Pong mit Ablauf seiner 15-s-Frist,
+bei Close oder Socketfehler sofort. Der gueltige, bereits empfangene und
+freigegebene Clientvorrat darf ohne zeitliches Offline-Limit vollstaendig
+ausgegeben werden. Verbindungsverlust und erfolglose Reconnectversuche loesen
+weder Pause noch Stop oder Cache-Loeschung aus. Backoff 0.5/1/2/4/8 s mit Jitter;
+nach Erreichen der Obergrenze bei 8 s bleiben und erst nach erfolgreich
+wiederhergestellter Verbindung zuruecksetzen, nicht nach Ablauf einer Offlinezeit.
 Bei Controlverlust bleiben lokale Pause, Stop, Lautstaerke und Mute jederzeit
 bedienbar und benoetigen keine Netzwerkbestaetigung. Lokales Play nur fuer den
-bereits freigegebenen aktuellen Stream mit nutzbarem Cache innerhalb der bestehenden
-Grace; keine neuen lokalen Seeks/B-Promotion/Freigaben. A hoechstens waehrend
-Grace ausgeben, danach pausieren, nicht loeschen; lokale Bedienung verlaengert
-die Grace nicht. Ein ausdruecklicher lokaler Stop verwirft dagegen den lokalen Cache.
+bereits freigegebenen aktuellen Stream mit nutzbarem Cache; keine neuen lokalen
+Seeks oder Freigaben. Nach regulaerem hoerbarem A-Ende darf ein bereits
+freigegebener und gecachter Nachfolger B lokal promoviert und ausgegeben werden.
+Kein neuer Inhalt oder weiterer Nachfolger ohne MA-Freigabe. Ausgabeende und
+Promotion unabhaengig von Reconnectversuchen lokal verfolgen und beim naechsten
+Handshake abstimmen. Ohne finalen Chunk ist Cache-Unterlauf kein regulaeres
+Trackende und erlaubt keine Promotion; Position einfrieren und auf neue Daten
+warten. Ein ausdruecklicher lokaler Stop verwirft dagegen den lokalen Cache.
 
 Beim Control-Reconnect den aktuellen Istzustand einschliesslich offline angewendeter
 Aenderungen in ClientResumeState melden und nach der Abstimmung frisch mit
@@ -1840,7 +1849,7 @@ kein Ruecksetzen von Empfangscursor oder Lieferfreigaben. Provider erhaelt playe
 eine Positionsmeldung darf niemals Quellenbeschaffung ausloesen. Provider prueft
 aktuellen Kontext und aktualisiert Playerposition. Stop/Queuewechsel/Rechteentzug
 gewinnen gegen einen optimistischen lokalen Sprung; stale Ausgabe stoppen.
-Pause bleibt Pause. Kein lokaler Seek bei verlorenem Control/abgelaufener Grace.
+Pause bleibt Pause. Kein lokaler Seek bei verlorenem Control.
 
 Beispiel: 48 kHz, Streamanker 0, Ausgabe 30 s, Ziel 40 s. Chunk 41 bei 1000-ms-
 Chunks beginnt bei first_frame=1920000; Position nach Seek 1920000, Revision 1.
@@ -2082,8 +2091,10 @@ sind feste V1-Konstanten und muessen exakt dem Tabellenwert entsprechen,
 einschliesslich Chunkdauer, Opus-Vorlaufmaximum, Mengen und saemtlicher Fristen.
 Ein Maximum bleibt eine Obergrenze der Arbeit, sein Wirewert ist dennoch fest.
 Insbesondere keine Konfiguration fuer zwei ausstehende Chunks, weitere Decoder,
-andere Chunkdauer oder verlaengerte Grace. welcome.limits handelt diese Werte
+andere Chunkdauer. welcome.limits handelt diese Werte
 nicht aus; beide Implementierungen kennen sie bereits vor dem Handshake.
+reconnect_grace_seconds und disconnected_source_retention_seconds bleiben
+reservierte Legacy-Wire-Felder mit unveraendertem Wert, keine aktiven Timer.
 
 Nur max_server_buffer_metadata_bytes, max_server_pending_audio_bytes und
 max_control_message_bytes sind konfigurierbare Schutzbudgets: positive Integer
@@ -2124,7 +2135,7 @@ Bytebudgets sind Schutzvorgaben, kein Nachweis eines tatsaechlichen Speicherbeda
 | max_retained_streams_per_player | 2 | Client darf Codecchunks fuer A und den freigegebenen B halten. Zwei Cachekontexte bedeuten nicht zwei aktive Decoder; beide teilen das lokale Clientbudget. |
 | max_stream_tombstones_per_player | 32 | Kleine Abschlusskontexte alter Streams fuer idempotente Behandlung spaeter/doppelter Meldungen. Keine Audiobytes und keine Voraussetzung fuer B-Start; zaehlen zum Metadatenbudget. |
 | hello_timeout_seconds | 5 s | Frist ab Control-Verbindungsaufbau fuer hello. Ohne gueltigen Handshake keine angenommene Controlsession und keine Audiofreigabe. |
-| welcome_timeout_seconds | 30 s | Feste Clientfrist ab hello-Sendebeginn fuer gueltiges welcome; Providerfrist ab Empfang des gueltigen hello fuer Handshake/Reconciliation und Antwort. Timeout schliesst Control, keine neue Grace oder automatische Wiedergabe. Bereits vor welcome bekannt. |
+| welcome_timeout_seconds | 30 s | Feste Clientfrist ab hello-Sendebeginn fuer gueltiges welcome; Providerfrist ab Empfang des gueltigen hello fuer Handshake/Reconciliation und Antwort. Timeout schliesst Control; kein Autoplay, Cache-Verwurf oder Backoff-Reset allein deshalb. Bereits vor welcome bekannt. |
 | audio_binding_response_timeout_seconds | 5 s | Frist ab erstem audio_reconnect_request-Sendebeginn fuer die zugeordnete audio_binding; Provider antwortet innerhalb derselben Frist ab Empfang. Ohne Antwort Control neu abstimmen, keine parallelen Requests oder Quellenreparatur. |
 | command_ack_timeout_seconds | 5 s | Frist ab Sendebeginn fuer command_ack des Commands. Bei fehlender Antwort ist dessen Wirkung unbekannt: Control sperren/schliessen und erhaltenen Istzustand beim Reconnect abstimmen; keine blinde Wiederholung mit neuer ID. |
 | chunk_ack_timeout_seconds | 5 s | Frist ab data-Sendebeginn fuer den zugeordneten chunk_ack. Danach Audioverbindung sperren und Audio neu binden; unbestaetigte Bytes behalten, keinen weiteren Chunk senden. |
@@ -2132,8 +2143,8 @@ Bytebudgets sind Schutzvorgaben, kein Nachweis eines tatsaechlichen Speicherbeda
 | buffer_status_timeout_seconds | 5 s | Antwortfrist fuer die erforderliche frische Kapazitaetsbestaetigung ab audio_ready beziehungsweise accepted-set_media bei bereits ready Audio. Bei ueberlappenden Barrieren erst ab dem spaeteren dieser beiden Ereignisse. Wert 0 beendet die Frist; Backpressure und normale Platzmeldungen haben keine Antwortfrist. |
 | control_ping_interval_seconds | 5 s | Client und Provider senden auf Control im Takt je einen nativen WebSocket-Ping, sofern kein eigener Ping offen ist. Auch bei Pause/Backpressure aktiv; kein JSON-Report oder Chunk-ACK. |
 | control_liveness_timeout_seconds | 15 s | Frist je Endpunkt ab Sendebeginn seines eigenen Control-Pings fuer einen Pong mit identischem Payload auf derselben Verbindung. Andere Aktivitaet verlaengert sie nicht; Timeout sperrt/schliesst Control. Close/Socketfehler gelten sofort als Verlust. |
-| reconnect_grace_seconds | 30 s | Ab erster clientseitiger Verlustfeststellung nach Abschnitt 6 darf A aus gueltigem Clientvorrat noch innerhalb dieser Grace ausgegeben werden. Danach pausieren, Cache nicht allein deshalb loeschen. Lokale Bedienung und Reconnectversuche verlaengern die Grace nicht. |
-| disconnected_source_retention_seconds | 30 s | Reserviertes Legacy-Wire-Feld fuer bestehende Clients. Kein Mashin-Quellenabbautimer und keine garantierte Haltezeit. MA-/Musikdienst-Lifecycle entscheidet ueber Quellproduzent und PCM-Puffer; Client-Reconnect-Grace bleibt separat. |
+| reconnect_grace_seconds | 30 s | Reserviertes Legacy-Wire-Feld fuer bestehende Clients, kein Offline-Ausgabelimit. Gueltigen bereits freigegebenen Clientvorrat gemaess Abschnitt 9 vollstaendig ausgeben; kein zeitgesteuertes Pausieren/Stoppen, Cache-Loeschen oder Zuruecksetzen des Reconnect-Backoffs. |
+| disconnected_source_retention_seconds | 30 s | Reserviertes Legacy-Wire-Feld fuer bestehende Clients. Kein Mashin-Quellenabbautimer und keine garantierte Haltezeit. MA-/Musikdienst-Lifecycle entscheidet ueber Quellproduzent und PCM-Puffer; gueltiger Clientvorrat hat kein zeitliches Offline-Ausgabelimit. |
 | source_idle_timeout_seconds | 30 s | Normale Produktionsfrist ohne PCM-Fortschritt bei tatsaechlich erlaubter Mashin-PCM-Anforderung. Warten auf Chunkplatz oder Clientkapazitaet zaehlt nicht; kein eigener Pause-/Backpressure-Abbruchtimer. Waehrend eines Reparaturvorfalls durch dessen gemeinsames Budget ersetzt; nach erfolgreichem neuen Chunkcommit frisch beginnen gemaess 4.4. |
 | stream_start_timeout_seconds | 10 s | Aktive Wartezeit auf erstes nutzbares PCM/Codec-Audio nach MA-Puffervorbereitung und vollstaendiger Freigabebarriere gemaess Abschnitt 4.3. Die initiale MA-Quellenplatz-/Pufferbereitschaft folgt ihren eigenen begrenzten MA-Fristen. Nur bei tatsaechlich erlaubter PCM-Anforderung zaehlen; Kapazitaets-/Chunkplatzwarten zaehlt nicht. Nach erstem nutzbarem Audio erledigt, kein erneuter Start durch Audio-Reconnect. Waehrend Reparatur einschliesslich Rueckfall gilt stattdessen deren gemeinsames Budget gemaess 4.4; externe MA-Startgrenzen bleiben verbindlich. Timeout ausserhalb Reparatur ist Quellenstillstand, kein Transport-Rebind. |
 | source_recovery_tail_duration_millis | 3000 ms | Festes Reparatur-Endfenster vor dem letzten gespeicherten Chunkende. Unabhaengig von ACK-Freigabe und den zehn Codecchunkplaetzen, ohne Bytebudget. Matching nur ueber volle drei Sekunden; sonst Rueckfall, ausser vor dem ersten Chunk. |
@@ -2193,7 +2204,7 @@ der betroffenen Operation, keine pauschale Quellen-Reopenberechtigung.
 | Ausloeser | Reaktion / Fehlerzuordnung | Erhaltener Zustand |
 | --- | --- | --- |
 | hello fehlt nach 5 s, ungueltige Huelle oder widerspruechliche ID-/ACK-Inhalte auf Control | invalid_message, soweit sendbar; Control sperren/schliessen, alten Audiokanal sperren. Neue Epoche erst nach gueltigem Handshake. | Keine neue Freigabe; bereits autorisierter Cache nur im regulaeren Controlverlustpfad. |
-| welcome oder zugeordnete audio_binding fehlt nach ihrer Antwortfrist | stream_unavailable, soweit sendbar; Control samt Audio sperren/schliessen und mit Backoff neu abstimmen. Keine parallele Bindungsautoritaet, kein Quellenrestart und keine neue Grace fuer denselben Verlust. | Gueltiger Cache/Istzustand und unbestaetigte Serverbytes im regulaeren Controlverlustpfad; keine Freigabe aus einer verspaeteten Antwort. |
+| welcome oder zugeordnete audio_binding fehlt nach ihrer Antwortfrist | stream_unavailable, soweit sendbar; Control samt Audio sperren/schliessen und mit Backoff neu abstimmen. Keine parallele Bindungsautoritaet, kein Quellenrestart und kein Backoff-Reset allein wegen des Antworttimeouts. | Gueltiger Cache/Istzustand und unbestaetigte Serverbytes im regulaeren Controlverlustpfad; keine Freigabe aus einer verspaeteten Antwort. |
 | audio_setup_timeout oder erforderliches buffer_status fehlt nach seiner Frist | stream_unavailable, is_retryable=true, der Bindung/Audioverbindung zuordnen; nur Audio sperren/schliessen, neue Bindung nach Backoff. Kein Quellenrestart allein deshalb. | Control, Playbackidentitaet, gueltiger Clientcache, Empfangscursor und unbestaetigte Serverbytes. |
 | command_ack fehlt nach seiner Frist | command_failed; keine Wirkung unterstellen. Control schliessen und aktuellen Istzustand beim Reconnect abstimmen. Nach neuer Abstimmung nur weiterhin erforderliche neue Commands senden. | Empfangs-/Ausgabezustand fuer Reconciliation; keine Wiederholung alter UI-Aktionen oder unbekannter Commandwirkungen. |
 | command_ack=rejected | command_failed beziehungsweise genauer ProtocolError; Command als gescheitert abschliessen, keine neue Produktions-/Nachfolgerfreigabe aus ihm ableiten. Istzustand aus Reports verwenden; ohne weiter gueltige alte Streamfreigabe regulaeren Stop/Cleanup veranlassen. | Nur weiterhin autorisierte Kontexte; kein angenommener Zustandswechsel und kein unvalidiertes Rollback. |
@@ -2204,7 +2215,7 @@ der betroffenen Operation, keine pauschale Quellen-Reopenberechtigung.
 | Externer MA-/Quellenabschluss oder PCM-Pufferfreigabe bei Disconnect/Pause/Backpressure ohne regulaeres EOF | Ressourcenverlust einmalig fuer Abschnitt 4.4 markieren, bei fehlender Empfangsfreigabe warten; Reopen/MA-Quellen-Seek und PCM-Matching erst bei gueltiger Freigabe/Kapazitaet. Kein sofortiges error/EOF/Queue-Next allein durch Ressourcen-Cleanup. | Playbackkontext, Codecchunks, Cursor und PCM-Endfenster; Pausezustand und gueltiger Clientcache. Bei sicherem Abgleich unveraendert fortsetzen, sonst begrenzter Rueckfall. |
 | Endgueltiges recovery_failed, encoder_failed oder stream_failed | Betroffene Produktion/Lieferung beenden und error melden; Verbindung nicht allein deshalb schliessen. Client kann bereits validiertes Audio ausgeben, danach error statt regulaerem Trackende/automatischer B-Promotion. Neuer Inhalt nur durch regulaeren MA-Load. B-Fehler widerruft nur B und haelt A nicht an. | Kein Anspruch auf weitere Chunks; gueltiger Cache bis Ausgabe oder ersetzendem Load/Stop. Fehler ist kein Final-Chunk. |
 | cache_unavailable, stream_unavailable oder stale_playback beim Resume | Betroffenen Resume ablehnen, keine geloeschten Bytes rekonstruieren. MA-Kontext erneut pruefen; nur ausdruecklich autorisierter regulaerer Seek/Load kann ersetzen, niemals stilles Resume oder erfundene Position. | Unabhaengig weiterhin gueltige Kontexte; keine Wiederherstellung alter Freigaben. |
-| unauthorized / forbidden / Rechteentzug | Beide Kanaele sperren/schliessen, MA-/Quellencleanup und weitere Ausgabe geschuetzten Audios beenden; keine Grace oder automatische Auth-Retryschleife. | Keine geschuetzten A/B-Audiocaches oder Freigaben behalten. |
+| unauthorized / forbidden / Rechteentzug | Beide Kanaele sperren/schliessen, MA-/Quellencleanup und weitere Ausgabe geschuetzten Audios sofort beenden; kein Offline-Ausspielen oder automatische Auth-Retryschleife. | Keine geschuetzten A/B-Audiocaches oder Freigaben behalten. |
 | unsupported_version / incompatible_server | Sicheren Fehler melden und betroffene Verbindung schliessen; kein Retry derselben inkompatiblen Konfiguration oder Codec-/Protokollfallback. | Keine neue Audiofreigabe. |
 | device_conflict / source_busy / rate_limited | Betroffene Operation ohne neue Freigabe ablehnen; Retry nur bei is_retryable=true mit Backoff und frischer Rechte-/Kontextpruefung. | Weiterhin gueltige bestehende Wiedergabe; keine zusaetzlichen Devices/Source-Slots. |
 | media_unsupported / profile_unsupported | Betroffenen Load/Prepare ablehnen, kein stiller Formatfallback. Nur neuer regulaerer MA-Load oder neue B-Freigabe mit unterstuetztem Inhalt. | Unabhaengige weiterhin gueltige Kontexte, insbesondere A bei B-Ablehnung. |
@@ -2268,7 +2279,8 @@ Gezielte Vertragsszenarien fuer die Zustandsgrenzen:
 - Fehlendes welcome nach hello und fehlende audio_binding nach Request:
 	30-s-/5-s-Antwortfrist, monotone Timer und Control-Reconciliation. Wiederholung,
 	Ping/Pong, verspaetete Antwort und Verbindungswechsel verlaengern keine Frist
-	oder Grace; kein paralleler Request. Bindungsaufbau hat seine eigene Gesamtfrist.
+	und setzen den Reconnect-Backoff nicht zurueck; kein paralleler Request.
+	Bindungsaufbau hat seine eigene Gesamtfrist; gueltigen Clientvorrat erhalten.
 - set_media/prepare_next angenommen, ACK verloren, noch kein data: Pending-
 	Payload vor Sendebeginn erhalten, atomare Descriptorregistrierung im hello
 	mit Cursor 1 erkennen, keine erneute Ausfuehrung. Pending-clear_next anhand
@@ -2309,9 +2321,11 @@ Pflichtabnahme und Integrationsgates:
 	gecachtes Audio, Pause, ACK-Warten und Backpressure verhindern keine Pongs/Timer.
 	Einseitiger Paketverlust, falsche/alte/unaufgeforderte Pongs und blockierter
 	Versand pruefen; andere Frames verlaengern keine Frist. Close/Socketfehler sofort
-	als Verlust behandeln; Client-Grace beginnt einmal bei lokaler Verlustfeststellung,
-	nicht erst beim naechsten Reconnect. Alte Timer und Reconnectversuche verlaengern
-	sie nicht; native Frames veraendern keine Reportsequenz, ACKs oder Kapazitaet.
+	als Verlust behandeln und Reconnect beginnen. Bereits freigegebenen Clientvorrat
+	auch nach mehr als 30 s vollstaendig ausgeben, einschliesslich eines gecachten B
+	nach finalem A-Ende. Unvollstaendiger Cache-Unterlauf ist kein EOF. Alte Timer
+	und Reconnectversuche duerfen keinen Cache verwerfen oder Backoff zuruecksetzen;
+	native Frames veraendern keine Reportsequenz, ACKs oder Kapazitaet.
 - Alle JSON-Schemas, Header/UUID/Big Endian, Laengen-/Integer-/Fragmentgrenzen,
 	Unknown Fields, Deduplizierung und niemals Audiobytes/URLs auf Control.
 	ClientCapabilities, AudioProfileId-Arrays/ausgewaehltes Profil und vollstaendiges
@@ -2468,8 +2482,8 @@ Pflichtabnahme und Integrationsgates:
 - Lokales Play/Pause/Stop und Lautstaerke/Mute ohne vorherigen MA-Roundtrip;
 	dieselbe lokale Ausfuehrungslogik fuer Provider-Commands. Reports aktualisieren
 	MA und erforderliche serverseitige Verarbeitung ohne Command-Rueckkopplung.
-	Bei Controlverlust Pause/Stop/Lautstaerke/Mute sofort wirksam; Play nur innerhalb
-	gueltiger Grace mit vorhandenem freigegebenem Cache. Reconnect uebernimmt den
+	Bei Controlverlust Pause/Stop/Lautstaerke/Mute sofort wirksam; Play nur mit
+	vorhandenem freigegebenem Cache, ohne zeitliches Offline-Limit. Reconnect uebernimmt den
 	aktuellen Zustand statt alter Aktionen, kein unbeabsichtigtes Autoplay oder
 	Zuruecksetzen von Lautstaerke/Mute. Offline-Stop gibt lokalen A/B-Cache sofort
 	und serverseitige Queue-/Session-/Quellenressourcen nach Abstimmung einmalig frei;
@@ -2481,8 +2495,9 @@ Pflichtabnahme und Integrationsgates:
 	Gespielt-Markierung, Fortschrittsreports und Scrobbling behalten die MA-Semantik,
 	auch bei lokalen Vor-/Rueckwaertsspruengen; keine eigene Gehoertzeitkorrektur.
 - Zeiten: lokaler 30->40-s-Seek +10 s Ausgabe ergibt Player/Queue50 s; Quellen-
-	Seek150 s +10 s ergibt Player10 s/Queue160 s. Pause/Unterlauf/Offline frieren
-	Ausgabezeit ein; keine Tracker-Wallclockfortschreibung waehrend buffering.
+	Seek150 s +10 s ergibt Player10 s/Queue160 s. Pause/Unterlauf frieren
+	Ausgabezeit ein; Offline-Ausgabe gueltigen Clientvorrats zaehlt dagegen normal.
+	Keine Tracker-Wallclockfortschreibung waehrend buffering.
 - MA-Quellen-Seek ohne lokalen Vorrat: neue echte Session/Generation/Stream,
 	alte Worker/Bytes/ACKs/EOFs nicht umetikettieren; zwei schnelle Seeks zuletzt gewinnt.
 - MA-Enqueue/Invalidierung, B-Empfang erst nach bestaetigtem finalen A-Chunk, kein C ohne neue
