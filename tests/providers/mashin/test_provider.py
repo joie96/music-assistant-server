@@ -38,6 +38,7 @@ from music_assistant.providers.mashin.models import (
     encode_message,
     parse_model,
 )
+from music_assistant.providers.mashin.wire import ProtocolViolation
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -214,6 +215,44 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 ready = await asyncio.wait_for(audio.receive_json(), 1)
                 assert ready["type"] == "audio_ready"
                 assert self.provider.registry.devices["desktop"].session.buffer.ready
+
+    async def test_rejected_resume_sends_error_before_welcome(self) -> None:
+        """A rejected resume reaches the new socket without an old Control sender."""
+        device = await self._device("desktop")
+        app = web.Application()
+        app.router.add_get("/mashin/v1/control", self.provider._control_route)
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        with patch.object(
+            device.session,
+            "connect",
+            side_effect=ProtocolViolation("stale_playback", "Playback is no longer current"),
+        ):
+            async with (
+                TestClient(TestServer(app)) as client,
+                client.ws_connect("/mashin/v1/control") as control,
+            ):
+                await control.send_json(
+                    {
+                        "protocol_version": 1,
+                        "type": "hello",
+                        "message_id": str(uuid4()),
+                        "connection_epoch": None,
+                        "payload": asdict(
+                            Hello(
+                                "desktop",
+                                "Desktop",
+                                "0.1.0",
+                                None,
+                                capabilities,
+                                AudioProfileId.FLAC,
+                            )
+                        ),
+                    }
+                )
+                response = await asyncio.wait_for(control.receive_json(), 1)
+                assert response["type"] == "error"
+                assert response["connection_epoch"] is None
+                assert response["payload"]["error"]["code"] == "stale_playback"
 
     async def test_restart_reconciles_idle_state_with_available_player(self) -> None:
         """A new client process can stop stale MA playback before receiving welcome."""

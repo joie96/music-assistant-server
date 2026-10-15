@@ -110,6 +110,49 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
         await task
 
+    async def test_idle_report_before_load_ack_cannot_reset_new_stream(self) -> None:
+        """Queued idle state cannot revoke a subsequently acknowledged MA load."""
+        self.sent.clear()
+        task = self.spawn(self.session.load(self.context))
+        await self.sent.wait()
+        assert self.session.pending is not None
+        await self.session.report(
+            CommandAck(self.session.pending.command_id, "accepted", None), received_order=10
+        )
+        await task
+        run = self.session.current
+        assert run is not None
+        await self.session.report(
+            PlayerState(1, None, 0, "idle", 0, 100, False, None), received_order=9
+        )
+        assert self.session.current is run
+        self.stop.assert_not_awaited()
+        await self.session.report(BufferStatus(2, 1, 262144), received_order=11)
+        assert self.session.buffer.capacity_confirmed
+
+    async def test_idle_report_during_pending_load_cannot_reset_new_stream(self) -> None:
+        """The client's old idle state remains valid until it applies set_media."""
+        self.sent.clear()
+        task = self.spawn(self.session.load(self.context))
+        await self.sent.wait()
+        run = self.session.current
+        assert run is not None
+        assert self.session.pending is not None
+        await self.session.report(
+            PlayerState(1, None, 0, "idle", 0, 100, False, None), received_order=9
+        )
+        assert self.session.current is run
+        self.stop.assert_not_awaited()
+        await self.session.report(
+            CommandAck(self.session.pending.command_id, "accepted", None), received_order=10
+        )
+        await task
+        await self.session.report(
+            PlayerState(2, None, 0, "idle", 0, 100, False, None), received_order=11
+        )
+        self.assertIsNone(self.session.current)
+        self.stop.assert_awaited_once()
+
     async def test_stale_deadlines_cannot_close_replacement_audio(self) -> None:
         """Late timers cannot mutate a newer epoch, binding or timer owner."""
         for change in ("epoch", "binding", "timer"):

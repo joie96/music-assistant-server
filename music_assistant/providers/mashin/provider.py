@@ -293,6 +293,7 @@ class MashinDevice:
         pong = asyncio.Event()
         expected: list[bytes] = []
         control_lock = asyncio.Lock()
+        welcome_sent = False
         try:
             async with asyncio.timeout(30), self.handshake_lock:
                 await self._check_connection(request)
@@ -312,6 +313,7 @@ class MashinDevice:
                 self.player.connected(True)
                 welcome = await self.session.connect(hello, send, self.provider.server_revision)
                 await send("welcome", welcome)
+                welcome_sent = True
                 self._spawn(self.session.after_welcome())
             epoch = self.session.epoch
             worker = self._spawn(self._reports(socket, queue))
@@ -346,7 +348,7 @@ class MashinDevice:
             self.player.logger.debug(
                 "Control connection failed for player %s: %s", self.player.player_id, code
             )
-            await self._error(socket, code)
+            await self._error(socket, code, welcome=welcome_sent)
         finally:
             for task in (worker, pinger):
                 if task:
@@ -486,7 +488,20 @@ class MashinDevice:
                 await self.session.control_lost()
             await socket.close()
 
-    async def _error(self, socket: web.WebSocketResponse, code: str) -> None:
+    async def _error(
+        self, socket: web.WebSocketResponse, code: str, *, welcome: bool = True
+    ) -> None:
+        if not welcome:
+            with suppress(ConnectionError):
+                await socket.send_str(
+                    encode_message(
+                        "error",
+                        str(uuid4()),
+                        None,
+                        ErrorMessage(None, None, None, safe_error(code, "Mashin handshake failed")),
+                    )
+                )
+            return
         if self.control_socket is socket and self.session.send_control:
             with suppress(ConnectionError):
                 await self.session.send_control(

@@ -547,7 +547,7 @@ def decode_envelope(text: str) -> Envelope:
     return envelope
 
 
-def encode_message(message_type: str, message_id: str, epoch: str, payload: object) -> str:
+def encode_message(message_type: str, message_id: str, epoch: str | None, payload: object) -> str:
     """Serialize a typed provider payload at the WebSocket boundary."""
     if not is_dataclass(payload) or isinstance(payload, type):
         raise ProtocolViolation("invalid_message", "Expected typed message payload")

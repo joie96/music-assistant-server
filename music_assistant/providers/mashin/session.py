@@ -427,6 +427,11 @@ class MashinSession:
         elif isinstance(report, ChunkAck):
             await self._chunk_ack(report)
         elif isinstance(report, PlayerState):
+            if self.current is not None and (
+                not self.current.accepted
+                or (received_order is not None and received_order <= self.capacity_after_order)
+            ):
+                return
             await self._player_state(report)
         elif isinstance(report, TransportStatus):
             run = self._find(report.stream_id)
