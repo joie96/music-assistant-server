@@ -5,22 +5,12 @@ from music_assistant_models.enums import ConfigEntryType
 
 
 def entries() -> tuple[ConfigEntry, ...]:
-    """Return shared settings; devices register themselves through authenticated hello."""
+    """Return shared admission settings for token-free LAN device registration."""
     return (
-        ConfigEntry(
-            key="tls_proxy_ip", type=ConfigEntryType.STRING, required=False, category="advanced"
-        ),
         ConfigEntry(
             key="max_registered_devices",
             type=ConfigEntryType.INTEGER,
             default_value=32,
-            range=(1, 4096),
-            category="advanced",
-        ),
-        ConfigEntry(
-            key="max_devices_per_user",
-            type=ConfigEntryType.INTEGER,
-            default_value=8,
             range=(1, 4096),
             category="advanced",
         ),

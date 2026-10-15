@@ -1,4 +1,4 @@
-"""Persistent device ownership and independent runtime registration."""
+"""Persistent LAN device identities and independent runtime registration."""
 
 from __future__ import annotations
 
@@ -13,10 +13,9 @@ from .wire import ProtocolViolation
 
 @dataclass(frozen=True, slots=True)
 class DeviceBinding:
-    """Stable client identity bound to one MA user, never to a token or socket."""
+    """Stable client identity independent of MA users and sockets."""
 
     device_id: str
-    user_id: str
     name: str
 
     @property
@@ -35,9 +34,8 @@ class DeviceRegistry[DeviceT]:
         create: Callable[[DeviceBinding], Awaitable[DeviceT]],
         *,
         max_devices: int = 32,
-        max_devices_per_user: int = 8,
     ) -> None:
-        """Restore ownership records without restoring sockets or playback authority."""
+        """Restore device identities without restoring sockets or playback state."""
         self.bindings: dict[str, DeviceBinding] = {}
         self.devices: dict[str, DeviceT] = {}
         self.save = save
@@ -45,8 +43,7 @@ class DeviceRegistry[DeviceT]:
         self.lock = asyncio.Lock()
         self.closed = False
         self.max_devices = max_devices
-        self.max_devices_per_user = max_devices_per_user
-        if min(max_devices, max_devices_per_user) < 1:
+        if max_devices < 1:
             raise ProtocolViolation("incompatible_server", "Invalid device admission limits")
         if stored is not None:
             self._restore(stored)
@@ -54,37 +51,26 @@ class DeviceRegistry[DeviceT]:
     async def register(
         self,
         device_id: str,
-        user_id: str,
         name: str,
-        allowed: Callable[[str], bool],
     ) -> DeviceT:
-        """Authorize ownership and ACL before persisting or activating a new player."""
-        for identifier in (device_id, user_id):
-            if not identifier or not identifier.isascii() or len(identifier) > 128:
-                raise ProtocolViolation("invalid_message", "Invalid device or user ID")
+        """Persist a LAN device identity and activate its independent player."""
+        if not device_id or not device_id.isascii() or len(device_id) > 128:
+            raise ProtocolViolation("invalid_message", "Invalid device ID")
         async with self.lock:
             if self.closed:
                 raise ProtocolViolation("stream_unavailable", "Provider is unloading")
             binding = self.bindings.get(device_id)
-            if binding is not None and binding.user_id != user_id:
-                raise ProtocolViolation("forbidden", "Device belongs to another MA user")
-            binding = binding or DeviceBinding(device_id, user_id, name[:128] or "Mashin")
-            if not allowed(binding.player_id):
-                raise ProtocolViolation("forbidden", "Player access denied")
+            binding = binding or DeviceBinding(device_id, name[:128] or "Mashin")
             if device_id in self.devices:
                 return self.devices[device_id]
             if device_id not in self.bindings:
-                if (
-                    len(self.bindings) >= self.max_devices
-                    or sum(value.user_id == user_id for value in self.bindings.values())
-                    >= self.max_devices_per_user
-                ):
+                if len(self.bindings) >= self.max_devices:
                     raise ProtocolViolation("rate_limited", "Device admission limit reached")
                 updated = {**self.bindings, device_id: binding}
                 self.save(
                     json.dumps(
                         {
-                            "version": 1,
+                            "version": 2,
                             "devices": [asdict(value) for value in updated.values()],
                         },
                         separators=(",", ":"),
@@ -96,16 +82,11 @@ class DeviceRegistry[DeviceT]:
             self.devices[device_id] = device
             return device
 
-    def lookup(self, device_id: str, user_id: str, allowed: Callable[[str], bool]) -> DeviceT:
-        """Resolve Audio only to an already registered and authorized Control device."""
+    def lookup(self, device_id: str) -> DeviceT:
+        """Resolve Audio only to a device already registered through Control."""
         binding = self.bindings.get(device_id)
-        if (
-            self.closed
-            or binding is None
-            or binding.user_id != user_id
-            or not allowed(binding.player_id)
-        ):
-            raise ProtocolViolation("forbidden", "Device is not authorized")
+        if self.closed or binding is None:
+            raise ProtocolViolation("forbidden", "Device is not registered")
         if device_id not in self.devices:
             raise ProtocolViolation("stream_unavailable", "Control registration is required")
         return self.devices[device_id]
@@ -121,21 +102,23 @@ class DeviceRegistry[DeviceT]:
             not isinstance(data, dict)
             or set(data) != {"version", "devices"}
             or type(data["version"]) is not int
-            or data["version"] != 1
+            or data["version"] != 2
             or not isinstance(data["devices"], list)
         ):
-            raise ProtocolViolation("incompatible_server", "Invalid stored device bindings")
+            raise ProtocolViolation(
+                "incompatible_server", "Recreate the Mashin provider for LAN device registration"
+            )
         for value in data["devices"]:
-            if not isinstance(value, dict) or set(value) != {"device_id", "user_id", "name"}:
+            if not isinstance(value, dict) or set(value) != {"device_id", "name"}:
                 raise ProtocolViolation("incompatible_server", "Invalid stored device binding")
-            for identifier in (value["device_id"], value["user_id"]):
-                if (
-                    not isinstance(identifier, str)
-                    or not identifier
-                    or not identifier.isascii()
-                    or len(identifier) > 128
-                ):
-                    raise ProtocolViolation("incompatible_server", "Invalid stored device identity")
+            identifier = value["device_id"]
+            if (
+                not isinstance(identifier, str)
+                or not identifier
+                or not identifier.isascii()
+                or len(identifier) > 128
+            ):
+                raise ProtocolViolation("incompatible_server", "Invalid stored device identity")
             if not isinstance(value["name"], str) or not 1 <= len(value["name"]) <= 128:
                 raise ProtocolViolation("incompatible_server", "Invalid stored device name")
             if value["device_id"] in self.bindings:

@@ -29,9 +29,7 @@ class TestModels(unittest.TestCase):
     def test_provider_settings_do_not_duplicate_client_profile_or_core_logging(self) -> None:
         """The client chooses quality; the core owns the standard logging entry."""
         assert [entry.key for entry in entries()] == [
-            "tls_proxy_ip",
             "max_registered_devices",
-            "max_devices_per_user",
             "max_websocket_connections",
         ]
 
@@ -47,6 +45,20 @@ class TestModels(unittest.TestCase):
         )
         parsed = parse_model(Hello, values)
         assert parsed.audio_profile == AudioProfileId.OPUS_128K
+        _, decoded = decode_message(
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "type": "hello",
+                    "message_id": str(uuid4()),
+                    "connection_epoch": None,
+                    "payload": values,
+                }
+            ),
+            None,
+        )
+        assert isinstance(decoded, Hello)
+        assert decoded.audio_profile == AudioProfileId.OPUS_128K
         for invalid in (
             {**values, "audio_profile": "mp3"},
             {key: value for key, value in values.items() if key != "audio_profile"},

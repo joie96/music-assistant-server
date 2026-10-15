@@ -23,7 +23,7 @@ Dokument-/Modellpruefungen sind kein Nachweis fuer laufende MA-/Codecintegration
 ## 1. Ziel, Grenzen und Autoritaet
 
 Mashin ist ein echter MA-PlayerProvider fuer mehrere gleichzeitig verbundene,
-autorisierte Clients. Eine Providerinstanz registriert jeden Client anhand seiner
+Clients im vertrauenswuerdigen LAN. Eine Providerinstanz registriert jeden Client anhand seiner
 stabilen device_id als eigenes Device mit genau einem stabilen MA-Player und
 eigener MA-Queue, aehnlich der Clientregistrierung bei Sendspin. Die 1:1-Zuordnung
 gilt ausschliesslich zwischen Client/Device und Player, nicht zwischen Provider
@@ -585,7 +585,7 @@ Seek/Rueckfall erzeugt neue ID. audio_connection_id ist ein vom Client vergebene
 Integer 1..9007199254740991, im audio_hello uebermittelt. Pro Control-Epoche ab 1
 bei jedem neuen Audioverbindungsversuch strikt erhoehen, auch nach gescheitertem
 Aufbau; Luecken sind erlaubt. Provider haelt nur die hoechste nach gueltiger
-Bearer-/ACL-/Tokenpruefung beanspruchte ID je Epoche und lehnt IDs kleiner oder
+Device-/Epochen-/Audiobindungspruefung beanspruchte ID je Epoche und lehnt IDs kleiner oder
 gleich diesem Stand ab. ID-Verbrauch, Bindungsverbrauch und Socketzuordnung
 atomar ausfuehren; ein nachfolgender Cursor-/Setupfehler gibt die ID nicht wieder
 frei. Keine Liste alter UUIDs/Verbindungen und keine historische ID pro Reconnect.
@@ -698,7 +698,7 @@ String-/Boolkonvertierung. Integer nichtnegativ und <=9007199254740991, sofern
 nicht enger begrenzt. UUIDs kanonisch. Sonstige String-IDs maximal 128 ASCII-Zeichen.
 Kein MA-JSON-RPC auf den Mashin-WebSockets. Alle Attribute Englisch/snake_case.
 
-## 6. Verbindung, Auth und Handshake
+## 6. LAN-Verbindung und Handshake
 
 Control: WebSocket GET /mashin/v1/control, Audio: GET /mashin/v1/audio am
 MA-Hauptwebserver. Dieselben beiden Routes bedienen alle Clients einer
@@ -707,19 +707,25 @@ Audiolieferung und ein aktiver Mashin-Quellen-/Encoderproduzent. A/B je Player
 sequenziell liefern; kein separater Transfer-Lifecycle pro Stream und keine
 providerweite Einzelclientbegrenzung.
 
-TLS, MA-Bearer-Authentifizierung und Player-/Device-ACL bei beiden Upgrades.
-Keine Tokens in Querystrings. TLS, Bearer und beide Player-Scopes vor dem Upgrade
-pruefen; nach hello beziehungsweise audio_hello die device_id einem eigenen
-Player zuordnen und Nutzerbindung sowie Player-ACL vor welcome/audio_ready
-pruefen. Ein neuer Client wird bei seinem ersten autorisierten Control-hello
-registriert; Audio allein darf weder ein Device anlegen noch dessen Besitzer
-wechseln. Devicebindung an den authentifizierten Nutzer persistent erhalten.
-Dieselbe device_id eines anderen Nutzers ablehnen, keine Uebernahme bestehender
-Sessions. Reconnect desselben Nutzers betrifft nur sein Device. Rechteentzug
-bereinigt nur betroffene Devices; Provider-Unload alle eigenen Devices.
-PLAYERS_READ/PLAYERS_CONTROL pruefen, MA-Queueaktionen mit erforderlichen
-Queue-Rechten. Scope-Tupel mit ODER-Semantik nicht als erforderliches UND behandeln.
-Routes pruefen Auth selbst, wenn Standardmiddleware sie nicht abdeckt.
+Beide Routes akzeptieren ws ueber HTTP und wss ueber HTTPS ohne MA-Bearer,
+Nutzeranmeldung oder Player-/Nutzer-ACL. WSS setzt TLS am MA-Webserver oder einem
+WebSocket-faehigen Reverse Proxy voraus; der Provider benoetigt keine Proxy-IP-
+Vertrauensliste und wertet X-Forwarded-Proto nicht aus. Querystrings sind unzulaessig.
+Nach hello die device_id einem eigenen Player zuordnen; Name und stabile Identitaet
+ohne Nutzerbesitz persistent erhalten. Audio allein darf kein Device anlegen und
+muss vor audio_ready die aktuelle Epoche sowie einmalige Audiobindung nachweisen.
+Deaktivierte Player und herunterfahrende Provider akzeptieren keine Verbindungen.
+Reconnect und Deaktivierung betreffen nur das jeweilige Device, Unload alle Devices.
+Globale Geraete- und Socketlimits gelten weiterhin; es gibt keine Nutzerquote.
+Recovery und Profilwechsel verwenden ausschliesslich die eigene MA-Queue und den
+gueltigen Playbackkontext, ohne Client-Nutzerscopes. Musikdienstberechtigungen und
+MA-API-Authentifizierung bleiben unveraendert.
+
+Dieses Modell vertraut der Netzwerkerreichbarkeit: Jeder erreichende Client kann
+Devices registrieren oder eine bestehende device_id beanspruchen. Device-IDs sind
+kein Identitaetsnachweis; WSS allein ist keine Zugriffskontrolle. Endpunkte nur im
+vertrauenswuerdigen LAN bereitstellen, nicht oeffentlich weiterleiten. Keine
+automatische Uebernahme gespeicherter Nutzerbindungen; Bestandsprovider neu einrichten.
 
 ```json
 {
@@ -829,7 +835,7 @@ verspaetetes welcome einer geschlossenen Verbindung ignorieren. Client kennt
 die feste V1-Frist bereits vor welcome.limits; kein zirkulaerer Handshake.
 
 audio_binding_id hat mindestens 256 Bit Entropie, einmalige Verwendung und 30 s
-Erstbindungsfrist; gebunden an Nutzer/Device/Player/Epoche. Audio sendet
+Erstbindungsfrist; gebunden an Device/Player/Epoche. Audio sendet
 audio_hello mit genau device_id, audio_binding_id, audio_connection_id,
 received_streams. received_streams ist der frische Empfangscursor-Snapshot wie
 in ClientResumeState, einschliesslich Cursor 1 fuer registrierte leere Streams.
@@ -844,7 +850,7 @@ audio_setup_timeout_seconds laeuft monoton ab Ausgabe der Bindung bis zu diesem
 Abschluss; Tokenwiederholung, Upgrade, audio_hello und audio_ready setzen die
 Gesamtfrist nicht zurueck. Zusaetzlich die Kapazitaetsfrist aus Abschnitt 12
 nach audio_ready beachten. Vor Ablauf verbrauchte Bindungen nicht wiederverwenden.
-Binding ist zusaetzlich zur Bearer-/ACL-Pruefung, nicht deren Ersatz. Bei neuem
+Binding ordnet Audio der aktuellen Controlsession zu, nicht einem MA-Nutzer. Bei neuem
 accepted-load/prepare initialen Cursor 1 registrieren; kein zusaetzlicher Abruf.
 
 Audio-only-Reconnect: audio_reconnect_request(sequence,request_id) auf Control,
@@ -897,8 +903,8 @@ Transport geschlossen; eine Close-Bestaetigung des Clients ist keine Voraussetzu
 fuer den neuen Handshake. Alte Sockets zaehlen bis zur Bereinigung weiter gegen
 die Verbindungsgrenze. Alte Reader, Pings, Sendelocks und Timer duerfen die neue
 Verbindung nicht beeinflussen; Streams und Empfangscursor bleiben erhalten.
-Kein ungepruefter Load/Enqueue aus alten Sessions. Rechteentzug beendet beide
-Kanaele und weitere Ausgabe geschuetzten Audios. Keine anonyme Rueckfallverbindung.
+Kein ungepruefter Load/Enqueue aus alten Sessions. Player-Deaktivierung beendet beide
+Kanaele. MA-/Quellenberechtigungen und deren Grenzen gelten unabhaengig vom LAN-Zugang.
 
 Control-Liveness ausschliesslich mit nativen WebSocket-Ping/Pong-Frames gemaess
 RFC 6455 pruefen. Nach welcome senden Client und Provider jeweils im 5-s-Takt
@@ -935,10 +941,10 @@ Bitraten- oder FFmpeg-Parameter; audio_profile ist weiterhin AudioProfileId.
 Ohne laufenden Stream die Deviceauswahl fuer neue Streams aktualisieren.
 Bei laufendem A einen neuen Stream ueber den normalen MA-Queue-Seek anfordern:
 seek_seconds + floor(position_frame / aktuelle sample_rate_hz). Nur bestaetigte
-Clientpositionen und weiterhin gueltige MA-Kontexte verwenden. Beide Player-Scopes,
-Devicebesitzer, Player-ACL und queues.control vor dem Seek erneut pruefen.
-Fehlende Queueberechtigung oder Position und unentschiedene Playercommands werden
-abgewiesen; bestehendes Audio unveraendert lassen. Kein privilegierter Seek.
+Clientpositionen und weiterhin gueltige MA-Kontexte verwenden. Aktive Controlsession,
+aktivierten Player und unveraenderten Wiedergabekontext vor dem Seek erneut pruefen.
+Fehlende Position und unentschiedene Playercommands werden abgewiesen; bestehendes
+Audio unveraendert lassen. Nur die eigene Queue ueber den regulaeren MA-Seek steuern.
 
 Der neue set_media-Stream hat eine neue stream_id/Generation, den angefragten Codec
 und die neue Zeitbasis. Alte A/B-Kontexte und Decoder-/Kapazitaetsfreigaben regulaer
@@ -1438,8 +1444,8 @@ die Antwort `audio_binding(request_id,audio_binding_id)` zu. Genau ein solcher
 Request darf ausstehen; identische Wiederholung liefert dieselbe noch gueltige,
 unverbrauchte Bindung. Verbrauchte/abgelaufene Bindung verlangt neue request_id.
 
-Provider sperrt den alten Audiokanal vor Ersatz. Anschliessend authentifiziert
-und bindet der Client Audio ueber `audio_hello` mit frischen Empfangscursorn und
+Provider sperrt den alten Audiokanal vor Ersatz. Anschliessend bindet der Client
+Audio ueber `audio_hello` mit frischen Empfangscursorn und
 neuer Verbindungs-ID. Nach `audio_ready` und frischem `buffer_status` liefert der Provider
 auf der neuen Audioverbindung ab dem validierten Empfangscursor weiter.
 Die Nachricht bestellt keinen Track/Chunk, aendert weder Ausgabezeiger noch
@@ -2215,16 +2221,17 @@ Setup prueft gepinnte Versionen, Pflichtprofile, Encoder, Routes, Config und
 Playerbindung. Tasks/Puffer/Handles haben genau einen Lifecycle-Eigentuemer.
 Shutdown sperrt Freigaben zuerst, beendet Generatoren/Prozesse/Sockets/Timer,
 gibt RAM frei und meldet keine falschen Trackenden. Kein offenes CORS, Fan-out,
-frei waehlbares Proxyziel oder unsicherer TLS-Fallback; HTTP nur expliziter Devmodus.
+frei waehlbares Proxyziel. WS und WSS sind gleichwertige LAN-Transporte; keine
+Tokenweitergabe oder oeffentliche Erreichbarkeit dieser ungeschuetzten Endpunkte.
 
 Diagnose nur sichere IDs, Zustandswechsel, Bytebudgets, ACK-/Produktionscursor,
 Ausgaberevision/Position und Fehlercodes. Keine Audio-/Binding-/Token-/Quell-URL-
-Logs, Dumps oder Exporte. Tokenrotation/Rechteentzug auf beiden Kanaelen testen.
+Logs, Dumps oder Exporte. Audiobindung und Player-Deaktivierung auf beiden Kanaelen testen.
 
 ## 13. Umsetzung und blockierende Abnahme
 
 1. Providerrepository/Image, Discovery und ein echtes gebundenes Device/Player.
-2. Typisierte Modelle, Auth/ACL, Control/Audio und Protokolltestclient.
+2. Typisierte Modelle, LAN-Zugang, Control/Audio-Bindung und Protokolltestclient.
 3. MA-PCM-/Ausgabeplan-/Pacingadapter und alle unabhaengigen Codecprofile.
 4. Provider-Push, Stop-and-Wait-ACK/buffer_capacity und native MA-Enqueue-Promotion.
 5. Reconnect, position_frame/output_revision, lokale Client-Seeks und MA-Seeks.
@@ -2291,12 +2298,12 @@ Pflichtabnahme und Integrationsgates:
 - Mehrere gleichzeitig verbundene Clients an einer Providerinstanz: je device_id
 	ein eigener stabiler Player mit eigener MA-Queue und unabhaengiger Session.
 	Reconnect, Control-/Audioersatz, ACK, Kapazitaet, Stop, Fehler und Rechteentzug
-	eines Devices duerfen kein anderes Device veraendern. Persistierte Besitzerbindung
-	und Playeridentitaet nach Serverneustart pruefen; fremde Besitzer und Audio ohne
-	vorherige Controlregistrierung ablehnen. Provider-Unload beendet alle Devices.
+	eines Devices duerfen kein anderes Device veraendern. Persistierte Device- und
+	Playeridentitaet nach Serverneustart pruefen; Audio ohne vorherige Controlregistrierung,
+	aktuelle Epoche oder gueltige Audiobindung ablehnen. Provider-Unload beendet alle Devices.
 - Gepinnte interne APIs und vollstaendiger DSP/Resampling-/Pacingpfad; Loaded/
 	Served-/Streaminghooks nicht durch PCM-Direktzugriff oder Replay verlieren.
-- Beide Upgrade-ACLs, Scope-UND, Devicebinding, alte Epochen/Bindings und Entzug.
+- Tokenfreie WS-/WSS-Upgrades, Devicebinding, alte Epochen/Bindings und Deaktivierung.
 - Native Control-Ping/Pong-Pruefung auf beiden Seiten: 5-s-Takt, ein eigener
 	ausstehender Ping, passender Payload und 15-s-Frist ab Sendebeginn. Vollstaendig
 	gecachtes Audio, Pause, ACK-Warten und Backpressure verhindern keine Pongs/Timer.

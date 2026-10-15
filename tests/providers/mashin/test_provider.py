@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import sys
 import unittest
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 from aiohttp import WSMessage, WSMsgType, web
-from music_assistant_models.auth import User
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from music_assistant_models.config_entries import PlayerConfig, ProviderConfig
 from music_assistant_models.enums import (
     ContentType,
@@ -33,6 +34,9 @@ from music_assistant.providers.mashin.models import (
     ClientCapabilities,
     Hello,
     OutputFormat,
+    Welcome,
+    encode_message,
+    parse_model,
 )
 
 if TYPE_CHECKING:
@@ -78,6 +82,8 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.provider.server_revision = "test"
+        self.provider.unloading = False
+        self.provider.max_sockets = 128
         self.provider.removers = []
         self.provider.sockets = set()
         self.provider.registry = DeviceRegistry(None, Mock(), self.provider._create_device)
@@ -93,11 +99,10 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         socket = AsyncMock()
         socket.prepared = True
         self.provider.sockets.add(socket)
-        with (
-            patch.object(self.provider, "authenticate", AsyncMock(return_value=Mock(spec=User))),
-            pytest.raises(web.HTTPTooManyRequests),
-        ):
-            await self.provider._route(Mock(), audio=False)
+        with pytest.raises(web.HTTPTooManyRequests):
+            await self.provider._route(
+                make_mocked_request("GET", "/mashin/v1/control"), audio=False
+            )
         assert len(self.provider.sockets) == 1
 
     async def test_each_client_gets_its_own_player_and_device_info(self) -> None:
@@ -129,29 +134,86 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         assert second.player.available
         assert not first.player.available
 
-    async def test_user_revocation_selects_only_owned_devices(self) -> None:
-        """Revoking one user's rights cannot terminate another user's device."""
-        first, second = await self._device("desktop", "alice"), await self._device("phone", "bob")
-        with (
-            patch.object(first, "_spawn", Mock()) as first_spawn,
-            patch.object(second, "_spawn", Mock()) as second_spawn,
-            patch.object(first, "_revoke", AsyncMock()) as revoke,
-        ):
-            self.provider._access_revoked(Mock(spec=User, user_id="alice"))
-            first_spawn.assert_called_once()
-            second_spawn.assert_not_called()
-            await first_spawn.call_args.args[0]
-            revoke.assert_awaited_once()
+    async def test_http_and_https_requests_need_no_token_or_proxy(self) -> None:
+        """Transport security and forwarded headers do not gate LAN connections."""
+        for secure in (False, True):
+            with self.subTest(secure=secure):
+                request = Mock(secure=secure, query_string="", headers={})
+                self.provider.check_request(request)
+        self.mass.webserver.auth.authenticate_with_token.assert_not_called()
+        with pytest.raises(web.HTTPBadRequest):
+            self.provider.check_request(Mock(query_string="token=secret"))
+        self.provider.unloading = True
+        with pytest.raises(web.HTTPServiceUnavailable):
+            self.provider.check_request(Mock(query_string=""))
 
-    async def test_stop_failure_still_closes_only_the_revoked_device(self) -> None:
-        """A failing MA stop does not leave the revoked client's transports alive."""
+    async def test_token_free_websocket_control_and_audio_handshake(self) -> None:
+        """Real WS upgrades bind Audio to Control without an Authorization header."""
+        app = web.Application()
+        app.router.add_get("/mashin/v1/control", self.provider._control_route)
+        app.router.add_get("/mashin/v1/audio", self.provider._audio_route)
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        async with (
+            TestClient(TestServer(app)) as client,
+            client.ws_connect("/mashin/v1/control") as control,
+        ):
+            await control.send_json(
+                {
+                    "protocol_version": 1,
+                    "type": "hello",
+                    "message_id": str(uuid4()),
+                    "connection_epoch": None,
+                    "payload": asdict(
+                        Hello(
+                            "desktop",
+                            "Desktop",
+                            "0.1.0",
+                            None,
+                            capabilities,
+                            AudioProfileId.FLAC,
+                        )
+                    ),
+                }
+            )
+            response = await asyncio.wait_for(control.receive_json(), 1)
+            assert response["type"] == "welcome"
+            welcome = parse_model(Welcome, response["payload"])
+            async with client.ws_connect("/mashin/v1/audio") as audio:
+                await audio.send_str(
+                    encode_message(
+                        "audio_hello",
+                        str(uuid4()),
+                        response["connection_epoch"],
+                        AudioHello("desktop", welcome.audio_binding_id, 1, []),
+                    )
+                )
+                ready = await asyncio.wait_for(audio.receive_json(), 1)
+                assert ready["type"] == "audio_ready"
+                assert self.provider.registry.devices["desktop"].session.buffer.ready
+
+    async def test_fallback_uses_own_queue_without_user_scopes(self) -> None:
+        """LAN recovery can seek its player while retaining the requested pause."""
+        device = await self._device("desktop")
+        device.control_socket = AsyncMock()
+        device.control_request = make_mocked_request("GET", "/mashin/v1/control")
+        self.mass.player_queues.seek = AsyncMock()
+        self.mass.player_queues.pause = AsyncMock()
+        await device._fallback(42, True)
+        self.mass.player_queues.seek.assert_awaited_once_with(device.player.player_id, 42)
+        self.mass.player_queues.pause.assert_awaited_once_with(device.player.player_id)
+        self.mass.config.get_raw_player_config_value.return_value = False
+        with pytest.raises(web.HTTPForbidden):
+            await device._check_connection(device.control_request)
+
+    async def test_stop_failure_still_closes_only_the_disabled_device(self) -> None:
+        """A failing MA stop does not leave the disabled client's transports alive."""
         first, second = await self._device("desktop"), await self._device("phone")
         first.control_socket, first.audio_socket = AsyncMock(), AsyncMock()
         second.control_socket, second.audio_socket = AsyncMock(), AsyncMock()
         control, audio = first.control_socket, first.audio_socket
         self.mass.player_queues.stop.side_effect = RuntimeError("MA stop failed")
         with pytest.raises(RuntimeError, match="MA stop failed"):
-            await first._revoke()
+            await first._disable()
         control.close.assert_awaited_once()
         audio.close.assert_awaited_once()
         second.control_socket.close.assert_not_awaited()
@@ -179,7 +241,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         device.control_socket, device.audio_socket = old_control, old_audio
         capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
         hello = Hello("desktop", "Desktop", "0.1.0", None, capabilities, AudioProfileId.FLAC)
-        with patch.object(device, "_authorize", AsyncMock()):
+        with patch.object(device, "_check_connection", AsyncMock()):
             task = asyncio.ensure_future(device._control_route(Mock(), replacement, hello))
             try:
                 await asyncio.wait_for(welcomed.wait(), 1)
@@ -221,7 +283,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         replacement.send_str.side_effect = send
         replacement.__aiter__.side_effect = messages
         device.audio_socket = previous
-        with patch.object(device, "_authorize", AsyncMock()):
+        with patch.object(device, "_check_connection", AsyncMock()):
             task = asyncio.ensure_future(
                 device._audio_route(
                     Mock(),
@@ -264,7 +326,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         assert not device.retired_sockets
         assert socket not in self.provider.sockets
 
-    async def test_old_ping_errors_cannot_disconnect_or_revoke_replacement(self) -> None:
+    async def test_old_ping_errors_cannot_disconnect_or_disable_replacement(self) -> None:
         """A superseded ping cannot mutate the replacement connection authority."""
         device = await self._device("desktop")
         for error in (ConnectionError(), web.HTTPForbidden()):
@@ -284,12 +346,12 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                     old.ping.side_effect = fail
                 with (
                     patch("music_assistant.providers.mashin.provider.asyncio.sleep", AsyncMock()),
-                    patch.object(device, "_authorize", AsyncMock(side_effect=fail)),
-                    patch.object(device, "_revoke", AsyncMock()) as revoke,
+                    patch.object(device, "_check_connection", AsyncMock(side_effect=fail)),
+                    patch.object(device, "_disable", AsyncMock()) as disable,
                     patch.object(device.session, "control_lost", AsyncMock()) as lost,
                 ):
                     await device._pings(Mock(), old, [], asyncio.Event())
-                    revoke.assert_not_awaited()
+                    disable.assert_not_awaited()
                     lost.assert_not_awaited()
                 assert device.control_socket is replacement
 
@@ -311,7 +373,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             authorized.set()
 
         with (
-            patch.object(device, "_authorize", authorize),
+            patch.object(device, "_check_connection", authorize),
             patch.object(device.session, "bind_audio", Mock()) as bind,
         ):
             await device.handshake_lock.acquire()
@@ -340,12 +402,12 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
     async def test_registration_failure_cleans_up_the_partial_device(self) -> None:
         """Aborting player registration cannot leave session workers or a player behind."""
         self.mass.players.register.side_effect = RuntimeError("Registration failed")
-        binding = DeviceBinding("desktop", "owner", "Desktop")
+        binding = DeviceBinding("desktop", "Desktop")
         with pytest.raises(RuntimeError, match="Registration failed"):
-            await self.provider.registry.register("desktop", "owner", "Desktop", lambda _: True)
+            await self.provider.registry.register("desktop", "Desktop")
         self.mass.players.unregister.assert_awaited_once_with(binding.player_id)
         assert not self.provider.registry.devices
-        assert self.provider.registry.bindings["desktop"].user_id == "owner"
+        assert self.provider.registry.bindings["desktop"] == binding
 
     async def test_provider_unload_cancels_all_device_workers(self) -> None:
         """Provider teardown stops all clients without leaving their workers running."""
@@ -544,10 +606,8 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         assert await source.read(8) == b""
         process.wait_with_timeout.assert_awaited_once_with(5)
 
-    async def _device(self, device_id: str, user_id: str = "owner") -> MashinDevice:
-        device = await self.provider.registry.register(
-            device_id, user_id, device_id, lambda _: True
-        )
+    async def _device(self, device_id: str) -> MashinDevice:
+        device = await self.provider.registry.register(device_id, device_id)
         update = patch.object(device.player, "update_state", Mock())
         update.start()
         self.addCleanup(update.stop)

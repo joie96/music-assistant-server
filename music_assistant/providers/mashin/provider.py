@@ -1,11 +1,10 @@
-"""Authenticated Mashin Control/Audio routes and provider lifecycle."""
+"""Token-free Mashin LAN Control/Audio routes and provider lifecycle."""
 
 # ruff: noqa: TRY301
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -13,16 +12,9 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from aiohttp import WSMsgType, web
-from music_assistant_models.auth import Scope
 from music_assistant_models.enums import EventType
 from music_assistant_models.errors import SetupFailedError
 
-from music_assistant.controllers.webserver.helpers.auth_middleware import (
-    get_current_user,
-    has_player_access,
-    has_scope,
-    set_current_user,
-)
 from music_assistant.helpers.build_info import get_official_build_info
 from music_assistant.helpers.ffmpeg import check_ffmpeg_version
 from music_assistant.models.player_provider import PlayerProvider
@@ -47,20 +39,19 @@ from .session import MashinSession, safe_error
 from .wire import ProtocolViolation
 
 if TYPE_CHECKING:
-    from music_assistant_models.auth import User
     from music_assistant_models.config_entries import ConfigEntry
     from music_assistant_models.event import MassEvent
 
 
 class MashinProvider(PlayerProvider):
-    """Serve independently authorized devices through one pair of shared routes."""
+    """Serve independent LAN devices through one pair of shared routes."""
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
-        """Return TLS settings; profiles are requested by each client."""
+        """Return admission settings; profiles are requested by each client."""
         return entries()
 
     async def handle_async_init(self) -> None:
-        """Restore device ownership and prepare shared runtime configuration."""
+        """Restore device identities and prepare shared runtime configuration."""
         self.removers: list[Callable[[], None]] = []
         self.sockets: set[web.WebSocketResponse] = set()
         self.unloading = False
@@ -72,11 +63,6 @@ class MashinProvider(PlayerProvider):
         self.server_revision = (
             build["revision"] if build and build.get("revision") else self.mass.version
         )
-        try:
-            proxy = self.get_config_value("tls_proxy_ip", "", return_type=str)
-            self.proxy_ip = str(ipaddress.ip_address(proxy)) if proxy else None
-        except ValueError as err:
-            raise SetupFailedError("Invalid Mashin trusted proxy IP") from err
         stored = self.get_setup_value("device_bindings")
         if stored is not None and not isinstance(stored, str):
             raise SetupFailedError("Invalid stored Mashin device bindings")
@@ -86,18 +72,15 @@ class MashinProvider(PlayerProvider):
                 self._save_bindings,
                 self._create_device,
                 max_devices=self.get_config_value("max_registered_devices", 32, return_type=int),
-                max_devices_per_user=self.get_config_value(
-                    "max_devices_per_user", 8, return_type=int
-                ),
             )
         except ProtocolViolation as err:
-            raise SetupFailedError(str(err)) from err
-        self.logger.debug(
-            "Restored %s Mashin device ownership records", len(self.registry.bindings)
-        )
+            raise SetupFailedError(
+                "Invalid Mashin device storage; remove and re-add the provider for LAN access"
+            ) from err
+        self.logger.debug("Restored %s Mashin device identities", len(self.registry.bindings))
 
     async def loaded_in_mass(self) -> None:
-        """Register shared routes; players are discovered through authorized hello."""
+        """Register shared routes; players are discovered through Control hello."""
         self.removers.extend(
             [
                 self.mass.webserver.register_dynamic_route(
@@ -106,12 +89,11 @@ class MashinProvider(PlayerProvider):
                 self.mass.webserver.register_dynamic_route(
                     "/mashin/v1/audio", self._audio_route, "GET"
                 ),
-                self.mass.webserver.auth.subscribe_user_access_revoked(self._access_revoked),
             ]
         )
 
     async def unload(self, is_removed: bool = False) -> None:
-        """Stop discovery and release all devices without crossing their ownership."""
+        """Stop discovery and release all device runtimes."""
         del is_removed
         self.unloading = True
         for remove in self.removers:
@@ -135,31 +117,12 @@ class MashinProvider(PlayerProvider):
             if pending:
                 self.logger.warning("Mashin device cleanup continues in %s MA tasks", len(pending))
 
-    async def authenticate(self, request: web.Request) -> User:
-        """Require TLS, a live MA bearer and both scopes before device routing."""
+    def check_request(self, request: web.Request) -> None:
+        """Accept token-free HTTP or HTTPS requests while the provider is available."""
         if self.unloading:
             raise web.HTTPServiceUnavailable
-        peer = request.transport.get_extra_info("peername") if request.transport else None
-        trusted_tls = (
-            self.proxy_ip is not None
-            and peer
-            and peer[0] == self.proxy_ip
-            and request.headers.get("X-Forwarded-Proto") == "https"
-        )
-        if not request.secure and not trusted_tls:
-            raise web.HTTPForbidden(reason="Mashin requires TLS")
         if request.query_string:
             raise web.HTTPBadRequest(reason="Mashin does not accept query parameters")
-        authorization = request.headers.get("Authorization", "")
-        if not authorization.startswith("Bearer "):
-            raise web.HTTPUnauthorized
-        user = await self.mass.webserver.auth.authenticate_with_token(authorization[7:])
-        if user is None:
-            raise web.HTTPUnauthorized
-        if not has_scope(user, Scope.PLAYERS_READ) or not has_scope(user, Scope.PLAYERS_CONTROL):
-            raise web.HTTPForbidden
-        set_current_user(user)
-        return user
 
     def _save_bindings(self, stored: str) -> None:
         self._update_setup_data("device_bindings", stored, immediate=True)
@@ -186,7 +149,7 @@ class MashinProvider(PlayerProvider):
         return await self._route(request, audio=True)
 
     async def _route(self, request: web.Request, *, audio: bool) -> web.WebSocketResponse:
-        user = await self.authenticate(request)
+        self.check_request(request)
         if len(self.sockets) >= self.max_sockets:
             raise web.HTTPTooManyRequests(reason="Mashin connection admission limit reached")
         socket = web.WebSocketResponse(autoping=False, compress=False, max_msg_size=65536)
@@ -215,20 +178,15 @@ class MashinProvider(PlayerProvider):
                     hello = candidate
                     hello.capabilities.validate()
 
-            def allowed(player_id: str) -> bool:
-                return has_player_access(user, player_id, self.mass.players.get_player(player_id))
-
             if isinstance(hello, AudioHello):
-                device = self.registry.lookup(hello.device_id, user.user_id, allowed)
+                device = self.registry.lookup(hello.device_id)
                 if epoch is None or epoch != device.session.epoch:
                     raise ProtocolViolation(
                         "forbidden", "Audio belongs to a different device epoch"
                     )
                 return await device._audio_route(request, socket, hello, epoch)
             async with asyncio.timeout(30):
-                device = await self.registry.register(
-                    hello.device_id, user.user_id, hello.client_name, allowed
-                )
+                device = await self.registry.register(hello.device_id, hello.client_name)
             return await device._control_route(request, socket, hello)
         except (ProtocolViolation, TimeoutError, ConnectionError, web.HTTPException) as err:
             code = err.code if isinstance(err, ProtocolViolation) else type(err).__name__
@@ -247,11 +205,6 @@ class MashinProvider(PlayerProvider):
         if socket.prepared:
             await socket.close()
 
-    def _access_revoked(self, user: User) -> None:
-        for device in list(self.registry.devices.values()):
-            if device.user_id == user.user_id:
-                device._spawn(device._revoke())
-
 
 class MashinDevice:
     """Own one client's player, session, sockets, locks and cancellable workers."""
@@ -261,7 +214,6 @@ class MashinDevice:
         self.provider = provider
         self.mass = provider.mass
         self.device_id = binding.device_id
-        self.user_id = binding.user_id
         self.tasks: set[asyncio.Task[None]] = set()
         self.removers: list[Callable[[], None]] = []
         self.control_socket: web.WebSocketResponse | None = None
@@ -321,13 +273,12 @@ class MashinDevice:
         task.add_done_callback(self.tasks.discard)
         return task
 
-    async def _authorize(self, request: web.Request) -> User:
-        user = await self.provider.authenticate(request)
-        if user.user_id != self.user_id or not has_player_access(
-            user, self.player.player_id, self.player
+    async def _check_connection(self, request: web.Request) -> None:
+        self.provider.check_request(request)
+        if self.session.closed or not self.mass.config.get_raw_player_config_value(
+            self.player.player_id, "enabled", True
         ):
             raise web.HTTPForbidden
-        return user
 
     async def _control_route(  # noqa: PLR0915
         self,
@@ -335,7 +286,7 @@ class MashinDevice:
         socket: web.WebSocketResponse,
         hello: Hello,
     ) -> web.WebSocketResponse:
-        await self._authorize(request)
+        await self._check_connection(request)
         queue: asyncio.Queue[tuple[int, object]] = asyncio.Queue(maxsize=64)
         received_order = 0
         worker: asyncio.Task[None] | None = None
@@ -345,7 +296,7 @@ class MashinDevice:
         control_lock = asyncio.Lock()
         try:
             async with asyncio.timeout(30), self.handshake_lock:
-                await self._authorize(request)
+                await self._check_connection(request)
                 await self._close_control()
                 await self._close_audio()
                 self.control_socket = socket
@@ -423,14 +374,14 @@ class MashinDevice:
         hello: AudioHello,
         epoch: str,
     ) -> web.WebSocketResponse:
-        await self._authorize(request)
+        await self._check_connection(request)
         try:
             async with asyncio.timeout(30), self.handshake_lock:
                 if epoch != self.session.epoch:
                     raise ProtocolViolation(
                         "forbidden", "Audio belongs to a different device epoch"
                     )
-                await self._authorize(request)
+                await self._check_connection(request)
 
                 async def send(data: bytes) -> None:
                     if self.audio_socket is not socket:
@@ -519,7 +470,7 @@ class MashinDevice:
                 expected[:] = [secrets.token_bytes(16)]
                 async with asyncio.timeout(15):
                     await socket.ping(expected[0])
-                    await self._authorize(request)
+                    await self._check_connection(request)
                     await pong.wait()
                 expected.clear()
                 next_ping += 5
@@ -527,7 +478,7 @@ class MashinDevice:
                     next_ping += 5
         except web.HTTPException:
             if self.control_socket is socket:
-                await self._revoke()
+                await self._disable()
         except TimeoutError, ConnectionError:
             if self.control_socket is socket:
                 self.player.logger.warning(
@@ -595,20 +546,17 @@ class MashinDevice:
         await self.mass.player_queues.stop(self.player.player_id)
 
     async def _fallback(self, position: int, paused: bool) -> None:
-        if self.control_request is None:
+        if self.control_request is None or self.control_socket is None:
             raise ProtocolViolation(
-                "forbidden", "MA seek requires an authorized Control connection"
+                "stream_unavailable", "MA seek requires an active Control connection"
             )
         try:
             epoch = self.session.epoch
-            await self._authorize(self.control_request)
+            await self._check_connection(self.control_request)
         except web.HTTPException as err:
-            raise ProtocolViolation("forbidden", "MA seek authorization was revoked") from err
-        user = get_current_user()
+            raise ProtocolViolation("forbidden", "Mashin player is unavailable") from err
         if self.session.epoch != epoch:
             raise ProtocolViolation("stale_playback", "MA seek belongs to an old Control epoch")
-        if user is None or not has_scope(user, Scope.QUEUES_CONTROL):
-            raise ProtocolViolation("forbidden", "MA seek requires queues.control")
         target = self.session.profile_restart_run
         if target is not None and (
             self.session.current is not target or not self.session.adapter.valid(target.context)
@@ -634,8 +582,8 @@ class MashinDevice:
         ):
             await self.session.clear_next()
 
-    async def _revoke(self) -> None:
-        self.player.logger.info("Access revoked for Mashin player %s", self.player.player_id)
+    async def _disable(self) -> None:
+        self.player.logger.info("Mashin player %s disabled", self.player.player_id)
         self.session.buffer.disconnect()
         try:
             with suppress(ConnectionError, ProtocolViolation):
