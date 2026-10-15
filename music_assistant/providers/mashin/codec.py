@@ -26,13 +26,12 @@ class PCMPacing:
         """Initialize an unused stream budget."""
         self.started_at: float | None = None
         self.seconds = 0.0
-        self.rate = 1.1
-        self.burst = 60.0
+        self.configure(False)
 
     def configure(self, realtime: bool) -> None:
-        """Select MA's normal or realtime budget without resetting consumed PCM."""
-        self.rate = 1.01 if realtime else 1.1
-        self.burst = 3.0 if realtime else 60.0
+        """Select Mashin's normal or realtime budget without resetting consumed PCM."""
+        self.rate = 1.01 if realtime else 1.2
+        self.burst = 3.0 if realtime else 120.0
 
     async def wait(self, seconds: float) -> None:
         """Wait until the requested PCM fits the cumulative read budget."""

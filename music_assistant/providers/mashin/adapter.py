@@ -16,7 +16,6 @@ from music_assistant_models.errors import AudioError, LoginFailed, MediaNotFound
 from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.controllers.streams.audio import overlay_active
-from music_assistant.controllers.streams.constants import PacingProfile, output_pacing_args
 from music_assistant.helpers.ffmpeg import FFMpeg
 
 from .codec import PCMChunkReader, PCMPacing
@@ -230,12 +229,12 @@ class PCMSource:
             session_id=context.session_id,
             prepared_buffer=prepared,
         )
-        profile = PacingProfile.NEAR_REALTIME if details.is_realtime else PacingProfile.DEFAULT
-        if self.pacing is not None:
-            self.pacing.configure(details.is_realtime)
-        pacing = output_pacing_args(profile)
+        budget = self.pacing if self.pacing is not None else PCMPacing()
+        budget.configure(details.is_realtime)
+        pacing = ["-readrate", str(budget.rate)]
+        if not repair:
+            pacing += ["-readrate_initial_burst", f"{budget.burst:g}"]
         if repair:
-            pacing = ["-readrate", "1.01" if details.is_realtime else "1.1"]
             source_format = details.audio_format
             resampling = len({source_format.sample_rate, pcm.sample_rate, target.sample_rate}) > 1
             channel_conversion = len({source_format.channels, pcm.channels, target.channels}) > 1

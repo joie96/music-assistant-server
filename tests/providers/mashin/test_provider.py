@@ -580,6 +580,51 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(device.cleanup_task, 1)
         self.mass.players.unregister.assert_awaited_once_with(device.player.player_id)
 
+    async def test_pcm_source_uses_provider_pacing_without_repair_burst(self) -> None:
+        """FFmpeg uses the Mashin budget and never grants a new repair burst."""
+        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        adapter = Mock()
+        adapter.valid.return_value = True
+        pcm = AudioFormat(content_type=ContentType.PCM_F32LE, sample_rate=48000, channels=2)
+        context = module.PlaybackContext(
+            media=Mock(),
+            queue_id="mashin_test",
+            queue_item_id="item",
+            session_id="session",
+            seek_seconds=0,
+            item=SimpleNamespace(
+                streamdetails=SimpleNamespace(
+                    audio_format=pcm,
+                    volume_normalization_mode=VolumeNormalizationMode.DISABLED,
+                    fade_in=False,
+                    is_realtime=False,
+                )
+            ),
+            source_identity=("same", "item", "pcm", 48000, 32, 2, "uri", "", 300),
+        )
+        adapter.source_identity.return_value = context.source_identity
+        audio = adapter.mass.streams.audio
+        audio.select_pcm_format = AsyncMock(return_value=pcm)
+        audio.get_audio_buffer = AsyncMock(return_value=Mock(cancelled=False))
+        audio.get_player_output_plan.return_value = SimpleNamespace(filter_params=[])
+        output = OutputFormat(AudioProfileId.FLAC, "flac", "flac", 48000, 16, 2, None, False)
+        for realtime, repair, expected in (
+            (False, False, ["-readrate", "1.2", "-readrate_initial_burst", "120"]),
+            (False, True, ["-readrate", "1.2"]),
+            (True, False, ["-readrate", "1.01", "-readrate_initial_burst", "3"]),
+            (True, True, ["-readrate", "1.01"]),
+        ):
+            with self.subTest(realtime=realtime, repair=repair):
+                context.item.streamdetails.is_realtime = realtime
+                process = Mock(start=AsyncMock(), close=AsyncMock())
+                source = module.PCMSource(adapter, context, output)
+                with patch.object(module, "FFMpeg", return_value=process) as ffmpeg:
+                    try:
+                        await source.open(repair=repair)
+                        assert ffmpeg.call_args.kwargs["extra_input_args"] == expected
+                    finally:
+                        await source.close()
+
     async def test_repair_keeps_ma_processing_without_dsp_precheck(self) -> None:
         """DSP, normalization, fade and conversion cannot preempt the PCM match."""
         module = importlib.import_module("music_assistant.providers.mashin.adapter")

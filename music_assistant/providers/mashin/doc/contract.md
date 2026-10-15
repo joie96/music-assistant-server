@@ -299,9 +299,13 @@ keine Bitidentitaet gegen einen kontinuierlichen Opus-Encoder behaupten.
 
 ### 4.3 Provider-Push und kapazitaetsgesteuerte Produktion
 
-MA-Pacing erhalten: normale nicht-realtime Tracks im Referenzstand maximal
-60 s Anfangsburst, danach 1.1x; realtime 3 s/1.01x. Quelle darf langsamer sein.
-Das ist eine Obergrenze, kein zugesicherter oder erzwungener Vorrat.
+Mashin-eigenes Output-Pacing: normale nicht-realtime Tracks maximal
+120 s Anfangsburst, danach 1.2x; realtime unveraendert 3 s/1.01x. Diese
+providerlokale Regel aendert keine zentralen MA-Pacingprofile oder Quellenlimits.
+Quelle darf langsamer sein. Das ist eine Obergrenze, kein zugesicherter oder
+erzwungener Vorrat. PCM-Lesebudget und FFmpeg-Ausgabe verwenden dieselben Werte;
+Reconnect und PCM-Reparatur setzen das verbrauchte Budget nicht zurueck und
+gewaehren keinen neuen Anfangsburst.
 
 Der Provider startet den freigegebenen A-Stream selbst, B erst gemaess Abschnitt
 11. Barriere: accepted-load/prepare, aktuelles audio_ready, danach bestaetigte

@@ -23,22 +23,24 @@ class TestPCMPacing(unittest.IsolatedAsyncioTestCase):
     async def test_reopen_and_overlap_share_the_initial_budget(self) -> None:
         """Repair work consumes the same ledger instead of starting another burst."""
         pacing = PCMPacing()
+        assert pacing.rate == 1.2
+        assert pacing.burst == 120
         with (
             patch("music_assistant.providers.mashin.codec.time.monotonic", return_value=10),
             patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
         ):
             pacing.configure(False)
-            await pacing.wait(1)
+            await pacing.wait(120)
             sleep.assert_not_awaited()
-            pacing.commit(60)
+            pacing.commit(120)
             pacing.configure(False)
             await pacing.wait(1)
             assert sleep.await_args is not None
-            assert sleep.await_args.args[0] == pytest.approx(1 / 1.1)
+            assert sleep.await_args.args[0] == pytest.approx(1 / 1.2)
             pacing.commit(5)
             await pacing.wait(1)
-            assert sleep.await_args.args[0] == pytest.approx(6 / 1.1)
-            assert pacing.seconds == 65
+            assert sleep.await_args.args[0] == pytest.approx(6 / 1.2)
+            assert pacing.seconds == 125
 
     async def test_realtime_uses_its_smaller_single_burst(self) -> None:
         """Realtime sources retain MA's three-second and 1.01x envelope."""
