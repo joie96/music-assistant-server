@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -12,8 +13,12 @@ from typing import TYPE_CHECKING
 from mutagen.ogg import OggPage
 from mutagen.ogg import error as ogg_error
 
+from music_assistant.helpers.diagnostics import sanitize_text
+
 from .models import AudioProfileId, OutputFormat
 from .wire import MAX_PAYLOAD_BYTES, ProtocolViolation
+
+LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from music_assistant.helpers.ffmpeg import FFMpeg
@@ -103,6 +108,43 @@ class ChunkEncoder:
 
     async def encode(self, pcm: bytes) -> bytes:
         """Encode one independently decodable mini-stream without disk or source URLs."""
+        frame_bytes = self.format.channels * 4
+        if not pcm or len(pcm) % frame_bytes or len(pcm) > self.format.sample_rate_hz * frame_bytes:
+            raise ProtocolViolation("encoder_failed", "Invalid encoder PCM size")
+        attempt = 1
+        while True:
+            try:
+                return await self._encode_once(pcm)
+            except (ProtocolViolation, OSError, TimeoutError) as err:
+                if isinstance(err, ProtocolViolation) and err.code != "encoder_failed":
+                    raise
+                reason = str(err) if isinstance(err, ProtocolViolation) else type(err).__name__
+                if attempt == 3:
+                    raise ProtocolViolation(
+                        "encoder_failed", f"Audio encoder failed after 3 attempts: {reason}"
+                    ) from err
+                LOGGER.warning(
+                    "Retrying Mashin audio encoder: profile=%s attempt=%s/3; reason=%s",
+                    self.format.profile_id.value,
+                    attempt + 1,
+                    reason,
+                )
+                await asyncio.sleep(0.25 * 2 ** (attempt - 1))
+                attempt += 1
+
+    def commit_history(self, pcm: bytes) -> None:
+        """Advance history only after a valid atomic chunk commit."""
+        if self.format.profile_id != AudioProfileId.FLAC:
+            size = 3840 * self.format.channels * 4
+            self.history = pcm[-size:] if len(pcm) >= size else (self.history + pcm)[-size:]
+
+    async def close(self) -> None:
+        """Release a currently running encoder."""
+        if self.active is not None:
+            await self.active.close()
+
+    async def _encode_once(self, pcm: bytes) -> bytes:
+        """Encode the reserved PCM once without committing codec history."""
         from music_assistant_models.enums import ContentType  # noqa: PLC0415
         from music_assistant_models.media_items import AudioFormat  # noqa: PLC0415
 
@@ -110,8 +152,6 @@ class ChunkEncoder:
 
         output = self.format
         frame_bytes = output.channels * 4
-        if not pcm or len(pcm) % frame_bytes or len(pcm) > output.sample_rate_hz * frame_bytes:
-            raise ProtocolViolation("encoder_failed", "Invalid encoder PCM size")
         opus = output.profile_id != AudioProfileId.FLAC
         history = self.history if opus else b""
         audio_format = AudioFormat(
@@ -170,6 +210,8 @@ class ChunkEncoder:
             input_format=audio_format,
             output_format=audio_format,
             extra_output_args=args,
+            collect_log_history=True,
+            loglevel="error",
         )
         self.active = process
         encoded = bytearray()
@@ -183,7 +225,29 @@ class ChunkEncoder:
                         )
                 await process.wait_with_timeout(5)
                 if process.returncode != 0 or process.stdin_feeder_exception is not None:
-                    raise ProtocolViolation("encoder_failed", "Audio encoder failed")
+                    input_error = (
+                        type(process.stdin_feeder_exception).__name__
+                        if process.stdin_feeder_exception is not None
+                        else "none"
+                    )
+                    log_tail = sanitize_text("\n".join(list(process.log_history)[-5:]))[-1024:]
+                    LOGGER.warning(
+                        "Mashin audio encoder failed: profile=%s rate=%s channels=%s "
+                        "pcm_bytes=%s encoded_bytes=%s exit_code=%s input_error=%s; ffmpeg=%s",
+                        output.profile_id.value,
+                        output.sample_rate_hz,
+                        output.channels,
+                        len(pcm),
+                        len(encoded),
+                        process.returncode,
+                        input_error,
+                        " | ".join(log_tail.splitlines()) or "No stderr captured",
+                    )
+                    raise ProtocolViolation(
+                        "encoder_failed",
+                        f"Audio encoder failed (exit_code={process.returncode}, "
+                        f"input_error={input_error})",
+                    )
             if opus:
                 payload = remux_opus(
                     bytes(encoded), len(history) // frame_bytes, len(pcm) // frame_bytes
@@ -195,17 +259,6 @@ class ChunkEncoder:
             return payload
         finally:
             self.active = None
-
-    def commit_history(self, pcm: bytes) -> None:
-        """Advance history only after a valid atomic chunk commit."""
-        if self.format.profile_id != AudioProfileId.FLAC:
-            size = 3840 * self.format.channels * 4
-            self.history = pcm[-size:] if len(pcm) >= size else (self.history + pcm)[-size:]
-
-    async def close(self) -> None:
-        """Release a currently running encoder."""
-        if self.active is not None:
-            await self.active.close()
 
 
 def strip_flac_metadata(data: bytes, sample_rate: int, channels: int) -> bytes:

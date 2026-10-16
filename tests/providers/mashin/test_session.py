@@ -22,6 +22,7 @@ from music_assistant.providers.mashin.models import (
     ClientResumeState,
     ClientStreamCursor,
     CommandAck,
+    ErrorMessage,
     Hello,
     PlayerState,
     SetAudioProfile,
@@ -109,6 +110,27 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         assert self.session.pending is not None
         await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
         await task
+
+    async def test_stream_failure_logs_server_reason_and_chunk_context(self) -> None:
+        """Internal encoder reasons remain visible without logging client-provided text."""
+        await self.accept_load()
+        run = self.session.current
+        assert run is not None
+        await self.session._fail(
+            run,
+            safe_error("encoder_failed", "Invalid FLAC signature"),
+            detail="Invalid FLAC signature",
+        )
+        self.adapter.player.logger.warning.assert_called_once_with(
+            "Stream %s failed on player %s: %s; profile=%s chunk=%s frame=%s; reason=%s",
+            run.descriptor.stream_id,
+            "mashin_test",
+            "encoder_failed",
+            "flac",
+            1,
+            0,
+            "Invalid FLAC signature",
+        )
 
     async def test_idle_report_before_load_ack_cannot_reset_new_stream(self) -> None:
         """Queued idle state cannot revoke a subsequently acknowledged MA load."""
@@ -365,6 +387,52 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         assert self.session.recovery_fallback is None
         assert secret not in str(logger.mock_calls)
         assert not any("fallback completed" in str(call) for call in logger.info.call_args_list)
+
+    async def test_encoder_exhaustion_sends_one_terminal_stream_error(self) -> None:
+        """Retries stay internal until one stream-scoped error reaches the client."""
+        await self.accept_load()
+        await self.session.report(BufferStatus(1, 1, 262144))
+        run = self.session.current
+        assert run is not None
+        failed = asyncio.Event()
+
+        async def encode_once(_pcm: bytes) -> bytes:
+            assert not any(kind == "error" for kind, _payload in self.messages)
+            raise OSError("private source detail")
+
+        async def read_chunk(_run: object) -> tuple[bytes, bool, bytes, int]:
+            pcm = bytes(8)
+            payload = await run.encoder.encode(pcm)
+            return pcm, False, payload, run.source_attempt_id
+
+        async def send(kind: str, payload: object) -> None:
+            await self.send(kind, payload)
+            if kind == "error":
+                failed.set()
+
+        self.session.send_control = send
+        with (
+            patch.object(run.encoder, "_encode_once", AsyncMock(side_effect=encode_once)) as encode,
+            patch.object(self.session, "_read_chunk", side_effect=read_chunk),
+        ):
+            producer = self.spawn(self.session._produce())
+            await asyncio.wait_for(failed.wait(), 2)
+        assert encode.await_count == 3
+        assert not producer.done()
+        errors = [payload for kind, payload in self.messages if kind == "error"]
+        assert len(errors) == 1
+        error = errors[0]
+        assert isinstance(error, ErrorMessage)
+        assert error.stream_id == run.descriptor.stream_id
+        assert error.audio_connection_id == self.session.buffer.audio_connection_id
+        assert error.error.code == "encoder_failed"
+        assert "after 3 attempts" in error.error.message
+        assert not error.error.is_retryable
+        assert self.session.buffer.streams[run.descriptor.stream_id].terminal
+        assert self.session.buffer.reservation is None
+        assert "private source detail" not in str(self.messages)
+        self.fallback.assert_not_awaited()
+        self.stop.assert_not_awaited()
 
     async def test_fallback_failure_reports_source_error_and_keeps_producer_alive(self) -> None:
         """A failed MA seek is terminal for its stream, not for the producer worker."""
@@ -701,15 +769,19 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         await self.accept_load()
         assert self.session.current is not None
         run = self.session.current
-        await self.session._fail(
-            run, safe_error("stream_failed", "Untrusted private source detail")
-        )
+        secret = "https://example.test/audio?token=secret"
+        await self.session._fail(run, safe_error("stream_failed", secret))
         self.adapter.player.logger.warning.assert_called_once_with(
-            "Stream %s failed on player %s: %s",
+            "Stream %s failed on player %s: %s; profile=%s chunk=%s frame=%s; reason=%s",
             run.descriptor.stream_id,
             "mashin_test",
             "stream_failed",
+            "flac",
+            1,
+            0,
+            "No server-side detail",
         )
+        assert secret not in str(self.adapter.player.logger.mock_calls)
 
     async def test_profile_change_without_seek_authority_preserves_old_stream(self) -> None:
         """A rejected public MA seek cannot secretly change an active stream's codec."""

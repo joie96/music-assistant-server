@@ -1,8 +1,10 @@
 """Independent EOF assembly and bounded Ogg remux tests."""
 
+import asyncio
 import unittest
 from io import BytesIO
-from unittest.mock import AsyncMock, patch
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from mutagen.ogg import OggPage
@@ -15,6 +17,126 @@ from music_assistant.providers.mashin.codec import (
 )
 from music_assistant.providers.mashin.models import AudioProfileId, OutputFormat
 from music_assistant.providers.mashin.wire import ProtocolViolation
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+
+class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
+    """Preserve actionable encoder diagnostics without exposing raw input failures."""
+
+    async def test_retries_preserve_pcm_and_uncommitted_history(self) -> None:
+        """Two transient failures replay the same chunk without advancing codec history."""
+        encoder = ChunkEncoder(
+            OutputFormat(AudioProfileId.OPUS_96K, "ogg", "opus", 48000, None, 2, 96000, True)
+        )
+        encoder.history = b"previous"
+        pcm = bytes(8)
+        with (
+            patch.object(
+                encoder,
+                "_encode_once",
+                AsyncMock(
+                    side_effect=[
+                        ProtocolViolation("encoder_failed", "Invalid Ogg checksum"),
+                        OSError("private source detail"),
+                        b"valid",
+                    ]
+                ),
+            ) as encode,
+            patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
+        ):
+            assert await encoder.encode(pcm) == b"valid"
+        assert encode.await_count == 3
+        assert all(call.args == (pcm,) for call in encode.await_args_list)
+        assert [call.args[0] for call in sleep.await_args_list] == [0.25, 0.5]
+        assert encoder.history == b"previous"
+
+    async def test_retries_stop_after_three_failures(self) -> None:
+        """Permanent encoder failures remain terminal and do not reveal raw exceptions."""
+        encoder = ChunkEncoder(
+            OutputFormat(AudioProfileId.FLAC, "flac", "flac", 48000, 16, 2, None, False)
+        )
+        with (
+            patch.object(
+                encoder, "_encode_once", AsyncMock(side_effect=OSError("private-token"))
+            ) as encode,
+            patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
+            pytest.raises(ProtocolViolation, match="after 3 attempts: OSError") as failure,
+        ):
+            await encoder.encode(bytes(8))
+        assert encode.await_count == 3
+        assert sleep.await_count == 2
+        assert failure.value.code == "encoder_failed"
+        assert "private-token" not in str(failure.value)
+
+    async def test_cancellation_and_invalid_pcm_are_not_retried(self) -> None:
+        """Stop/seek cancellation propagates and malformed input never starts FFmpeg."""
+        encoder = ChunkEncoder(
+            OutputFormat(AudioProfileId.FLAC, "flac", "flac", 48000, 16, 2, None, False)
+        )
+        with patch.object(
+            encoder, "_encode_once", AsyncMock(side_effect=asyncio.CancelledError)
+        ) as encode:
+            with pytest.raises(ProtocolViolation, match="Invalid encoder PCM size"):
+                await encoder.encode(b"invalid")
+            encode.assert_not_awaited()
+            with pytest.raises(asyncio.CancelledError):
+                await encoder.encode(bytes(8))
+            encode.assert_awaited_once()
+
+    async def test_failure_reports_exit_code_and_sanitized_stderr(self) -> None:
+        """Process and feeder failures provide bounded, privacy-safe server diagnostics."""
+        for returncode, input_error in ((1, None), (0, OSError("private-feeder-detail"))):
+            with self.subTest(returncode=returncode):
+                encoder = ChunkEncoder(
+                    OutputFormat(AudioProfileId.FLAC, "flac", "flac", 48000, 16, 2, None, False)
+                )
+                process = AsyncMock()
+                process.returncode = returncode
+                process.stdin_feeder_exception = input_error
+                process.log_history = [
+                    "earlier omitted entry",
+                    "context one",
+                    "context two",
+                    "context three",
+                    "Unrecognized option 'frame_size'.",
+                    "https://username:private-password@example.test/audio.flac?token=private-token",
+                ]
+
+                async def encoded() -> AsyncGenerator[bytes]:
+                    yield b"encoded"
+
+                process.iter_chunked = Mock(return_value=encoded())
+                ffmpeg = Mock(return_value=process)
+                with (
+                    patch.dict(
+                        "sys.modules", {"music_assistant.helpers.ffmpeg": Mock(FFMpeg=ffmpeg)}
+                    ),
+                    self.assertLogs(
+                        "music_assistant.providers.mashin.codec", level="WARNING"
+                    ) as logs,
+                    pytest.raises(ProtocolViolation) as failure,
+                ):
+                    await encoder._encode_once(bytes(8))
+                assert failure.value.code == "encoder_failed"
+                assert f"exit_code={returncode}" in str(failure.value)
+                assert "private-feeder-detail" not in str(failure.value)
+                assert "private-token" not in str(failure.value)
+                message = logs.records[0].getMessage()
+                assert "Unrecognized option 'frame_size'." in message
+                assert "profile=flac rate=48000 channels=2" in message
+                assert "pcm_bytes=8 encoded_bytes=7" in message
+                assert "earlier omitted entry" not in message
+                assert "private-password" not in message
+                assert "private-token" not in message
+                assert "private-feeder-detail" not in message
+                expected_input_error = "OSError" if input_error else "none"
+                assert f"input_error={expected_input_error}" in message
+                assert ffmpeg.call_args is not None
+                assert ffmpeg.call_args.kwargs["collect_log_history"] is True
+                assert ffmpeg.call_args.kwargs["loglevel"] == "error"
+                assert encoder.active is None
 
 
 class TestPCMPacing(unittest.IsolatedAsyncioTestCase):

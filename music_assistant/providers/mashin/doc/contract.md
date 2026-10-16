@@ -292,6 +292,14 @@ Ueberschreitung ist encoder_failed, kein Split in kuerzere regulaere Chunks.
 Gueltige Dauer/Seekgrenzen aus first_frame/frame_count validieren, nicht blind
 aus Chunkindex oder Zielbitrate ableiten. EOF-Rest nie kuenstlich auffuellen.
 
+Fehlgeschlagenes Chunk-Encoding vor dem Commit providerintern hoechstens dreimal
+mit unveraenderten PCM-Bytes, derselben Reservierung und unveraenderter Codec-Historie
+versuchen. Vor Versuch zwei und drei 250 beziehungsweise 500 ms warten; bestehende
+Anforderungs- und Recoveryfristen bleiben wirksam. Abbruch durch Stop/Seek nicht
+wiederholen. Keine Musikquelle neu oeffnen und keine teilweise erzeugten Bytes
+senden. Erst endgueltiges Scheitern als nicht retryable encoder_failed ueber die
+bestehende streambezogene error-Meldung an den Client melden.
+
 FLAC dekodiert exakt frame_count Eingabeframes. Opus bekommt genau die letzten
 min(first_frame, 3840) verfuegbaren vorangehenden PCM-Sampleframes bei 48 kHz
 zur Initialisierung, also maximal 80 ms; am Streamanfang keine erfundene

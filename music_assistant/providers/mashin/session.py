@@ -1221,7 +1221,7 @@ class MashinSession:
             except ProtocolViolation as err:
                 if self._find(run.descriptor.stream_id) is run:
                     self.buffer.reservation = None
-                    await self._fail(run, safe_error(err.code, str(err)))
+                    await self._fail(run, safe_error(err.code, str(err)), detail=str(err))
             except MusicAssistantError:
                 if self._find(run.descriptor.stream_id) is run:
                     await self._fail(run, safe_error("source_failed", "Unable to open source"))
@@ -1528,14 +1528,21 @@ class MashinSession:
             ):
                 await self.adapter.release(owned)
 
-    async def _fail(self, run: StreamRun, error: ProtocolError) -> None:
+    async def _fail(
+        self, run: StreamRun, error: ProtocolError, *, detail: str | None = None
+    ) -> None:
         if run.error is not None or self._find(run.descriptor.stream_id) is not run:
             return
+        stream = self.buffer.streams[run.descriptor.stream_id]
         self.logger.warning(
-            "Stream %s failed on player %s: %s",
+            "Stream %s failed on player %s: %s; profile=%s chunk=%s frame=%s; reason=%s",
             run.descriptor.stream_id,
             self.adapter.player.player_id,
             error.code,
+            run.descriptor.output_format.profile_id.value,
+            stream.next_produced,
+            stream.produced_frames,
+            detail or "No server-side detail",
         )
         run.error = error
         self.buffer.streams[run.descriptor.stream_id].terminal = True
