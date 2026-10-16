@@ -587,6 +587,15 @@ class MashinDevice:
         del event
         run = self.session.next
         current = self.session.current
+        if run is not None:
+            data = self.mass.player_queues.queue_data_or_none(run.context.queue_id)
+            if (
+                data is not None
+                and data.queue.current_item is run.context.item
+                and run.context.item.available
+                and not self.player.state.group_members
+            ):
+                return
         if (
             run
             and current

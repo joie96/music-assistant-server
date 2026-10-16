@@ -9,7 +9,7 @@ from enum import StrEnum
 from functools import cache
 from typing import Any, Literal, TypeAliasType, TypeVar, Union, get_args, get_origin, get_type_hints
 
-from .wire import MAX_INTEGER, ProtocolViolation, integer, stream_uuid
+from .wire import MAX_INTEGER, PROTOCOL_VERSION, ProtocolViolation, integer, stream_uuid
 
 ModelT = TypeVar("ModelT")
 type OutputState = Literal["idle", "buffering", "playing", "paused", "ended", "error"]
@@ -198,6 +198,16 @@ class ClientStreamCursor:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedActivation:
+    """One consumed MA successor grant, retained independently of socket delivery."""
+
+    previous_stream_id: str
+    stream_id: str
+    next_revision: int
+    previous_position_frame: int
+
+
+@dataclass(frozen=True, slots=True)
 class ClientResumeState:
     """Current local output and receipt state retained across reconnects."""
 
@@ -209,6 +219,7 @@ class ClientResumeState:
     is_muted: bool
     next_revision: int
     received_streams: list[ClientStreamCursor]
+    activation: PreparedActivation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +332,17 @@ class TransportStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedActivated:
+    """Actual application of a manual successor activation, not a natural track end."""
+
+    sequence: int
+    activation: PreparedActivation
+    output_revision: int
+    output_state: OutputState
+    position_frame: int
+
+
+@dataclass(frozen=True, slots=True)
 class TrackStarted:
     """Audible promotion of the authorized successor."""
 
@@ -376,6 +398,7 @@ CLIENT_MESSAGES = {
     "player_state": PlayerState,
     "transport_status": TransportStatus,
     "track_started": TrackStarted,
+    "prepared_activated": PreparedActivated,
     "track_ended": TrackEnded,
     "audio_reconnect_request": AudioReconnectRequest,
     "set_audio_profile": SetAudioProfile,
@@ -439,6 +462,16 @@ class PrepareNext:
     command_id: int
     current_stream_id: str
     stream: StreamDescriptor
+    next_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActivatePrepared:
+    """Consume an existing successor grant without replacing its PCM stream."""
+
+    command_id: int
+    current_stream_id: str
+    stream_id: str
     next_revision: int
 
 
@@ -507,6 +540,15 @@ def parse_model(model: type[ModelT], value: object) -> ModelT:
         identifiers = [cursor.stream_id for cursor in result.received_streams]
         if len(identifiers) > 2 or len(identifiers) != len(set(identifiers)):
             raise ProtocolViolation("invalid_message", "Invalid received stream set")
+    if isinstance(result, PreparedActivation) and (
+        result.previous_stream_id == result.stream_id or result.next_revision == 0
+    ):
+        raise ProtocolViolation("invalid_message", "Invalid activation grant")
+    if isinstance(result, PreparedActivated) and result.output_state == "idle":
+        raise ProtocolViolation("invalid_message", "Activated stream cannot be idle")
+    if isinstance(result, ClientResumeState) and result.activation is not None:
+        if result.current_stream_id != result.activation.stream_id:
+            raise ProtocolViolation("invalid_message", "Activation does not match current stream")
     if isinstance(result, ClientResumeState) and result.current_stream_id is None:
         if (
             result.output_state != "idle"
@@ -542,7 +584,7 @@ def decode_envelope(text: str) -> Envelope:
     except (ValueError, UnicodeError) as err:
         raise ProtocolViolation("invalid_message", "Invalid JSON") from err
     envelope = parse_model(Envelope, value)
-    if envelope.protocol_version != 1:
+    if envelope.protocol_version != PROTOCOL_VERSION:
         raise ProtocolViolation("unsupported_version", "Mashin protocol version 1 required")
     return envelope
 
@@ -551,7 +593,7 @@ def encode_message(message_type: str, message_id: str, epoch: str | None, payloa
     """Serialize a typed provider payload at the WebSocket boundary."""
     if not is_dataclass(payload) or isinstance(payload, type):
         raise ProtocolViolation("invalid_message", "Expected typed message payload")
-    envelope = Envelope(1, message_type, message_id, epoch, asdict(payload))
+    envelope = Envelope(PROTOCOL_VERSION, message_type, message_id, epoch, asdict(payload))
     result = json.dumps(asdict(envelope), separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     if len(result) > 65536:
         raise ProtocolViolation("incompatible_server", "Control message too large")
@@ -612,7 +654,7 @@ def _parse_value(hint: Any, value: object, name: str) -> Any:
             not value.isascii() or len(value) > 128
         ):
             raise ProtocolViolation("invalid_message", "Invalid ASCII identifier")
-        if name in ("stream_id", "current_stream_id", "playback_instance_id"):
+        if name in ("stream_id", "previous_stream_id", "current_stream_id", "playback_instance_id"):
             stream_uuid(value)
         if hint is AudioProfileId:
             try:

@@ -190,7 +190,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         ):
             await control.send_json(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "type": "hello",
                     "message_id": str(uuid4()),
                     "connection_epoch": None,
@@ -239,7 +239,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             ):
                 await control.send_json(
                     {
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "type": "hello",
                         "message_id": str(uuid4()),
                         "connection_epoch": None,
@@ -286,7 +286,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             ):
                 await control.send_json(
                     {
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "type": "hello",
                         "message_id": str(uuid4()),
                         "connection_epoch": None,

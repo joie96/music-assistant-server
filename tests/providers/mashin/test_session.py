@@ -25,6 +25,8 @@ from music_assistant.providers.mashin.models import (
     ErrorMessage,
     Hello,
     PlayerState,
+    PreparedActivated,
+    PreparedActivation,
     SetAudioProfile,
     SetMedia,
     TrackStarted,
@@ -72,6 +74,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 queue_item_id="item",
                 session_id="ma-session",
                 seek_seconds=150,
+                source_identity=("fixture-source",),
                 item=SimpleNamespace(duration=300),
             ),
         )
@@ -1129,6 +1132,178 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.session.buffer.commit(AudioChunk(successor, 1, 0, 48000, False, b"encoded"))
         self.session.buffer.streams[successor].highest_offered = 1
         return current, successor
+
+    async def test_manual_activation_resumes_without_final_a_or_duplicate_switch(self) -> None:
+        """An offline manual skip consumes B once without inventing a natural A end."""
+        current, successor = await self.prepare_transition()
+        old = self.session.buffer.streams[current]
+        old.final_index = old.final_frame_count = None
+        old.terminal = False
+        receipt = PreparedActivation(current, successor, 1, 12000)
+        state = ClientResumeState(
+            successor,
+            1,
+            "playing",
+            0,
+            50,
+            False,
+            1,
+            [ClientStreamCursor(successor, 2)],
+            receipt,
+        )
+        await self.session._reconcile(state)
+        assert self.session.current is not None
+        run = self.session.current
+        assert run.descriptor.stream_id == successor
+        assert self.session.activation == receipt
+        assert current not in self.session.buffer.streams
+        await self.session._reconcile(state)
+        assert self.session.current is run
+        await self.session.report(PreparedActivated(5, receipt, 1, "playing", 0))
+        assert self.session.current is run
+
+    async def test_new_ma_session_activates_existing_successor_without_set_media(self) -> None:
+        """MA's new load generation reauthorizes B without changing its cache identity."""
+        current, successor = await self.prepare_transition()
+        run = self.session.next
+        assert run is not None
+        descriptor = run.descriptor
+        delivery = self.session.buffer.streams[successor]
+        context = cast(
+            "PlaybackContext",
+            SimpleNamespace(**{**vars(self.context), "session_id": "new-ma-session"}),
+        )
+        self.sent.clear()
+        self.messages.clear()
+        task = self.spawn(self.session.load(context))
+        await self.sent.wait()
+        assert [kind for kind, _ in self.messages] == ["activate_prepared"]
+        assert self.session.next is run
+        assert run.descriptor is descriptor
+        assert run.context is context
+        assert self.session.buffer.streams[successor] is delivery
+        assert delivery.next_produced == 2
+        assert self.session.pending is not None
+        await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
+        await task
+        self.publish.reset_mock()
+        await self.session.report(
+            PreparedActivated(1, PreparedActivation(current, successor, 1, 0), 1, "buffering", 0)
+        )
+        assert self.session.current is run
+        assert self.session.activation_target is None
+        assert self.publish.call_args.args[0].output_state == "buffering"
+        assert all(call.args[0].output_state != "playing" for call in self.publish.call_args_list)
+
+    async def test_applied_activation_with_lost_ack_does_not_reissue(self) -> None:
+        """Hello proves a completed B switch without replaying the lost activation ACK."""
+        current, successor = await self.prepare_transition()
+        context = cast(
+            "PlaybackContext",
+            SimpleNamespace(**{**vars(self.context), "session_id": "new-ma-session"}),
+        )
+        self.sent.clear()
+        task = self.spawn(self.session.load(context))
+        await self.sent.wait()
+        await self.session.control_lost()
+        state = ClientResumeState(
+            successor,
+            1,
+            "playing",
+            12000,
+            50,
+            False,
+            1,
+            [ClientStreamCursor(successor, 2)],
+            PreparedActivation(current, successor, 1, 12000),
+        )
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        await self.session.connect(
+            Hello("device", "Client", "0.1.0", state, capabilities, AudioProfileId.FLAC),
+            self.send,
+            "test",
+        )
+        await task
+        assert self.session.current is not None
+        assert self.session.current.descriptor.stream_id == successor
+        assert self.session.current.position_frame == 12000
+        assert self.session.activation_target is None
+        assert current not in self.session.buffer.streams
+        self.adapter.loaded.assert_called_once_with(context)
+        self.messages.clear()
+        await self.session.after_welcome()
+        assert not self.messages
+
+    async def test_changed_source_uses_fresh_load_instead_of_prepared_cache(self) -> None:
+        """A matching queue item alone never authorizes bytes from another source."""
+        _, successor = await self.prepare_transition()
+        context = cast(
+            "PlaybackContext",
+            SimpleNamespace(
+                **{
+                    **vars(self.context),
+                    "session_id": "new-ma-session",
+                    "source_identity": ("different-source",),
+                }
+            ),
+        )
+        self.sent.clear()
+        self.messages.clear()
+        task = self.spawn(self.session.load(context))
+        await self.sent.wait()
+        assert [kind for kind, _ in self.messages] == ["set_media"]
+        assert successor not in self.session.buffer.streams
+        assert self.session.pending is not None
+        await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
+        await task
+
+    async def test_pending_activation_reissues_after_reconnect_still_on_a(self) -> None:
+        """A lost activation command retains the desired B, not another queue Next action."""
+        current, successor = await self.prepare_transition()
+        context = cast(
+            "PlaybackContext",
+            SimpleNamespace(**{**vars(self.context), "session_id": "new-ma-session"}),
+        )
+        self.sent.clear()
+        task = self.spawn(self.session.load(context))
+        await self.sent.wait()
+        await self.session.control_lost()
+        state = ClientResumeState(
+            current,
+            1,
+            "playing",
+            0,
+            50,
+            False,
+            1,
+            [ClientStreamCursor(current, 2), ClientStreamCursor(successor, 1)],
+        )
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        await self.session.connect(
+            Hello("device", "Client", "0.1.0", state, capabilities, AudioProfileId.FLAC),
+            self.send,
+            "test",
+        )
+        await task
+        assert self.session.activation_target is context
+        self.messages.clear()
+        self.sent.clear()
+        reissue = self.spawn(self.session.after_welcome())
+        await self.sent.wait()
+        assert [kind for kind, _ in self.messages] == ["activate_prepared"]
+        assert self.session.pending is not None
+        await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
+        await reissue
+        assert self.session.next is not None
+        assert self.session.next.descriptor.stream_id == successor
+
+    async def test_invalid_activation_does_not_discard_a(self) -> None:
+        """A stale predecessor or forged skip position cannot consume the grant."""
+        current, successor = await self.prepare_transition()
+        with pytest.raises(ProtocolViolation):
+            self.session._accept_activation(PreparedActivation(current, successor, 1, 48001), 1, 0)
+        assert self.session.current is not None
+        assert self.session.current.descriptor.stream_id == current
 
     async def test_promotion_resume_accepts_retired_a_and_lost_b_ack(self) -> None:
         """A valid hello retains only B after the atomic local transition."""

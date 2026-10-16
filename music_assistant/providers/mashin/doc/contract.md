@@ -1,4 +1,11 @@
-# Implementierungsvertrag: Mashin PlayerProvider und Rust-Client V1
+# Implementierungsvertrag: Mashin PlayerProvider und Clients V2
+
+Control-Wireversion 2 erweitert V1 inkompatibel um cache-erhaltende manuelle
+Nachfolgeraktivierung. Provider, Rust-/Flutter-Client und Python-CLI gemeinsam
+aktualisieren; andere Wireversionen explizit ablehnen, kein stiller V1-Fallback.
+Die `/mashin/v1/`-Routes, das binaere Chunkformat, Codecprofile und die 39 bisherigen
+Ressourcenlimits bleiben unveraendert. Verweise auf V1-Basisregeln unten gelten
+auch fuer V2, soweit die explizite Aktivierung sie nicht ergaenzt.
 
 Datum: 2026-10-14
 Status: Zielmodell und Implementierungsvorgabe; keine implementierte Provider-/Clientloesung.
@@ -645,7 +652,15 @@ Chunk bestaetigt implizit die erhaltene Final-Markierung und Endmetadaten aus
 Abschnitt 8/9; keine zusaetzlichen EOF-/Endmetadatenfelder im Cursor.
 ClientResumeState hat genau current_stream_id nullable,
 output_revision, output_state, position_frame, volume_percent, is_muted,
-next_revision und received_streams. received_streams enthaelt maximal zwei
+next_revision, received_streams und activation. activation ist verpflichtend
+nullable PreparedActivation. PreparedActivation hat genau previous_stream_id
+(UUIDv4 von A), stream_id (UUIDv4 von B), next_revision (die konsumierte Freigabe)
+und previous_position_frame (letzter realer A-Ausgabezeiger). Genau einen solchen
+Beleg nach expliziter Aktivierung erhalten, nicht eine Liste von UI-Aktionen.
+Er bleibt auch nach neuem prepare_next erhalten; Stop, set_media und die naechste
+natuerliche Promotion entfernen ihn. Der neue aktuelle Stream muss stream_id
+des Belegs sein. Ohne manuelle Aktivierung und nach lokalem Stop activation=null.
+received_streams enthaelt maximal zwei
 ClientStreamCursor fuer registriertes A/B, keine Cachebereichsliste. Jeden noch
 registrierten aktuellen oder vorbereiteten Stream genau einmal aufnehmen,
 auch ohne Audiobytes mit next_chunk_index=1. Cursor 1 bestaetigt nur die atomare
@@ -711,7 +726,7 @@ retry_after_millis nullable. Keine nackten Exceptions oder Musikservice-URLs.
 Externes Error-Mapping einmal an der Providergrenze.
 
 Textnachrichten auf beiden Kanaelen haben genau protocol_version, type,
-message_id, connection_epoch und payload. Version=1; Epoche vor welcome null,
+message_id, connection_epoch und payload. Version=2; Epoche vor welcome null,
 danach Pflicht. IDs eindeutig, Unknown Fields ablehnen, keine implizite
 String-/Boolkonvertierung. Integer nichtnegativ und <=9007199254740991, sofern
 nicht enger begrenzt. UUIDs kanonisch. Sonstige String-IDs maximal 128 ASCII-Zeichen.
@@ -748,7 +763,7 @@ automatische Uebernahme gespeicherter Nutzerbindungen; Bestandsprovider neu einr
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "hello",
 	"message_id": "hello-1",
 	"connection_epoch": null,
@@ -792,7 +807,7 @@ Umdeuten eines alten B in eine neue Freigabe. Nicht vereinbarer Zustand verlangt
 explizite Fehlerbehandlung/neuen MA-Load, kein stilles Resume oder Cacheflush.
 
 Vor End-/Promotionsabstimmung einen noch unbestaetigten Kontextcommand pruefen.
-Provider speichert vor Sendebeginn von set_media/prepare_next/clear_next dessen
+Provider speichert vor Sendebeginn von set_media/prepare_next/clear_next/activate_prepared dessen
 Epoche/command_id, unveraenderlichen Payload, betroffene Stream-/Freigabeidentitaet
 und Annahmestatus im begrenzten Metadatenbudget. Genau ein solcher Kontextcommand
 darf je Player unentschieden sein; keinen neuen Prepare/Load dahinter aufstauen.
@@ -817,6 +832,17 @@ oder widerspruechlichem Kontext keine Annahme unterstellen; unbekannte Wirkung
 explizit abstimmen. Nur ein weiterhin erforderlicher, aktuell autorisierter
 MA-Auftrag darf danach einen neuen Command erzeugen, kein alter Sollzustand
 oder verlorener ACK allein. Nach Entscheidung Pending-Daten freigeben.
+
+Bei pending-activate_prepared prueft der Provider zusaetzlich den erhaltenen
+PreparedActivation-Beleg gegen A/B, Freigaberevision und A-Produktionsgrenze.
+Ist B bereits aktuell, dessen gueltige Cursor und reale Ausgabe uebernehmen;
+die Aktivierung ist damit erklaert, kein erneuter Queue-Next und kein zweiter
+Positionsreset. Fehlt der Beleg und ist A noch aktuell, wurde die Ausfuehrung
+nicht nachgewiesen. Den alten Pending-Command abschliessen, den konkreten
+weiterhin erforderlichen MA-Zielauftrag aber erhalten und erst nach welcome
+einen neuen activate_prepared in der neuen Epoche senden. Keine UI-Aktion
+wiederholen. Stop, ersetzender MA-Auftrag und Rechteentzug gewinnen weiterhin.
+Ein manueller Beleg erklaert kein regulaeres A-Ende und keinen mark_played-Pfad.
 
 Verlorenes track_ended ohne Promotion vor welcome einmalig abstimmen:
 hello meldet denselben weiterhin zuordenbaren A mit output_state=ended oder
@@ -897,7 +923,7 @@ neue Bindung und Cursor werden vor audio_ready und erneuter Kapazitaetsfreigabe 
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "audio_hello",
 	"message_id": "audio-resume-1",
 	"connection_epoch": "epoch-1",
@@ -991,7 +1017,7 @@ verwenden. Alte Epochen/Callbacks duerfen keine neue Auswahl oder Antwort uebers
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "set_audio_profile",
 	"message_id": "profile-message-1",
 	"connection_epoch": "epoch-1",
@@ -1001,7 +1027,7 @@ verwenden. Alte Epochen/Callbacks duerfen keine neue Auswahl oder Antwort uebers
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "audio_profile_changed",
 	"message_id": "profile-response-1",
 	"connection_epoch": "epoch-1",
@@ -1034,6 +1060,7 @@ MA-API und MA-Event-Hub sind externe Schnittstellen, keine weiteren Mashin-Nachr
 | audio_ready | Audio / JSON | keine; leeres payload |
 | set_media | Control / JSON | command_id, stream, autoplay |
 | prepare_next | Control / JSON | command_id, current_stream_id, stream, next_revision |
+| activate_prepared | Control / JSON | command_id, current_stream_id, stream_id, next_revision |
 | clear_next | Control / JSON | command_id, current_stream_id, next_revision |
 | play | Control / JSON | command_id, stream_id |
 | pause | Control / JSON | command_id, stream_id |
@@ -1076,10 +1103,13 @@ Stop/Load/B-Invalidierung gewinnen gegen alte ACKs, Sender und Worker.
 #### set_media
 
 Legt den uebergebenen Stream als aktuelle Wiedergabe fest und ersetzt den
-bisherigen A/B-Wiedergabekontext. Fuer Trackwechsel, regulaere MA-Quellen-Seeks
+bisherigen A/B-Wiedergabekontext. Fuer ersetzende Trackwechsel, regulaere MA-Quellen-Seeks
 und Reparatur-Rueckfall verwenden, nicht zum Vorbereiten eines Nachfolgers.
 `stream` liefert Identitaet, Codecformat, Zeitursprung und Gesamtdauer; der
 Command selbst enthaelt keine Audiobytes.
+
+Ein manueller Next zu genau dem bereits autorisierten B verwendet stattdessen
+activate_prepared. set_media ist kein Ersatz fuer diese cache-erhaltende Aktion.
 
 Bei Annahme alte Freigaben, Decoder, Clientcache und zugehoerige Serverlieferpuffer
 invalidieren. Neue Ausgabe beginnt bei `position_frame=0` und `output_revision=0`,
@@ -1099,8 +1129,43 @@ die Nachfolgerfreigabe. Geaenderte Freigaben erhoehen die Revision.
 Der Command allein startet keine Quelle und keine B-Ausgabe. Nach ACK aller
 A-Chunks einschliesslich des final markierten Chunks pusht der Provider B bei gueltiger Freigabe und
 Empfangskapazitaet gemaess Abschnitt 11. A kann dabei aus dem Clientcache
-weiterspielen. B erst nach tatsaechlichem A-Ausgabeende hoerbar promovieren und
-den Wechsel mit `track_started` melden; der Client waehlt keinen anderen Nachfolger.
+weiterspielen. Ohne explizite Aktivierung B erst nach tatsaechlichem A-Ausgabeende
+hoerbar promovieren und den Wechsel mit `track_started` melden. Die angenommene
+Freigabe erlaubt auch manuelles Next ausschliesslich zu genau diesem B,
+online wie offline; der Client waehlt keinen anderen Nachfolger.
+
+#### activate_prepared
+
+Aktiviert genau den bereits angenommenen Nachfolger: current_stream_id=A,
+stream_id=B und next_revision muessen der registrierten Freigabe entsprechen.
+Der Command enthaelt keinen neuen Descriptor und keine Cacheinvalidierung.
+Atomar alte A-Ausgabe/Decoder stoppen und A-Restcache verwerfen, den bestehenden
+B-Cache samt Descriptor, Chunkbytes, Empfangscursor und Endmetadaten nach current
+verschieben. B startet bei Position 0, zunaechst buffering, bis echte Ausgabe
+moeglich ist. Auch ein registrierter B ohne Bytes darf aktiviert werden und
+wartet dann auf Daten; kein kuenstliches playing oder Trackende fuer A.
+
+Den PreparedActivation-Beleg vor jeder B-Statusmeldung speichern und online
+mit prepared_activated senden. Wiederholung desselben A/B/Revision-Grants ist
+auch mit neuer command_id idempotent: weder Cache noch B-Position zuruecksetzen.
+Ein anderer/veralteter Grant wird ohne Mutation abgelehnt. ACK accepted bestaetigt
+die atomare Anwendung, nicht hoerbare Ausgabe. Keine track_ended(A)-Meldung fuer
+den Skip und kein zusaetzlicher MA-Queue-Next neben der B-Zustandsprojektion.
+
+Ein lokaler Next konsumiert denselben vorhandenen Grant unmittelbar, auch bei
+Controlverlust; danach den Istzustand mit Beleg abstimmen. Ohne neuen MA-Grant
+kein weiterer Sprung zu C. Ein spaeterer Widerruf kann bereits offline gehoertes
+Audio nicht rueckgaengig machen, entscheidet aber ueber weitere Wiedergabe und
+Resume. Stop, Rechteentzug und neue ersetzende MA-Auftraege bleiben vorrangig.
+
+MA kann fuer einen externen Next eine neue queue_session_id erzeugen. Der Provider
+bindet nur denselben Queue-Item-Auftritt mit unveraendertem Quellenursprung,
+Seekoffset und Ausgabeprofil an den neuen gueltigen MA-Kontext; Stream-ID und
+Descriptorprovenienz bleiben erhalten. Waehrend dieser Uebergabe Produktion
+sperren, alte Quelle schliessen; unvollstaendiges B ausschliesslich ueber die
+bestehende PCM-Matching-Reparatur unter demselben Pacing fortsetzen. Bei anderer
+Quelle, anderem Ausgabeformat, Seek oder fehlender Freigabe frisches set_media
+verwenden, niemals fremde Bytes unter der alten ID weiterliefern.
 
 #### clear_next
 
@@ -1182,7 +1247,7 @@ Beispiel fuer `set_media`:
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "set_media",
 	"message_id": "load-1",
 	"connection_epoch": "epoch-1",
@@ -1235,6 +1300,7 @@ allein wegen Transportfehler loeschen.
 | buffer_status | Control / JSON | sequence, audio_connection_id, buffer_capacity |
 | player_state | Control / JSON | sequence, stream_id nullable, output_revision, output_state, position_frame, volume_percent, is_muted, error |
 | transport_status | Control / JSON | sequence, stream_id, audio_connection_id nullable, audio_state, buffered_duration_millis, error |
+| prepared_activated | Control / JSON | sequence, activation, output_revision, output_state, position_frame |
 | track_started | Control / JSON | sequence, stream_id, next_revision, output_revision, position_frame |
 | track_ended | Control / JSON | sequence, stream_id |
 | audio_reconnect_request | Control / JSON | sequence, request_id |
@@ -1339,7 +1405,7 @@ Beispiel fuer `buffer_status`:
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "buffer_status",
 	"message_id": "capacity-1",
 	"connection_epoch": "epoch-1",
@@ -1379,7 +1445,8 @@ und output_state=idle dem bisherigen Playerkontext zuordnen und dessen serversei
 Stop-/Cleanup einmalig ausfuehren; kein regulaeres Trackende oder Nachfolgerstart.
 Die lokale UI verwendet weiterhin
 lokale Istwerte, keine rueckgespiegelte MA-Extrapolation. Ein vorbereiteter B
-meldet keinen aktuellen Playerzustand vor hoerbarer Promotion. Die Meldung ist
+meldet keinen aktuellen Playerzustand vor hoerbarer Promotion oder expliziter
+Aktivierung. Die Meldung ist
 kein Quellen-/Seekauftrag und ersetzt kein `track_started` oder `track_ended`.
 
 #### transport_status
@@ -1399,6 +1466,18 @@ Bytekapazitaet ausschliesslich ueber `chunk_ack`/`buffer_status` aktualisieren.
 `audio_state=eof` erst nach atomarer Annahme des final markierten Chunks melden.
 Transport-EOF ist kein gehoertes Trackende und loest allein keinen Next aus.
 
+#### prepared_activated
+
+Bestaetigt eine explizite A/B-Aktivierung mit dem unveraenderlichen
+PreparedActivation-Beleg. output_revision, output_state und position_frame
+beschreiben B, gegebenenfalls noch buffering bei Position 0. Beleg vor normalen
+B-player_state-/Transportmeldungen senden. Provider prueft exakten Grant,
+A-Positionsgrenze, B-Revision und B-Produktionsgrenze, uebernimmt den vorhandenen
+B-Kontext und verwirft nur A. Wiederholungen desselben Belegs sind idempotent.
+Diese Meldung ist kein Beweis fuer gehoertes A-Ende oder bereits hoerbares B.
+Nach Verbindungsverlust denselben Beleg in hello.resume_state.activation melden;
+keinen nachtraeglichen Queue-Next oder erfundene Endereignisse erzeugen.
+
 #### track_started
 
 Meldet den tatsaechlich hoerbaren Start des bezeichneten neuen Tracks/Streams B.
@@ -1417,7 +1496,7 @@ Keinen alten A-Descriptor fuer die Startpruefung
 vorhalten und die Freigabe nicht aus einer inzwischen geaenderten Queue
 rekonstruieren. Der Client meldet keine zusaetzliche Vorgaenger-ID.
 
-Erst nach echtem A-Ausgabeende und Beginn der B-Ausgabe senden, nicht bei
+Bei natuerlicher Promotion erst nach echtem A-Ausgabeende und Beginn der B-Ausgabe senden, nicht bei
 Descriptorannahme, erstem B-Chunk oder Empfangsende von A. Auch beim direkten
 Wechsel separat zuerst `track_ended(A)` und danach `track_started(B)` melden.
 Beide Meldungen aus dem atomaren lokalen Uebergang gemaess Abschnitt 11 erzeugen.
@@ -1658,7 +1737,7 @@ Payload. Kein Wissen ueber Clientcachebereiche und keine lokalen Cachepflichten.
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "chunk_ack",
 	"message_id": "ack-42",
 	"connection_epoch": "epoch-1",
@@ -1680,7 +1759,7 @@ Provider behaelt Chunk 43 bis zu einer neueren Kapazitaetsmeldung:
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "chunk_ack",
 	"message_id": "reject-43",
 	"connection_epoch": "epoch-1",
@@ -1774,12 +1853,14 @@ wiederhergestellter Verbindung zuruecksetzen, nicht nach Ablauf einer Offlinezei
 Bei Controlverlust bleiben lokale Pause, Stop, Lautstaerke und Mute jederzeit
 bedienbar und benoetigen keine Netzwerkbestaetigung. Lokales Play nur fuer den
 bereits freigegebenen aktuellen Stream mit nutzbarem Cache; keine neuen lokalen
-Seeks oder Freigaben. Nach regulaerem hoerbarem A-Ende darf ein bereits
+Seeks oder Freigaben. Manueller Next darf den bereits registrierten konkreten
+B-Grant gemaess activate_prepared konsumieren und den Beleg erhalten; A muss
+dabei nicht beendet sein. Nach regulaerem hoerbarem A-Ende darf ein bereits
 freigegebener und gecachter Nachfolger B lokal promoviert und ausgegeben werden.
 Kein neuer Inhalt oder weiterer Nachfolger ohne MA-Freigabe. Ausgabeende und
 Promotion unabhaengig von Reconnectversuchen lokal verfolgen und beim naechsten
 Handshake abstimmen. Ohne finalen Chunk ist Cache-Unterlauf kein regulaeres
-Trackende und erlaubt keine Promotion; Position einfrieren und auf neue Daten
+Trackende und erlaubt keine automatische Promotion; Position einfrieren und auf neue Daten
 warten. Ein ausdruecklicher lokaler Stop verwirft dagegen den lokalen Cache.
 
 Beim Control-Reconnect den aktuellen Istzustand einschliesslich offline angewendeter
@@ -1881,7 +1962,7 @@ nicht am Zielchunk. Chunkindex niemals als feste Audiodauer interpretieren.
 
 ```json
 {
-	"protocol_version": 1,
+	"protocol_version": 2,
 	"type": "player_state",
 	"message_id": "local-seek-40",
 	"connection_epoch": "epoch-1",
@@ -1927,6 +2008,12 @@ neuen Handles schliessen, neuen Cache fuellen oder EOF melden. Cancel allein
 genuegt nicht. Zwei schnelle Seeks: nur letzte autorisierte Generation aktiv.
 
 ## 11. Nachfolger, Pause und Trackende
+
+Dieser Abschnitt beschreibt die natuerliche Promotion nach hoerbarem Ende.
+Manuelle Aktivierung folgt activate_prepared aus Abschnitt 7.1: Sie erhaelt B,
+bricht A ohne track_ended ab und benoetigt keinen finalen A-Chunk. Ein gueltiger
+manueller Next ist die ausdrueckliche Ausnahme vom Warten auf A-Ende, nicht ein
+neuer EOF-/Unterlaufpfad und keine clientseitige Queueauswahl.
 
 A-Produktion/-Transport zuerst. Nach ACK aller A-Chunks einschliesslich der Final-Markierung
 schiebt der Provider selbst den accepted-prepare_next(B)-Stream bei freier

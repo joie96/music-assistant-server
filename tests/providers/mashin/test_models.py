@@ -15,6 +15,8 @@ from music_assistant.providers.mashin.models import (
     ClientCapabilities,
     ClientResumeState,
     Hello,
+    PreparedActivated,
+    PreparedActivation,
     SetAudioProfile,
     Version1Limits,
     decode_message,
@@ -25,6 +27,30 @@ from music_assistant.providers.mashin.wire import ProtocolViolation
 
 class TestModels(unittest.TestCase):
     """Reject loose JSON and incomplete V1 handshakes."""
+
+    def test_activation_receipt_and_version_are_strict(self) -> None:
+        """V2 carries one exact non-idle grant and never silently accepts V1 envelopes."""
+        receipt = PreparedActivation(str(uuid4()), str(uuid4()), 1, 12000)
+        payload = asdict(PreparedActivated(1, receipt, 2, "buffering", 0))
+        envelope = {
+            "protocol_version": 2,
+            "type": "prepared_activated",
+            "message_id": "activation-1",
+            "connection_epoch": "epoch",
+            "payload": payload,
+        }
+        _, decoded = decode_message(json.dumps(envelope), "epoch")
+        assert isinstance(decoded, PreparedActivated)
+        assert decoded.activation == receipt
+        with pytest.raises(ProtocolViolation):
+            decode_message(json.dumps({**envelope, "protocol_version": 1}), "epoch")
+        with pytest.raises(ProtocolViolation):
+            parse_model(PreparedActivated, {**payload, "output_state": "idle"})
+        with pytest.raises(ProtocolViolation):
+            parse_model(PreparedActivation, {**asdict(receipt), "next_revision": 0})
+        idle = asdict(ClientResumeState(None, 0, "idle", 0, 50, False, 0, []))
+        with pytest.raises(ProtocolViolation):
+            parse_model(ClientResumeState, {**idle, "activation": asdict(receipt)})
 
     def test_provider_settings_do_not_duplicate_client_profile_or_core_logging(self) -> None:
         """The client chooses quality; the core owns the standard logging entry."""
@@ -48,7 +74,7 @@ class TestModels(unittest.TestCase):
         _, decoded = decode_message(
             json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "type": "hello",
                     "message_id": str(uuid4()),
                     "connection_epoch": None,
@@ -83,7 +109,7 @@ class TestModels(unittest.TestCase):
     def test_profile_change_messages_are_strict_and_epoch_bound(self) -> None:
         """Runtime codec selection uses the Control epoch and exact request/reply schemas."""
         envelope = {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "type": "set_audio_profile",
             "message_id": "profile-message-1",
             "connection_epoch": "epoch",
@@ -136,7 +162,7 @@ class TestModels(unittest.TestCase):
     def test_message_channel_epoch_and_duplicate_json(self) -> None:
         """A valid report belongs to exactly one control epoch."""
         envelope = {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "type": "buffer_status",
             "message_id": "report-1",
             "connection_epoch": "epoch",

@@ -18,6 +18,7 @@ from music_assistant.constants import VERBOSE_LOG_LEVEL
 from .buffer import DeliveryBuffer
 from .codec import ChunkEncoder, PCMChunkReader, PCMPacing
 from .models import (
+    ActivatePrepared,
     AudioBinding,
     AudioHello,
     AudioProfileChanged,
@@ -35,6 +36,8 @@ from .models import (
     OutputFormat,
     PlaybackIdentity,
     PlayerState,
+    PreparedActivated,
+    PreparedActivation,
     PrepareNext,
     ProtocolError,
     SetAudioProfile,
@@ -64,7 +67,14 @@ if TYPE_CHECKING:
 type SendControl = Callable[[str, object], Awaitable[None]]
 type SendAudio = Callable[[bytes], Awaitable[None]]
 type CommandPayload = (
-    SetMedia | PrepareNext | ClearNext | VolumeCommand | MuteCommand | StateRequest | StreamCommand
+    SetMedia
+    | PrepareNext
+    | ActivatePrepared
+    | ClearNext
+    | VolumeCommand
+    | MuteCommand
+    | StateRequest
+    | StreamCommand
 )
 
 
@@ -118,7 +128,7 @@ class TransportLogWindow:
 class MashinSession:
     """Coordinate one bound player's commands, receipt and actual output reports."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         adapter: MAAdapter,
         device_id: str,
@@ -140,6 +150,8 @@ class MashinSession:
         self.current: StreamRun | None = None
         self.next: StreamRun | None = None
         self.next_revision = 0
+        self.activation_target: PlaybackContext | None = None
+        self.activation: PreparedActivation | None = None
         self.generation = 0
         self.epoch: str | None = None
         self.sequence = 0
@@ -228,6 +240,9 @@ class MashinSession:
 
     async def after_welcome(self) -> None:
         """Issue only a still-required revocation using fresh command authority."""
+        if self.activation_target is not None:
+            await self._send_activation()
+            return
         if self.reissue_revocation and self.current is not None and self.next is not None:
             self.reissue_revocation = False
             await self.command(
@@ -264,6 +279,36 @@ class MashinSession:
 
     async def load(self, context: PlaybackContext, *, autoplay: bool = True) -> None:
         """Replace A/B with a fresh authorized MA generation and PCM origin."""
+        successor = self.next
+        if (
+            autoplay
+            and self.current is not None
+            and successor is not None
+            and successor.accepted
+            and successor.error is None
+            and not self.revoking
+            and successor.context.queue_id == context.queue_id
+            and successor.context.queue_item_id == context.queue_item_id
+            and successor.context.seek_seconds == context.seek_seconds
+            and successor.context.source_identity == context.source_identity
+            and successor.descriptor.output_format.profile_id == self.profile
+            and self.adapter.valid(context)
+        ):
+            self.activation_target = context
+            self.buffer.load_accepted = False
+            await self._close_run(successor, release=True)
+            if (
+                self.next is not successor
+                or self.activation_target is not context
+                or not self.adapter.valid(context)
+            ):
+                raise ProtocolViolation("stale_playback", "A newer operation replaced activation")
+            successor.context = context
+            successor.loaded = False
+            if self.buffer.streams[successor.descriptor.stream_id].final_index is None:
+                successor.incident = successor.incident or RecoveryIncident()
+            await self._send_activation()
+            return
         if self.recovery_fallback is not None and self.recovery_pause:
             autoplay = False
         if (
@@ -443,6 +488,22 @@ class MashinSession:
             self._ended(report.stream_id)
         elif isinstance(report, TrackStarted):
             self._promote(report)
+        elif isinstance(report, PreparedActivated):
+            self._accept_activation(
+                report.activation, report.output_revision, report.position_frame
+            )
+            await self._player_state(
+                PlayerState(
+                    report.sequence,
+                    report.activation.stream_id,
+                    report.output_revision,
+                    report.output_state,
+                    report.position_frame,
+                    self.volume_percent,
+                    self.is_muted,
+                    None,
+                )
+            )
         elif isinstance(report, AudioReconnectRequest):
             await self._reconnect(report)
         elif isinstance(report, SetAudioProfile):
@@ -480,6 +541,8 @@ class MashinSession:
         """Invalidate A/B atomically before releasing their processing handles."""
         runs = [run for run in (self.current, self.next) if run]
         self.current = self.next = None
+        self.activation_target = None
+        self.activation = None
         self.next_revision = 0
         self.revoking = False
         self.reissue_revocation = False
@@ -726,6 +789,65 @@ class MashinSession:
         self.command_counter = integer(self.command_counter + 1, 1, MAX_INTEGER - 1)
         return self.command_counter
 
+    async def _send_activation(self) -> None:
+        if self.activation_target is None or self.current is None or self.next is None:
+            return
+        if not self.adapter.valid(self.activation_target):
+            raise ProtocolViolation("stale_playback", "Prepared activation is no longer authorized")
+        if self.send_control is None:
+            return
+        try:
+            await self.command(
+                "activate_prepared",
+                ActivatePrepared(
+                    self._command_id(),
+                    self.current.descriptor.stream_id,
+                    self.next.descriptor.stream_id,
+                    self.next_revision,
+                ),
+            )
+        except ProtocolViolation as err:
+            if err.code != "stream_unavailable" and not (
+                err.code == "command_failed" and self.pending is not None
+            ):
+                raise
+        except ConnectionError, OSError:
+            await self.control_lost()
+
+    def _accept_activation(
+        self, activation: PreparedActivation, output_revision: int, position_frame: int
+    ) -> None:
+        if self.current is not None and self.current.descriptor.stream_id == activation.stream_id:
+            if self.activation != activation:
+                raise ProtocolViolation("stale_playback", "Activation receipt changed")
+            return
+        if (
+            self.current is None
+            or activation.previous_stream_id != self.current.descriptor.stream_id
+            or activation.previous_position_frame
+            > self.buffer.streams[activation.previous_stream_id].produced_frames
+        ):
+            raise ProtocolViolation("stale_playback", "Activation does not match current stream")
+        reauthorized = self.activation_target is not None
+        self._promote(
+            TrackStarted(
+                1,
+                activation.stream_id,
+                activation.next_revision,
+                output_revision,
+                position_frame,
+            ),
+            activation=activation,
+        )
+        self.activation = activation
+        self.activation_target = None
+        self.buffer.load_accepted = True
+        run = self.current
+        assert run is not None
+        if reauthorized and self.buffer.streams[activation.stream_id].next_received > 1:
+            run.loaded = True
+            self.adapter.loaded(run.context)
+
     def _find(self, identifier: str) -> StreamRun | None:
         return next(
             (
@@ -739,6 +861,7 @@ class MashinSession:
     def _active(self, run: StreamRun, attempt: int | None = None) -> bool:
         return (
             not self.closed
+            and self.activation_target is None
             and self._find(run.descriptor.stream_id) is run
             and run.error is None
             and (attempt is None or run.source_attempt_id == attempt)
@@ -759,12 +882,18 @@ class MashinSession:
                 return self.next
         return None
 
-    def _cursors(self, cursors: list[ClientStreamCursor], *, promotion: bool = False) -> None:
+    def _cursors(
+        self,
+        cursors: list[ClientStreamCursor],
+        *,
+        promotion: bool = False,
+        activation: bool = False,
+    ) -> None:
         identifiers = {cursor.stream_id for cursor in cursors}
         expected = set(self.buffer.streams)
         if promotion and self.current is not None:
             old = self.buffer.streams[self.current.descriptor.stream_id]
-            if old.final_index is None or old.next_received <= old.final_index:
+            if not activation and (old.final_index is None or old.next_received <= old.final_index):
                 raise ProtocolViolation("invalid_message", "Resume promotion lacks final A receipt")
             expected.remove(self.current.descriptor.stream_id)
         if identifiers != expected or len(identifiers) != len(cursors):
@@ -780,6 +909,35 @@ class MashinSession:
         for cursor in cursors:
             self.buffer.resume(cursor.stream_id, cursor.next_chunk_index)
 
+    def _reconcile_activation(self, state: ClientResumeState) -> bool:
+        """Apply a manual receipt, returning whether A awaits a new activation command."""
+        if state.activation is not None:
+            if state.current_stream_id != state.activation.stream_id:
+                raise ProtocolViolation(
+                    "stale_playback", "Resume activation has a different current stream"
+                )
+            if self.next is not None and state.current_stream_id == self.next.descriptor.stream_id:
+                self._cursors(state.received_streams, promotion=True, activation=True)
+            self._accept_activation(state.activation, state.output_revision, state.position_frame)
+        if (
+            self.activation_target is not None
+            and self.current is not None
+            and state.current_stream_id == self.current.descriptor.stream_id
+        ):
+            if (
+                not self.adapter.valid(self.activation_target)
+                or state.next_revision != self.next_revision
+            ):
+                raise ProtocolViolation(
+                    "stale_playback", "Pending activation is no longer authorized"
+                )
+            self._cursors(state.received_streams)
+            self._resolve_pending("accepted")
+            self.volume_percent, self.is_muted = state.volume_percent, state.is_muted
+            self.output_state = state.output_state
+            return True
+        return False
+
     async def _reconcile(self, state: ClientResumeState | None) -> None:  # noqa: PLR0915
         if state is None:
             if self.current is not None or self.pending is not None:
@@ -794,6 +952,8 @@ class MashinSession:
                     self.suppress_stop_command = False
                 await self.reset()
             self.volume_percent, self.is_muted = state.volume_percent, state.is_muted
+            return
+        if self._reconcile_activation(state):
             return
         pending = self.pending
         promotion = (
@@ -1048,7 +1208,13 @@ class MashinSession:
         run.ended = True
         self.tombstones.append(identifier)
 
-    def _promote(self, report: TrackStarted, *, resume: bool = False) -> None:
+    def _promote(
+        self,
+        report: TrackStarted,
+        *,
+        resume: bool = False,
+        activation: PreparedActivation | None = None,
+    ) -> None:
         if self.current and report.stream_id == self.current.descriptor.stream_id:
             return
         run = self.next
@@ -1063,7 +1229,9 @@ class MashinSession:
         ):
             raise ProtocolViolation("stale_playback", "Stale successor promotion")
         stream = self.buffer.streams[report.stream_id]
-        if stream.next_received <= 1 or report.position_frame > stream.produced_frames:
+        if (
+            activation is None and stream.next_received <= 1
+        ) or report.position_frame > stream.produced_frames:
             raise ProtocolViolation("invalid_message", "Promotion preceded B receipt")
         if report.output_revision < run.output_revision or (
             report.output_revision == run.output_revision
@@ -1072,18 +1240,22 @@ class MashinSession:
             raise ProtocolViolation("invalid_message", "Stale successor output revision")
         if self.current:
             old = self.buffer.streams[self.current.descriptor.stream_id]
-            if old.final_index is None or old.next_received <= old.final_index:
+            if activation is None and (
+                old.final_index is None or old.next_received <= old.final_index
+            ):
                 raise ProtocolViolation("invalid_message", "Promotion preceded final A receipt")
-            if not resume and not self.current.ended:
+            if activation is None and not resume and not self.current.ended:
                 raise ProtocolViolation("invalid_message", "Promotion preceded A output end")
             self.tombstones.append(self.current.descriptor.stream_id)
             self.buffer.discard(self.current.descriptor.stream_id)
-            self.spawn(self._close_run(self.current, release=False))
+            self.spawn(self._close_run(self.current, release=activation is not None))
         self.current, self.next = run, None
         self.next_revision = report.next_revision
         self.revoking = self.reissue_revocation = False
         run.position_frame, run.output_revision = report.position_frame, report.output_revision
         run.position_validated = True
+        if activation is not None:
+            return
         self.output_state = "playing"
         self.publish(
             PlayerState(
@@ -1219,6 +1391,8 @@ class MashinSession:
                         run, safe_error("forbidden", "MA source is not authorized or available")
                     )
             except ProtocolViolation as err:
+                if not self._active(run):
+                    continue
                 if self._find(run.descriptor.stream_id) is run:
                     self.buffer.reservation = None
                     await self._fail(run, safe_error(err.code, str(err)), detail=str(err))
@@ -1227,7 +1401,7 @@ class MashinSession:
                     await self._fail(run, safe_error("source_failed", "Unable to open source"))
 
     async def _source_lost(self, run: StreamRun) -> None:
-        if self._find(run.descriptor.stream_id) is not run:
+        if not self._active(run):
             return
         self.buffer.reservation = None
         run.incident = run.incident or RecoveryIncident()
