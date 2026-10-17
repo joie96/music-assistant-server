@@ -14,9 +14,10 @@ from music_assistant.providers.mashin.codec import (
     PCMChunkReader,
     PCMPacing,
     remux_opus,
+    strip_flac_metadata,
 )
 from music_assistant.providers.mashin.models import AudioProfileId, OutputFormat
-from music_assistant.providers.mashin.wire import ProtocolViolation
+from music_assistant.providers.mashin.wire import MAX_PAYLOAD_BYTES, ProtocolViolation
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -94,6 +95,7 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                 )
                 process = AsyncMock()
                 process.returncode = returncode
+                process.proc = Mock(pid=4321)
                 process.stdin_feeder_exception = input_error
                 process.log_history = [
                     "earlier omitted entry",
@@ -113,6 +115,10 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                     patch.dict(
                         "sys.modules", {"music_assistant.helpers.ffmpeg": Mock(FFMpeg=ffmpeg)}
                     ),
+                    patch(
+                        "music_assistant.providers.mashin.codec.get_global_cache_value",
+                        return_value="7.1.2",
+                    ),
                     self.assertLogs(
                         "music_assistant.providers.mashin.codec", level="WARNING"
                     ) as logs,
@@ -127,6 +133,11 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                 assert "Unrecognized option 'frame_size'." in message
                 assert "profile=flac rate=48000 channels=2" in message
                 assert "pcm_bytes=8 encoded_bytes=7" in message
+                assert "phase=wait pid=4321" in message
+                assert "pcm_frames=1 history_frames=0 target_bit_depth=16" in message
+                assert "ffmpeg_version=7.1.2" in message
+                assert "-sample_fmt s16" in message
+                assert "-frame_size 4096 -lpc_type none -ch_mode indep" in message
                 assert "earlier omitted entry" not in message
                 assert "private-password" not in message
                 assert "private-token" not in message
@@ -137,6 +148,104 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                 assert ffmpeg.call_args.kwargs["collect_log_history"] is True
                 assert ffmpeg.call_args.kwargs["loglevel"] == "error"
                 assert encoder.active is None
+
+    async def test_all_encoding_failure_phases_report_process_diagnostics(self) -> None:
+        """Validation errors after a successful exit retain the same process context."""
+        for phase in ("start", "encode", "wait", "validate_flac", "remux_opus", "payload_limit"):
+            with self.subTest(phase=phase):
+                is_opus = phase == "remux_opus"
+                encoder = ChunkEncoder(
+                    OutputFormat(
+                        AudioProfileId.OPUS_96K, "ogg", "opus", 48000, None, 2, 96000, True
+                    )
+                    if is_opus
+                    else OutputFormat(
+                        AudioProfileId.FLAC, "flac", "flac", 48000, 16, 2, None, False
+                    )
+                )
+                process = AsyncMock()
+                process.returncode = 0
+                process.proc = Mock(pid=5678)
+                process.stdin_feeder_exception = None
+                process.log_history = []
+                if phase == "start":
+                    process.__aenter__.side_effect = OSError("private-start-token")
+                if phase == "wait":
+                    process.wait_with_timeout.side_effect = TimeoutError("private-timeout-token")
+
+                async def encoded(failure_phase: str = phase) -> AsyncGenerator[bytes]:
+                    if failure_phase == "encode":
+                        raise OSError("private-read-token")
+                    yield (
+                        bytes(MAX_PAYLOAD_BYTES + 1)
+                        if failure_phase == "payload_limit"
+                        else b"invalid"
+                    )
+
+                process.iter_chunked = Mock(return_value=encoded())
+                with (
+                    patch.dict(
+                        "sys.modules",
+                        {"music_assistant.helpers.ffmpeg": Mock(FFMpeg=Mock(return_value=process))},
+                    ),
+                    self.assertLogs(
+                        "music_assistant.providers.mashin.codec", level="WARNING"
+                    ) as logs,
+                    pytest.raises((ProtocolViolation, OSError, TimeoutError)),
+                ):
+                    await encoder._encode_once(bytes(8))
+                message = logs.records[0].getMessage()
+                expected_phase = "encode" if phase == "payload_limit" else phase
+                assert f"phase={expected_phase} pid=5678" in message
+                assert "exit_code=0 input_error=none" in message
+                assert "pcm_frames=1" in message
+                assert "payload_limit=262144" in message
+                assert "elapsed_ms=" in message
+                assert "No stderr captured" in message
+                assert "private-" not in message
+                assert encoder.active is None
+
+    async def test_flac_bound_logs_actual_streaminfo_and_metadata_sizes(self) -> None:
+        """Oversized FLAC output exposes numeric format evidence, never encoded audio."""
+        packed_format = (96000 << 44) | (1 << 41) | (23 << 36) | 48000
+        streaminfo = (
+            (4096).to_bytes(2, "big") * 2
+            + (8192).to_bytes(3, "big")
+            + (16920).to_bytes(3, "big")
+            + packed_format.to_bytes(8, "big")
+            + bytes(16)
+        )
+        bound = 48000 * 2 * 2 + 12 * 20 + 1024
+        data = (
+            b"fLaC\x00\x00\x00\x22"
+            + streaminfo
+            + b"\x81\x00\x00\x64"
+            + bytes(100)
+            + bytes(bound + 1 - 42)
+        )
+        with (
+            self.assertLogs("music_assistant.providers.mashin.codec", level="WARNING") as logs,
+            pytest.raises(ProtocolViolation, match="FLAC exceeds VERBATIM bound") as failure,
+        ):
+            strip_flac_metadata(data, 48000, 2)
+        assert failure.value.code == "encoder_failed"
+        message = logs.records[0].getMessage()
+        assert "encoded_bytes=193369 payload_bytes=193265 bound_bytes=193264" in message
+        assert "excess_bytes=1 metadata_bytes=146" in message
+        assert "expected_rate=48000 expected_channels=2 expected_bit_depth=16" in message
+        assert "actual_rate=96000 actual_channels=2 actual_bit_depth=24" in message
+        assert "stream_total_samples=48000 min_block_frames=4096 max_block_frames=4096" in message
+        assert "min_frame_bytes=8192 max_frame_bytes=16920" in message
+
+    async def test_unreadable_streaminfo_does_not_replace_the_original_failure(self) -> None:
+        """Best-effort diagnostics preserve the encoder error even for malformed metadata."""
+        data = b"fLaC\x80\x00\x00\x22" + bytes(34 + 193264)
+        with (
+            self.assertLogs("music_assistant.providers.mashin.codec", level="WARNING") as logs,
+            pytest.raises(ProtocolViolation, match="FLAC exceeds VERBATIM bound"),
+        ):
+            strip_flac_metadata(data, 48000, 2)
+        assert "actual_rate=None actual_channels=None actual_bit_depth=None" in logs.output[0]
 
 
 class TestPCMPacing(unittest.IsolatedAsyncioTestCase):

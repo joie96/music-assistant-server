@@ -10,6 +10,9 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from io import BytesIO
 from typing import TYPE_CHECKING
 
+from music_assistant_models.helpers import get_global_cache_value
+from mutagen.flac import StreamInfo
+from mutagen.flac import error as flac_error
 from mutagen.ogg import OggPage
 from mutagen.ogg import error as ogg_error
 
@@ -215,14 +218,18 @@ class ChunkEncoder:
         )
         self.active = process
         encoded = bytearray()
+        started_at = time.monotonic()
+        phase = "start"
         try:
             async with process:
+                phase = "encode"
                 async for fragment in process.iter_chunked(16384):
                     encoded.extend(fragment)
                     if len(encoded) > MAX_PAYLOAD_BYTES:
-                        raise ProtocolViolation(
+                        raise ProtocolViolation(  # noqa: TRY301
                             "encoder_failed", "Encoded chunk exceeds its reservation"
                         )
+                phase = "wait"
                 await process.wait_with_timeout(5)
                 if process.returncode != 0 or process.stdin_feeder_exception is not None:
                     input_error = (
@@ -230,24 +237,12 @@ class ChunkEncoder:
                         if process.stdin_feeder_exception is not None
                         else "none"
                     )
-                    log_tail = sanitize_text("\n".join(list(process.log_history)[-5:]))[-1024:]
-                    LOGGER.warning(
-                        "Mashin audio encoder failed: profile=%s rate=%s channels=%s "
-                        "pcm_bytes=%s encoded_bytes=%s exit_code=%s input_error=%s; ffmpeg=%s",
-                        output.profile_id.value,
-                        output.sample_rate_hz,
-                        output.channels,
-                        len(pcm),
-                        len(encoded),
-                        process.returncode,
-                        input_error,
-                        " | ".join(log_tail.splitlines()) or "No stderr captured",
-                    )
-                    raise ProtocolViolation(
+                    raise ProtocolViolation(  # noqa: TRY301
                         "encoder_failed",
                         f"Audio encoder failed (exit_code={process.returncode}, "
                         f"input_error={input_error})",
                     )
+            phase = "remux_opus" if opus else "validate_flac"
             if opus:
                 payload = remux_opus(
                     bytes(encoded), len(history) // frame_bytes, len(pcm) // frame_bytes
@@ -257,6 +252,45 @@ class ChunkEncoder:
                     bytes(encoded), output.sample_rate_hz, output.channels
                 )
             return payload
+        except (ProtocolViolation, OSError, TimeoutError) as err:
+            reason = (
+                sanitize_text(str(err))
+                if isinstance(err, ProtocolViolation)
+                else type(err).__name__
+            )
+            input_error = (
+                type(process.stdin_feeder_exception).__name__
+                if process.stdin_feeder_exception is not None
+                else "none"
+            )
+            log_tail = sanitize_text("\n".join(list(process.log_history)[-5:]))[-1024:]
+            LOGGER.warning(
+                "Mashin audio encoder failed: profile=%s rate=%s channels=%s "
+                "pcm_bytes=%s encoded_bytes=%s exit_code=%s input_error=%s "
+                "phase=%s pid=%s elapsed_ms=%s pcm_frames=%s history_frames=%s "
+                "target_bit_depth=%s target_bitrate_bps=%s payload_limit=%s "
+                "ffmpeg_version=%s encoder_args=%s; reason=%s; ffmpeg=%s",
+                output.profile_id.value,
+                output.sample_rate_hz,
+                output.channels,
+                len(pcm),
+                len(encoded),
+                process.returncode,
+                input_error,
+                phase,
+                process.proc.pid if process.proc is not None else None,
+                round((time.monotonic() - started_at) * 1000),
+                len(pcm) // frame_bytes,
+                len(history) // frame_bytes,
+                output.bit_depth,
+                output.target_bitrate_bps,
+                MAX_PAYLOAD_BYTES,
+                get_global_cache_value("ffmpeg_version") or "unknown",
+                " ".join(args),
+                reason,
+                " | ".join(log_tail.splitlines()) or "No stderr captured",
+            )
+            raise
         finally:
             self.active = None
 
@@ -287,6 +321,32 @@ def strip_flac_metadata(data: bytes, sample_rate: int, channels: int) -> bytes:
     result = b"fLaC\x80\x00\x00\x22" + streaminfo + data[cursor:]
     bound = sample_rate * channels * 2 + ((sample_rate + 4095) // 4096) * 20 + 1024
     if len(result) > bound:
+        try:
+            info = StreamInfo(BytesIO(streaminfo))
+        except flac_error:
+            info = None
+        LOGGER.warning(
+            "Mashin FLAC size bound exceeded: encoded_bytes=%s payload_bytes=%s "
+            "bound_bytes=%s excess_bytes=%s metadata_bytes=%s expected_rate=%s "
+            "expected_channels=%s expected_bit_depth=16 actual_rate=%s actual_channels=%s "
+            "actual_bit_depth=%s stream_total_samples=%s min_block_frames=%s "
+            "max_block_frames=%s min_frame_bytes=%s max_frame_bytes=%s",
+            len(data),
+            len(result),
+            bound,
+            len(result) - bound,
+            cursor,
+            sample_rate,
+            channels,
+            info.sample_rate if info is not None else None,
+            info.channels if info is not None else None,
+            info.bits_per_sample if info is not None else None,
+            info.total_samples if info is not None else None,
+            info.min_blocksize if info is not None else None,
+            info.max_blocksize if info is not None else None,
+            info.min_framesize if info is not None else None,
+            info.max_framesize if info is not None else None,
+        )
         raise ProtocolViolation("encoder_failed", "FLAC exceeds VERBATIM bound")
     return result
 
