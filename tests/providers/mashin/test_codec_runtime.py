@@ -10,6 +10,7 @@ import numpy as np
 
 from music_assistant.providers.mashin.codec import ChunkEncoder
 from music_assistant.providers.mashin.models import AudioProfileId, OutputFormat
+from music_assistant.providers.mashin.wire import MAX_PAYLOAD_BYTES
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "Requires the pinned Linux MA/FFmpeg runtime")
@@ -71,10 +72,7 @@ class TestCodecRuntime(unittest.IsolatedAsyncioTestCase):
                         finally:
                             await encoder.close()
                         assert len(decoded) == frames * channels * 4
-                        assert (
-                            len(payload)
-                            <= rate * channels * 2 + ((rate + 4095) // 4096) * 20 + 1024
-                        )
+                        assert len(payload) <= MAX_PAYLOAD_BYTES
                         assert (
                             np.max(np.abs(np.frombuffer(decoded, dtype="<f4") - pcm.reshape(-1)))
                             <= 1 / 32768
@@ -96,7 +94,7 @@ class TestCodecRuntime(unittest.IsolatedAsyncioTestCase):
                         pcm = random.uniform(-0.1, 0.1, (frames, 2)).astype("<f4").tobytes()
                         payload = await encoder.encode(pcm)
                         assert len(await self.decode(payload)) == frames * 8
-                        assert len(payload) <= 87278
+                        assert len(payload) <= MAX_PAYLOAD_BYTES
                         encoder.commit_history(pcm)
             finally:
                 await encoder.close()

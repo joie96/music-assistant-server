@@ -210,13 +210,8 @@ libopus, application=audio, compression_level=10, frame_duration=20, vbr=on und
 expliziter Zielbitrate. Erprobte Codec-/Ogg-/WebSocketbibliotheken im Rust-Client.
 
 FLAC verwendet feste Bloecke mit 4096 Sampleframes, nur der letzte FLAC-Frame
-des Mini-Streams darf kleiner sein. Die gewaehlte Kodierung des gesamten
-Subframebereichs inklusive Subframeheadern, Wasted-Bits-Signalisierung und
-Bytepadding darf nicht groesser sein als unabhaengige 16-Bit-VERBATIM-Kanaele
-ohne Wasted Bits: block_frames * channels * 2 + channels Bytes. Der Encoder
-muss diese Auswahl garantieren, auch bei Stereo-Dekorrelation mit 17-Bit-Side-
-Kanal; andernfalls ist der Encoder nicht fuer V3 zugelassen. VERBATIM ist ein
-regulaerer verlustfreier FLAC-Kodierungsmodus, kein Codec-/Profilfallback.
+des Mini-Streams darf kleiner sein. Es gilt das gemeinsame Chunk-Payload-Limit
+aus Abschnitt 4.2, kein zusaetzliches FLAC-/VERBATIM-Groessenlimit.
 fLaC-Signatur und alle Metadatenblockheader/-inhalte zusammen maximal 1024 Bytes;
 nur STREAMINFO und optional ein begrenzter Encoder-Vendor-Kommentar, keine
 Quelltags, Bilder, Seektable, Application-/Cuesheet-Bloecke oder Metadatenpadding.
@@ -268,27 +263,13 @@ Fehler/Truncation beim Lesen sind kein EOF: ungecommitteten Chunk verwerfen und
 gemaess Abschnitt 4.4 behandeln. Keine nachtraegliche Final-Markierung eines
 bereits gespeicherten oder gesendeten Chunks, keine leeren Abschlusschunks.
 
-Maximal 262144 Codecbytes je Chunk inklusive Header/Vorlauf. Unter den verbindlichen
-Encoder-/Containergrenzen aus Abschnitt 4.1 gelten folgende konservative Obergrenzen,
-nicht nur empirische Messwerte oder aus der VBR-Zielbitrate abgeleitete Groessen:
-
-| Profil / groesster Ausgabefall | Herleitung inklusive Codec-/Containerheader | Maximalbytes |
-| --- | --- | --- |
-| flac, 48 kHz, Stereo, 16 Bit | 48000 * 2 * 2 + ceil(48000 / 4096) * 20 + 1024 | 193264 |
-| flac, 44.1 kHz, Stereo, 16 Bit | 44100 * 2 * 2 + ceil(44100 / 4096) * 20 + 1024 | 177644 |
-| opus_96k / opus_128k / opus_192k / opus_256k | 55 * 1276 + (55 + 2) * 282 + 1024 | 87278 |
-
-FLAC: maximal 16 Bytes Frameheader einschliesslich Header-CRC, zwei Bytes
-Subframeheader und zwei Bytes Frame-CRC ergeben 20 Bytes Aufwand pro Stereo-
-Frame; der Subframebereich wird gegen VERBATIM begrenzt. Mono und kuerzere
-EOF-Reste sind kleiner. Opus: ceil((48000 + 3840 + 960) / 960) = 55 Audiopakete
-fuer gueltige Frames, hoechstens 80 ms Historie und hoechstens 20 ms Lookahead.
-Ogg-Seitenheader sind maximal 27 + 255 = 282 Bytes inklusive Segmenttabelle und
-CRC (RFC 3533, Abschnitt 6); die zwei Headerpakete sind separat eingerechnet.
-Die 262144 Bytes bleiben als gemeinsames Transport-/Reservierungslimit mit
-Reserve bestehen; der 41-Byte-Mashin-Binaerheader zaehlt nicht zum Codec-Payload.
-Gepinnte Encoder/Muxer muessen diese Vorgaben nachweislich einhalten, bevor sie
-zugelassen werden; vor Produktion weiterhin das gemeinsame Byte-Limit reservieren.
+Maximal 262144 Codecbytes (256 KiB) je Chunk inklusive Codec-/Containerheader,
+Vorlauf und Padding, einheitlich fuer FLAC und alle Opusprofile. Die Reserve
+ist als 192 KiB fuer Audiodaten plus 64 KiB Raum fuer Header und weiteren
+Kodierungsaufwand bemessen; es gelten keine kleineren codecabhaengigen
+Chunk-Groessenlimits. Der 41-Byte-Mashin-Binaerheader
+zaehlt nicht zum Codec-Payload. Format-/Containerregeln aus Abschnitt 4.1
+bleiben verbindlich; vor Produktion das gemeinsame Byte-Limit reservieren.
 Ueberschreitung ist encoder_failed, kein Split in kuerzere regulaere Chunks.
 Gueltige Dauer/Seekgrenzen aus first_frame/frame_count validieren, nicht blind
 aus Chunkindex oder Zielbitrate ableiten. EOF-Rest nie kuenstlich auffuellen.
@@ -2425,13 +2406,12 @@ Pflichtabnahme und Integrationsgates:
 	pre_skip/Lookahead/Padding/End-Trimming und Grenzqualitaet/CPU/RAM nachgewiesen.
 - 1000-ms-Chunks/kurzer EOF-Rest, alle Codec-Worst-Cases <=262144 Bytes,
 	kein Bytegrenzen-Split; Sekunden-Seeks anhand validierter Framegrenzen.
-	FLAC-4096er-Bloecke und VERBATIM-Groessenvergleich einschliesslich 17-Bit-Side-
-	Kanal; Opus-Code-0-/Paket-/Lookahead-/Vorlaufgrenzen und Ogg-Seiten-/Metadaten-
+	FLAC-4096er-Bloecke; Opus-Code-0-/Paket-/Lookahead-/Vorlaufgrenzen und Ogg-Seiten-/Metadaten-
 	grenzen pruefen. Stille, Vollpegel, unkorrelierte Kanaele, Rauschen, Codec-
-	Moduswechsel, erster Chunk und kuerzester EOF-Rest; FLAC <=193264 und alle
-	Opusprofile <=87278 Bytes. Negative Tests fuer uebergrosse Metadaten, Vorlauf,
+	Moduswechsel, erster Chunk und kuerzester EOF-Rest; alle Profile <=262144 Bytes.
+	Negative Tests fuer uebergrosse Chunks, Metadaten, Vorlauf,
 	Lookahead, Paket-/Seitenzahl und nicht erlaubtes Padding; Messungen ersetzen
-	nicht den Nachweis der Encoder-Auswahlregeln und Containergrenzen.
+	nicht die Pruefung des gemeinsamen Chunk-Limits und der Containerregeln.
 - Mashin-PCM-/Quellenstartbarriere gegen verspaetete ACKs, fehlendes audio_ready/buffer_status und
 	Stop/Load waehrend Aufbau; accepted nie mit tatsaechlichem PLAYING verwechseln.
 	audio_hello enthaelt keine Kapazitaet und startet keine Produktion. Frisches buffer_status

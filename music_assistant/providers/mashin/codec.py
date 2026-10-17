@@ -296,7 +296,7 @@ class ChunkEncoder:
 
 
 def strip_flac_metadata(data: bytes, sample_rate: int, channels: int) -> bytes:
-    """Keep only STREAMINFO and enforce the conservative FLAC size bound."""
+    """Keep only STREAMINFO and enforce the shared chunk payload limit."""
     if not data.startswith(b"fLaC"):
         raise ProtocolViolation("encoder_failed", "Invalid FLAC signature")
     cursor = 4
@@ -319,7 +319,7 @@ def strip_flac_metadata(data: bytes, sample_rate: int, channels: int) -> bytes:
     if streaminfo is None or cursor == len(data):
         raise ProtocolViolation("encoder_failed", "Missing FLAC audio")
     result = b"fLaC\x80\x00\x00\x22" + streaminfo + data[cursor:]
-    bound = sample_rate * channels * 2 + ((sample_rate + 4095) // 4096) * 20 + 1024
+    bound = MAX_PAYLOAD_BYTES
     if len(result) > bound:
         try:
             info = StreamInfo(BytesIO(streaminfo))
@@ -347,7 +347,7 @@ def strip_flac_metadata(data: bytes, sample_rate: int, channels: int) -> bytes:
             info.min_framesize if info is not None else None,
             info.max_framesize if info is not None else None,
         )
-        raise ProtocolViolation("encoder_failed", "FLAC exceeds VERBATIM bound")
+        raise ProtocolViolation("encoder_failed", "FLAC exceeds chunk payload limit")
     return result
 
 
@@ -408,8 +408,8 @@ def remux_opus(data: bytes, history_frames: int, frame_count: int) -> bytes:
             page.position = pre_skip + frame_count
         page.packets = [packet]
         encoded.extend(page.write())
-    if len(encoded) > 87278:
-        raise ProtocolViolation("encoder_failed", "Opus exceeds its container bound")
+    if len(encoded) > MAX_PAYLOAD_BYTES:
+        raise ProtocolViolation("encoder_failed", "Opus exceeds chunk payload limit")
     return bytes(encoded)
 
 

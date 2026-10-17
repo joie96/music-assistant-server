@@ -215,7 +215,7 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
             + packed_format.to_bytes(8, "big")
             + bytes(16)
         )
-        bound = 48000 * 2 * 2 + 12 * 20 + 1024
+        bound = MAX_PAYLOAD_BYTES
         data = (
             b"fLaC\x00\x00\x00\x22"
             + streaminfo
@@ -225,12 +225,12 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
         )
         with (
             self.assertLogs("music_assistant.providers.mashin.codec", level="WARNING") as logs,
-            pytest.raises(ProtocolViolation, match="FLAC exceeds VERBATIM bound") as failure,
+            pytest.raises(ProtocolViolation, match="FLAC exceeds chunk payload limit") as failure,
         ):
             strip_flac_metadata(data, 48000, 2)
         assert failure.value.code == "encoder_failed"
         message = logs.records[0].getMessage()
-        assert "encoded_bytes=193369 payload_bytes=193265 bound_bytes=193264" in message
+        assert "encoded_bytes=262249 payload_bytes=262145 bound_bytes=262144" in message
         assert "excess_bytes=1 metadata_bytes=146" in message
         assert "expected_rate=48000 expected_channels=2 expected_bit_depth=16" in message
         assert "actual_rate=96000 actual_channels=2 actual_bit_depth=24" in message
@@ -239,13 +239,22 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
 
     async def test_unreadable_streaminfo_does_not_replace_the_original_failure(self) -> None:
         """Best-effort diagnostics preserve the encoder error even for malformed metadata."""
-        data = b"fLaC\x80\x00\x00\x22" + bytes(34 + 193264)
+        data = b"fLaC\x80\x00\x00\x22" + bytes(34 + MAX_PAYLOAD_BYTES)
         with (
             self.assertLogs("music_assistant.providers.mashin.codec", level="WARNING") as logs,
-            pytest.raises(ProtocolViolation, match="FLAC exceeds VERBATIM bound"),
+            pytest.raises(ProtocolViolation, match="FLAC exceeds chunk payload limit"),
         ):
             strip_flac_metadata(data, 48000, 2)
         assert "actual_rate=None actual_channels=None actual_bit_depth=None" in logs.output[0]
+
+    async def test_flac_accepts_payloads_up_to_the_shared_chunk_limit(self) -> None:
+        """All FLAC output formats use the same inclusive payload boundary."""
+        for rate in (44100, 48000):
+            for channels in (1, 2):
+                for size in (193328, MAX_PAYLOAD_BYTES):
+                    with self.subTest(rate=rate, channels=channels, size=size):
+                        data = b"fLaC\x80\x00\x00\x22" + bytes(size - 8)
+                        assert strip_flac_metadata(data, rate, channels) == data
 
 
 class TestPCMPacing(unittest.IsolatedAsyncioTestCase):
