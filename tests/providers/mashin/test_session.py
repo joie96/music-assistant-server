@@ -270,6 +270,92 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         source.close.assert_awaited_once()
         self.fallback.assert_not_awaited()
 
+    async def test_recovery_retains_pcm_buffer_until_final_reset(self) -> None:
+        """Recovery closes processing but retains ownership for reuse and final cleanup."""
+        await self.accept_load()
+        run = self.session.current
+        assert run is not None
+        owned = Mock()
+        source = Mock(owned_buffer=owned, close=AsyncMock())
+        run.source = source
+        await self.session._source_lost(run)
+        assert run.source is None
+        assert run.owned_buffer is owned
+        source.close.assert_awaited_once()
+        self.adapter.release.assert_not_awaited()
+        await self.session.reset()
+        self.adapter.release.assert_awaited_once_with(owned)
+        assert run.owned_buffer is None
+
+    async def test_pcm_repair_keeps_pcm_buffer_between_attempts(self) -> None:
+        """Retryable failures leave PCM reuse and replacement to MA, even before open completes."""
+        for failure in (TimeoutError(), ProtocolViolation("recovery_failed", "No PCM match")):
+            with self.subTest(failure=type(failure).__name__):
+                await self.accept_load()
+                run = self.session.current
+                assert run is not None
+                owned = Mock()
+                run.owned_buffer = owned
+                run.incident = RecoveryIncident()
+                run.position_validated = True
+                source = Mock(
+                    owned_buffer=None,
+                    open=AsyncMock(side_effect=failure),
+                    close=AsyncMock(),
+                )
+                self.adapter.release.reset_mock()
+                self.fallback.reset_mock()
+                with (
+                    patch.dict(
+                        "sys.modules",
+                        {
+                            "music_assistant.providers.mashin.adapter": SimpleNamespace(
+                                PCMSource=Mock(return_value=source)
+                            )
+                        },
+                    ),
+                    patch.object(self.session, "_recovery_grant", AsyncMock(return_value=True)),
+                ):
+                    await self.session._repair(run)
+                assert source.open.await_count == 2
+                assert source.close.await_count == 2
+                assert run.owned_buffer is owned
+                self.adapter.release.assert_not_awaited()
+                self.fallback.assert_awaited_once_with(150, False)
+                await self.session.reset()
+                self.adapter.release.assert_awaited_once_with(owned)
+
+    async def test_terminal_pcm_repair_releases_pcm_buffer(self) -> None:
+        """An authorization rejection terminates repair and releases its owned PCM buffer."""
+        await self.accept_load()
+        run = self.session.current
+        assert run is not None
+        owned = Mock()
+        run.incident = RecoveryIncident()
+        source = Mock(
+            owned_buffer=owned,
+            open=AsyncMock(side_effect=ProtocolViolation("forbidden", "Authorization revoked")),
+            close=AsyncMock(),
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "music_assistant.providers.mashin.adapter": SimpleNamespace(
+                        PCMSource=Mock(return_value=source)
+                    )
+                },
+            ),
+            patch.object(self.session, "_recovery_grant", AsyncMock(return_value=True)),
+            pytest.raises(ProtocolViolation, match="Authorization revoked"),
+        ):
+            await self.session._repair(run)
+        source.open.assert_awaited_once()
+        source.close.assert_awaited_once()
+        self.adapter.release.assert_awaited_once_with(owned)
+        assert run.owned_buffer is None
+        self.fallback.assert_not_awaited()
+
     async def test_rejected_pcm_repair_uses_pause_safe_seek_fallback(self) -> None:
         """Both failed PCM attempts lead to exactly one validated paused fallback."""
         try:

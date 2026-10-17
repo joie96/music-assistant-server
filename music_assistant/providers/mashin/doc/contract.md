@@ -420,7 +420,15 @@ Ausgabe den Reparaturpfad freigeben; kein vorheriges play erforderlich.
 
 Reparatur ist Best Effort mit sicherem Rueckfall, keine Erfolgsgarantie. Genau ein
 Reparaturvorgang je Player und ein Quellenversuch gleichzeitig. Alten Reader/
-Encoder beenden und Source-Slot freigeben, bevor MA die Ersatzquelle oeffnet.
+Encoder vor dem naechsten Versuch beenden, aber bei Reparatur desselben weiterhin
+autorisierten Streams den zugeordneten MA-PCM-Puffer nicht vorsorglich leeren.
+Dies gilt auch zwischen reparierbaren Fehlversuchen. MA prueft beim regulaeren
+Pufferabruf die Zielposition und den Pufferzustand und entscheidet ueber
+Wiederverwendung, Ersatz und erforderliche Source-Slot-Freigabe. Mashin haelt die
+Ownership-Referenz fuer spaeteres Cleanup erhalten, auch wenn der neue Reader
+noch keinen Puffer uebernommen hat. Endgueltiger Fehler, Stop, Widerruf und
+Shutdown geben weiterhin die eigenen, nicht inzwischen uebernommenen Ressourcen
+frei; keine zusaetzliche Puffer-Gesundheitslogik im Provider.
 Reopen nur ueber den MA-Adapter mit unveraendertem fachlichen Playbackkontext;
 ein regulaerer MA-Queue-Seek ist kein transparenter Reopen, sondern neuer Load.
 Ein vom Adapter fuer die Ersatzquelle ausgefuehrter MA-Quellen-Seek samt

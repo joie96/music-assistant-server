@@ -1405,7 +1405,7 @@ class MashinSession:
             return
         self.buffer.reservation = None
         run.incident = run.incident or RecoveryIncident()
-        await self._close_run(run, release=True)
+        await self._close_run(run, release=False)
         if run.incident.fallbacks:
             await self._fail(run, safe_error("recovery_failed", "Fallback source failed"))
         else:
@@ -1591,13 +1591,14 @@ class MashinSession:
                     run.descriptor.stream_id,
                     err.code,
                 )
-                await self._close_run(run, release=True)
-                if err.code in (
+                terminal = err.code in (
                     "forbidden",
                     "media_unsupported",
                     "stale_playback",
                     "source_failed",
-                ):
+                )
+                await self._close_run(run, release=terminal)
+                if terminal:
                     self.logger.warning(
                         "PCM repair failed for player %s stream=%s: %s; fallback not permitted",
                         self.adapter.player.player_id,
@@ -1613,7 +1614,7 @@ class MashinSession:
                     run.descriptor.stream_id,
                     type(err).__name__,
                 )
-                await self._close_run(run, release=True)
+                await self._close_run(run, release=False)
         self.logger.warning(
             "PCM repair failed for player %s stream=%s after %s attempt(s); checking bounded MA fallback",
             self.adapter.player.player_id,
@@ -1683,7 +1684,12 @@ class MashinSession:
     async def _close_run(self, run: StreamRun, *, release: bool) -> None:
         run.source_attempt_id += 1
         source, run.source = run.source, None
-        owned = source.owned_buffer if source is not None else run.owned_buffer
+        owned = (
+            source.owned_buffer
+            if source is not None and source.owned_buffer is not None
+            else run.owned_buffer
+        )
+        run.owned_buffer = owned
         if source:
             await source.close()
         await run.encoder.close()
