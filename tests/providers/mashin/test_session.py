@@ -216,15 +216,34 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                     assert not self.messages
 
     async def test_current_deadline_still_closes_audio(self) -> None:
-        """The ownership check must not suppress the current connection timeout."""
-        self.session.close_audio = AsyncMock()
-        self.messages.clear()
-        task = self.spawn(self.session._deadline(0, "capacity"))
-        self.session.capacity_timer = task
-        await task
-        self.session.close_audio.assert_awaited_once()
-        assert not self.session.buffer.ready
-        assert self.messages[-1][0] == "error"
+        """Each current timeout closes audio and reports its specific cause."""
+        for kind, reason in (
+            ("setup", "audio setup incomplete"),
+            ("capacity", "buffer_status not received"),
+            ("ack", "chunk_ack not received"),
+        ):
+            with self.subTest(kind=kind):
+                self.session.close_audio = AsyncMock()
+                self.session.buffer.ready = True
+                self.messages.clear()
+                with patch.object(self.session.logger, "warning") as warning:
+                    task = self.spawn(self.session._deadline(0, kind))
+                    setattr(self.session, f"{kind}_timer", task)
+                    await task
+                self.session.close_audio.assert_awaited_once()
+                assert not self.session.buffer.ready
+                assert self.messages[-1][0] == "error"
+                report = cast("ErrorMessage", self.messages[-1][1])
+                assert report.error == safe_error(
+                    "stream_unavailable",
+                    f"Audio response deadline expired: {reason}",
+                    retryable=True,
+                )
+                warning.assert_called_once_with(
+                    "Audio response deadline expired for player %s: %s",
+                    "mashin_test",
+                    reason,
+                )
 
     async def test_disconnect_retains_source_without_cleanup_timer(self) -> None:
         """Transport loss cannot start a source-closing task, even across long gaps."""

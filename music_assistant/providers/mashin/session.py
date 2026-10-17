@@ -1319,6 +1319,16 @@ class MashinSession:
         }[kind]
         if timer is not asyncio.current_task() or self.epoch != epoch or self.binding != binding:
             return
+        reason = {
+            "setup": "audio setup incomplete",
+            "capacity": "buffer_status not received",
+            "ack": "chunk_ack not received",
+        }[kind]
+        self.logger.warning(
+            "Audio response deadline expired for player %s: %s",
+            self.adapter.player.player_id,
+            reason,
+        )
         if kind == "setup":
             self.binding_consumed = True
         await self.audio_lost()
@@ -1332,7 +1342,9 @@ class MashinSession:
                     None,
                     self.buffer.audio_connection_id,
                     safe_error(
-                        "stream_unavailable", "Audio response deadline expired", retryable=True
+                        "stream_unavailable",
+                        f"Audio response deadline expired: {reason}",
+                        retryable=True,
                     ),
                 ),
             )
