@@ -53,6 +53,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.adapter = Mock()
         self.adapter.player.player_id = "mashin_test"
         self.adapter.valid.return_value = True
+        self.adapter.reauthorize_successor.return_value = None
         self.adapter.release = AsyncMock()
         self.publish = Mock()
         self.stop = AsyncMock()
@@ -790,9 +791,9 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         await self.sent.wait()
         command = cast("SetMedia", self.messages[-1][1])
         assert self.messages[-1][0] == "set_media"
-        assert not command.autoplay
-        assert command.stream.stream_id != original.descriptor.stream_id
-        assert command.stream.output_format.profile_id == AudioProfileId.OPUS_128K
+        assert command.initial_output_state == "paused"
+        assert command.current.stream_id != original.descriptor.stream_id
+        assert command.current.output_format.profile_id == AudioProfileId.OPUS_128K
         assert original.descriptor.output_format.profile_id == AudioProfileId.FLAC
         await self.session.report(CommandAck(command.command_id, "accepted", None))
         await operation
@@ -1135,7 +1136,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 0,
                 50,
                 False,
-                0,
+                self.session.media_revision,
                 [ClientStreamCursor(identifier, 1)],
             )
         )
@@ -1187,7 +1188,8 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 0,
                 50,
                 False,
-                1,
+                self.session.media_revision
+                - int(self.session.revoking or self.session.activation_target is not None),
                 [ClientStreamCursor(current, 1), ClientStreamCursor(next_id, 1)],
             )
         )
@@ -1225,7 +1227,13 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         old = self.session.buffer.streams[current]
         old.final_index = old.final_frame_count = None
         old.terminal = False
-        receipt = PreparedActivation(current, successor, 1, 12000)
+        receipt = PreparedActivation(
+            current,
+            successor,
+            self.session.media_revision
+            - int(self.session.revoking or self.session.activation_target is not None),
+            12000,
+        )
         state = ClientResumeState(
             successor,
             1,
@@ -1233,7 +1241,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
             0,
             50,
             False,
-            1,
+            self.session.media_revision,
             [ClientStreamCursor(successor, 2)],
             receipt,
         )
@@ -1248,7 +1256,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         await self.session.report(PreparedActivated(5, receipt, 1, "playing", 0))
         assert self.session.current is run
 
-    async def test_new_ma_session_activates_existing_successor_without_set_media(self) -> None:
+    async def test_new_ma_session_announces_existing_successor(self) -> None:
         """MA's new load generation reauthorizes B without changing its cache identity."""
         current, successor = await self.prepare_transition()
         run = self.session.next
@@ -1263,7 +1271,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.messages.clear()
         task = self.spawn(self.session.load(context))
         await self.sent.wait()
-        assert [kind for kind, _ in self.messages] == ["activate_prepared"]
+        assert [kind for kind, _ in self.messages] == ["set_media"]
         assert self.session.next is run
         assert run.descriptor is descriptor
         assert run.context is context
@@ -1274,7 +1282,19 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         await task
         self.publish.reset_mock()
         await self.session.report(
-            PreparedActivated(1, PreparedActivation(current, successor, 1, 0), 1, "buffering", 0)
+            PreparedActivated(
+                1,
+                PreparedActivation(
+                    current,
+                    successor,
+                    self.session.media_revision
+                    - int(self.session.revoking or self.session.activation_target is not None),
+                    0,
+                ),
+                1,
+                "buffering",
+                0,
+            )
         )
         assert self.session.current is run
         assert self.session.activation_target is None
@@ -1299,9 +1319,15 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
             12000,
             50,
             False,
-            1,
+            self.session.media_revision,
             [ClientStreamCursor(successor, 2)],
-            PreparedActivation(current, successor, 1, 12000),
+            PreparedActivation(
+                current,
+                successor,
+                self.session.media_revision
+                - int(self.session.revoking or self.session.activation_target is not None),
+                12000,
+            ),
         )
         capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
         await self.session.connect(
@@ -1319,6 +1345,50 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.messages.clear()
         await self.session.after_welcome()
         assert not self.messages
+
+    async def test_new_a_retains_authorized_b_descriptor_bytes_and_receipt(self) -> None:
+        """An A replacement retains the original B allocation under fresh MA authority."""
+        _, successor = await self.prepare_transition()
+        run = self.session.next
+        assert run is not None
+        run.context = cast(
+            "PlaybackContext",
+            SimpleNamespace(**{**vars(self.context), "queue_item_id": "next-item"}),
+        )
+        descriptor = run.descriptor
+        delivery = self.session.buffer.streams[successor]
+        chunk = delivery.chunks[1]
+        context = cast(
+            "PlaybackContext",
+            SimpleNamespace(
+                **{**vars(self.context), "session_id": "new-session", "seek_seconds": 160}
+            ),
+        )
+        authorized = cast(
+            "PlaybackContext",
+            SimpleNamespace(**{**vars(run.context), "session_id": "new-session"}),
+        )
+        self.adapter.reauthorize_successor.return_value = authorized
+        self.sent.clear()
+        task = self.spawn(self.session.load(context))
+        await self.sent.wait()
+        assert self.session.next is run
+        assert run.context is authorized
+        assert run.descriptor is descriptor
+        assert self.session.buffer.streams[successor] is delivery
+        assert delivery.chunks[1] is chunk
+        assert delivery.next_produced == 2
+        assert run.incident is not None
+        payload = self.messages[-1][1]
+        assert isinstance(payload, SetMedia)
+        assert payload.prepared is descriptor
+        assert payload.current is not None
+        assert payload.current.media_start_position_millis == 160000
+        assert payload.initial_output_state == "playing"
+        assert not self.session.buffer.enabled
+        await self.session.report(CommandAck(payload.command_id, "accepted", None))
+        await task
+        assert not self.session.buffer.enabled
 
     async def test_changed_source_uses_fresh_load_instead_of_prepared_cache(self) -> None:
         """A matching queue item alone never authorizes bytes from another source."""
@@ -1361,7 +1431,8 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
             0,
             50,
             False,
-            1,
+            self.session.media_revision
+            - int(self.session.revoking or self.session.activation_target is not None),
             [ClientStreamCursor(current, 2), ClientStreamCursor(successor, 1)],
         )
         capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
@@ -1376,7 +1447,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.sent.clear()
         reissue = self.spawn(self.session.after_welcome())
         await self.sent.wait()
-        assert [kind for kind, _ in self.messages] == ["activate_prepared"]
+        assert [kind for kind, _ in self.messages] == ["set_media"]
         assert self.session.pending is not None
         await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
         await reissue
@@ -1387,7 +1458,17 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         """A stale predecessor or forged skip position cannot consume the grant."""
         current, successor = await self.prepare_transition()
         with pytest.raises(ProtocolViolation):
-            self.session._accept_activation(PreparedActivation(current, successor, 1, 48001), 1, 0)
+            self.session._accept_activation(
+                PreparedActivation(
+                    current,
+                    successor,
+                    self.session.media_revision
+                    - int(self.session.revoking or self.session.activation_target is not None),
+                    48001,
+                ),
+                1,
+                0,
+            )
         assert self.session.current is not None
         assert self.session.current.descriptor.stream_id == current
 
@@ -1402,7 +1483,8 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 0,
                 50,
                 False,
-                1,
+                self.session.media_revision
+                - int(self.session.revoking or self.session.activation_target is not None),
                 [ClientStreamCursor(successor, 2)],
             )
         )
@@ -1417,7 +1499,16 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.session.buffer.resume(successor, 2)
         self.session._ended(current)
         with pytest.raises(ProtocolViolation):
-            self.session._promote(TrackStarted(1, successor, 1, 0, 48001))
+            self.session._promote(
+                TrackStarted(
+                    1,
+                    successor,
+                    self.session.media_revision
+                    - int(self.session.revoking or self.session.activation_target is not None),
+                    0,
+                    48001,
+                )
+            )
         assert self.session.current is not None
         assert self.session.current.descriptor.stream_id == current
         assert current in self.session.buffer.streams
@@ -1436,7 +1527,8 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 0,
                 50,
                 False,
-                1,
+                self.session.media_revision
+                - int(self.session.revoking or self.session.activation_target is not None),
                 [ClientStreamCursor(successor, 2)],
             )
         )
@@ -1464,7 +1556,14 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                     "rejected",
                     safe_error("stale_playback", "B already promoted"),
                 )
-                promotion = TrackStarted(self.session.sequence + 1, successor, 1, 0, 0)
+                promotion = TrackStarted(
+                    self.session.sequence + 1,
+                    successor,
+                    self.session.media_revision
+                    - int(self.session.revoking or self.session.activation_target is not None),
+                    0,
+                    0,
+                )
                 if ack_first:
                     await self.session.report(ack)
                 await self.session.report(promotion)
@@ -1473,7 +1572,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 with pytest.raises(ProtocolViolation):
                     await clear
                 assert not self.session.revoking
-                assert self.session.next_revision == 1
+                assert self.session.media_revision >= 2
                 assert self.session.buffer.ready
                 self.sent.clear()
                 preparing = self.spawn(self.session.prepare(self.context))
@@ -1500,7 +1599,8 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 48000,
                 50,
                 False,
-                1,
+                self.session.media_revision
+                - int(self.session.revoking or self.session.activation_target is not None),
                 [ClientStreamCursor(current, 2), ClientStreamCursor(successor, 1)],
             )
         )

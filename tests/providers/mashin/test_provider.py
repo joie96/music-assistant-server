@@ -190,7 +190,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         ):
             await control.send_json(
                 {
-                    "protocol_version": 2,
+                    "protocol_version": 3,
                     "type": "hello",
                     "message_id": str(uuid4()),
                     "connection_epoch": None,
@@ -239,7 +239,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             ):
                 await control.send_json(
                     {
-                        "protocol_version": 2,
+                        "protocol_version": 3,
                         "type": "hello",
                         "message_id": str(uuid4()),
                         "connection_epoch": None,
@@ -286,7 +286,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             ):
                 await control.send_json(
                     {
-                        "protocol_version": 2,
+                        "protocol_version": 3,
                         "type": "hello",
                         "message_id": str(uuid4()),
                         "connection_epoch": None,
@@ -301,7 +301,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                                 "position_frame": 0,
                                 "volume_percent": 100,
                                 "is_muted": False,
-                                "next_revision": 0,
+                                "media_revision": 0,
                                 "received_streams": [],
                             },
                             "capabilities": asdict(

@@ -1,4 +1,4 @@
-"""Typed, strictly validated Mashin V1 control messages."""
+"""Typed, strictly validated Mashin V3 control messages."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class AudioProfileId(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class Version1Limits:
+class ProtocolLimits:
     """Fixed V1 limits and the three configurable protection budgets."""
 
     max_server_buffered_chunks: int = 10
@@ -203,7 +203,7 @@ class PreparedActivation:
 
     previous_stream_id: str
     stream_id: str
-    next_revision: int
+    media_revision: int
     previous_position_frame: int
 
 
@@ -217,7 +217,7 @@ class ClientResumeState:
     position_frame: int
     volume_percent: int
     is_muted: bool
-    next_revision: int
+    media_revision: int
     received_streams: list[ClientStreamCursor]
     activation: PreparedActivation | None = None
 
@@ -348,7 +348,7 @@ class TrackStarted:
 
     sequence: int
     stream_id: str
-    next_revision: int
+    media_revision: int
     output_revision: int
     position_frame: int
 
@@ -412,13 +412,13 @@ class Welcome:
     player_id: str
     provider_version: str
     server_revision: str
-    limits: Version1Limits
+    limits: ProtocolLimits
     audio_profiles: list[AudioProfileId]
     selected_audio_profile: AudioProfileId
     audio_binding_id: str
     current_stream: StreamSnapshot | None
     desired_output_state: Literal["idle", "playing", "paused"]
-    next_revision: int
+    media_revision: int
     prepared_next: StreamSnapshot | None
 
 
@@ -448,40 +448,13 @@ class EmptyPayload:
 
 @dataclass(frozen=True, slots=True)
 class SetMedia:
-    """Atomically replace the current playback context."""
+    """Atomically reconcile the complete authorized A/B state."""
 
     command_id: int
-    stream: StreamDescriptor
-    autoplay: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PrepareNext:
-    """Register one MA-authorized successor."""
-
-    command_id: int
-    current_stream_id: str
-    stream: StreamDescriptor
-    next_revision: int
-
-
-@dataclass(frozen=True, slots=True)
-class ActivatePrepared:
-    """Consume an existing successor grant without replacing its PCM stream."""
-
-    command_id: int
-    current_stream_id: str
-    stream_id: str
-    next_revision: int
-
-
-@dataclass(frozen=True, slots=True)
-class ClearNext:
-    """Revoke one unpromoted successor without replacing the current stream."""
-
-    command_id: int
-    current_stream_id: str
-    next_revision: int
+    media_revision: int
+    current: StreamDescriptor | None
+    prepared: StreamDescriptor | None
+    initial_output_state: Literal["playing", "paused"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,14 +507,14 @@ def parse_model(model: type[ModelT], value: object) -> ModelT:
         raise ProtocolViolation("invalid_message", "Missing or unknown message fields")
     parsed = {name: _parse_value(hints[name], item, name) for name, item in value.items()}
     result = model(**parsed)
-    if isinstance(result, ClientCapabilities | OutputFormat | Version1Limits):
+    if isinstance(result, ClientCapabilities | OutputFormat | ProtocolLimits):
         result.validate()
     if isinstance(result, ClientResumeState | AudioHello):
         identifiers = [cursor.stream_id for cursor in result.received_streams]
         if len(identifiers) > 2 or len(identifiers) != len(set(identifiers)):
             raise ProtocolViolation("invalid_message", "Invalid received stream set")
     if isinstance(result, PreparedActivation) and (
-        result.previous_stream_id == result.stream_id or result.next_revision == 0
+        result.previous_stream_id == result.stream_id or result.media_revision == 0
     ):
         raise ProtocolViolation("invalid_message", "Invalid activation grant")
     if isinstance(result, PreparedActivated) and result.output_state == "idle":
@@ -554,10 +527,17 @@ def parse_model(model: type[ModelT], value: object) -> ModelT:
             result.output_state != "idle"
             or result.position_frame != 0
             or result.output_revision != 0
-            or result.next_revision != 0
             or result.received_streams
         ):
             raise ProtocolViolation("invalid_message", "Invalid idle snapshot")
+    if isinstance(result, SetMedia):
+        if result.media_revision == 0:
+            raise ProtocolViolation("invalid_message", "Media revision must be positive")
+        if result.current is None:
+            if result.prepared is not None:
+                raise ProtocolViolation("invalid_message", "Invalid empty media state")
+        elif result.prepared is not None and result.current.stream_id == result.prepared.stream_id:
+            raise ProtocolViolation("invalid_message", "Invalid media slots")
     if isinstance(result, CommandAck | ChunkAck | AudioProfileChanged):
         if (result.status == "accepted") != (result.error is None):
             raise ProtocolViolation("invalid_message", "ACK status contradicts error")
@@ -585,7 +565,7 @@ def decode_envelope(text: str) -> Envelope:
         raise ProtocolViolation("invalid_message", "Invalid JSON") from err
     envelope = parse_model(Envelope, value)
     if envelope.protocol_version != PROTOCOL_VERSION:
-        raise ProtocolViolation("unsupported_version", "Mashin protocol version 1 required")
+        raise ProtocolViolation("unsupported_version", "Mashin protocol version 3 required")
     return envelope
 
 

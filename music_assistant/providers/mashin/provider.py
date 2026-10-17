@@ -8,6 +8,7 @@ import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -594,6 +595,15 @@ class MashinDevice:
                 and data.queue.current_item is run.context.item
                 and run.context.item.available
                 and not self.player.state.group_members
+            ):
+                return
+            if (
+                data is not None
+                and current is not None
+                and data.queue.current_item is current.context.item
+                and self.session.adapter.reauthorize_successor(
+                    run.context, replace(current.context, session_id=data.session_id)
+                ) is not None
             ):
                 return
         if (

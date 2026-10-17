@@ -1,4 +1,4 @@
-"""Strict Mashin V1 wire primitives."""
+"""Strict Mashin V3 wire primitives."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import struct
 from dataclasses import dataclass
 from uuid import UUID
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_INTEGER = 9007199254740991
 MAX_PAYLOAD_BYTES = 262144
 CHUNK_HEADER = struct.Struct("!16sQQQB")

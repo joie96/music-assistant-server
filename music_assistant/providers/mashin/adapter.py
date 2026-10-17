@@ -43,6 +43,7 @@ class PlaybackContext:
     seek_seconds: int
     item: QueueItem
     source_identity: tuple[str, str, str, int, int, int, str, str, int | None]
+    processing_identity: str = ""
 
 
 class MAAdapter:
@@ -130,6 +131,7 @@ class MAAdapter:
             int(seek),
             item,
             self.source_identity(item),
+            self.processing_identity(item),
         )
 
     async def capture_next(self, media: PlayerMedia, current: PlaybackContext) -> PlaybackContext:
@@ -203,6 +205,32 @@ class MAAdapter:
         """Invoke MA's loaded/served path once after first usable audio."""
         self.mass.player_queues.track_loaded_in_buffer(context.queue_id, context.queue_item_id)
 
+    def reauthorize_successor(
+        self, previous: PlaybackContext, current: PlaybackContext
+    ) -> PlaybackContext | None:
+        """Bind an unchanged successor occurrence to a newly authorized MA session."""
+        if (
+            previous.queue_id != current.queue_id
+            or previous.item is not self.mass.player_queues.get_next_item(
+                current.queue_id, current.queue_item_id
+            )
+            or previous.source_identity != self.source_identity(previous.item)
+            or previous.processing_identity != self.processing_identity(previous.item)
+            or previous.item.streamdetails is None
+            or previous.item.streamdetails.seek_position != previous.seek_seconds
+        ):
+            return None
+        candidate = replace(previous, session_id=current.session_id)
+        return candidate if self.valid(candidate, successor_of=current.queue_item_id) else None
+
+    def processing_identity(self, item: QueueItem) -> str:
+        """Capture player DSP and track normalization settings for cache reauthorization."""
+        details = item.streamdetails
+        if details is None:
+            raise ProtocolViolation("source_failed", "Missing MA processing details")
+        dsp = self.mass.config.get_player_dsp_config(self.player.player_id)
+        return repr((dsp.to_dict(), details.volume_normalization_mode, details.fade_in))
+
     async def release(self, owned_buffer: AudioBuffer | None) -> None:
         """Release an owned incomplete MA buffer through its public lifecycle."""
         if owned_buffer is not None:
@@ -275,7 +303,11 @@ class PCMSource:
         if not self.adapter.valid(context) or (repair and identity != context.source_identity):
             raise ProtocolViolation("source_failed", "The MA source identity changed")
         if not repair:
-            context = self.context = replace(context, source_identity=identity)
+            context = self.context = replace(
+                context,
+                source_identity=identity,
+                processing_identity=self.adapter.processing_identity(context.item),
+            )
         details = context.item.streamdetails
         if details is None:
             raise ProtocolViolation("source_failed", "Missing prepared MA source details")

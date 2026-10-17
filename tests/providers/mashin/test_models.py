@@ -17,8 +17,9 @@ from music_assistant.providers.mashin.models import (
     Hello,
     PreparedActivated,
     PreparedActivation,
+    ProtocolLimits,
     SetAudioProfile,
-    Version1Limits,
+    SetMedia,
     decode_message,
     parse_model,
 )
@@ -28,12 +29,31 @@ from music_assistant.providers.mashin.wire import ProtocolViolation
 class TestModels(unittest.TestCase):
     """Reject loose JSON and incomplete V1 handshakes."""
 
+    def test_complete_media_state_requires_revision_and_valid_empty_slots(self) -> None:
+        """V3 accepts a complete empty state and rejects partial or contradictory states."""
+        payload = asdict(SetMedia(1, 1, None, None, "paused"))
+        assert parse_model(SetMedia, payload).media_revision == 1
+        assert parse_model(SetMedia, {**payload, "initial_output_state": "playing"})
+        for invalid in (
+            {**payload, "media_revision": 0},
+            {**payload, "position_mode": "preserve"},
+            {**payload, "desired_output_state": "playing"},
+            {**payload, "initial_output_state": "idle"},
+            {key: value for key, value in payload.items() if key != "initial_output_state"},
+            {**payload, "autoplay": True},
+            {key: value for key, value in payload.items() if key != "prepared"},
+        ):
+            with self.subTest(payload=invalid), pytest.raises(ProtocolViolation):
+                parse_model(SetMedia, invalid)
+        idle = asdict(ClientResumeState(None, 0, "idle", 0, 50, False, 7, []))
+        assert parse_model(ClientResumeState, idle).media_revision == 7
+
     def test_activation_receipt_and_version_are_strict(self) -> None:
         """V2 carries one exact non-idle grant and never silently accepts V1 envelopes."""
         receipt = PreparedActivation(str(uuid4()), str(uuid4()), 1, 12000)
         payload = asdict(PreparedActivated(1, receipt, 2, "buffering", 0))
         envelope = {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "type": "prepared_activated",
             "message_id": "activation-1",
             "connection_epoch": "epoch",
@@ -47,7 +67,7 @@ class TestModels(unittest.TestCase):
         with pytest.raises(ProtocolViolation):
             parse_model(PreparedActivated, {**payload, "output_state": "idle"})
         with pytest.raises(ProtocolViolation):
-            parse_model(PreparedActivation, {**asdict(receipt), "next_revision": 0})
+            parse_model(PreparedActivation, {**asdict(receipt), "media_revision": 0})
         idle = asdict(ClientResumeState(None, 0, "idle", 0, 50, False, 0, []))
         with pytest.raises(ProtocolViolation):
             parse_model(ClientResumeState, {**idle, "activation": asdict(receipt)})
@@ -74,7 +94,7 @@ class TestModels(unittest.TestCase):
         _, decoded = decode_message(
             json.dumps(
                 {
-                    "protocol_version": 2,
+                    "protocol_version": 3,
                     "type": "hello",
                     "message_id": str(uuid4()),
                     "connection_epoch": None,
@@ -94,22 +114,22 @@ class TestModels(unittest.TestCase):
 
     def test_all_limits_required_and_fixed(self) -> None:
         """Require exactly 39 fields and reject altered constant values."""
-        limits = asdict(Version1Limits())
-        assert len(fields(Version1Limits)) == 39
-        parse_model(Version1Limits, limits)
+        limits = asdict(ProtocolLimits())
+        assert len(fields(ProtocolLimits)) == 39
+        parse_model(ProtocolLimits, limits)
         for name in limits:
             invalid = dict(limits)
             del invalid[name]
             with self.subTest(name=name), pytest.raises(ProtocolViolation):
-                parse_model(Version1Limits, invalid)
+                parse_model(ProtocolLimits, invalid)
         limits["max_unacknowledged_audio_chunks"] = 2
         with pytest.raises(ProtocolViolation):
-            parse_model(Version1Limits, limits)
+            parse_model(ProtocolLimits, limits)
 
     def test_profile_change_messages_are_strict_and_epoch_bound(self) -> None:
         """Runtime codec selection uses the Control epoch and exact request/reply schemas."""
         envelope = {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "type": "set_audio_profile",
             "message_id": "profile-message-1",
             "connection_epoch": "epoch",
@@ -162,7 +182,7 @@ class TestModels(unittest.TestCase):
     def test_message_channel_epoch_and_duplicate_json(self) -> None:
         """A valid report belongs to exactly one control epoch."""
         envelope = {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "type": "buffer_status",
             "message_id": "report-1",
             "connection_epoch": "epoch",

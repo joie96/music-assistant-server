@@ -7,8 +7,8 @@ import secrets
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from music_assistant_models.errors import MusicAssistantError
@@ -18,7 +18,6 @@ from music_assistant.constants import VERBOSE_LOG_LEVEL
 from .buffer import DeliveryBuffer
 from .codec import ChunkEncoder, PCMChunkReader, PCMPacing
 from .models import (
-    ActivatePrepared,
     AudioBinding,
     AudioHello,
     AudioProfileChanged,
@@ -26,7 +25,6 @@ from .models import (
     AudioReconnectRequest,
     BufferStatus,
     ChunkAck,
-    ClearNext,
     ClientResumeState,
     ClientStreamCursor,
     CommandAck,
@@ -38,8 +36,8 @@ from .models import (
     PlayerState,
     PreparedActivated,
     PreparedActivation,
-    PrepareNext,
     ProtocolError,
+    ProtocolLimits,
     SetAudioProfile,
     SetMedia,
     StateRequest,
@@ -49,7 +47,6 @@ from .models import (
     TrackEnded,
     TrackStarted,
     TransportStatus,
-    Version1Limits,
     VolumeCommand,
     Welcome,
     parse_model,
@@ -66,16 +63,7 @@ if TYPE_CHECKING:
 
 type SendControl = Callable[[str, object], Awaitable[None]]
 type SendAudio = Callable[[bytes], Awaitable[None]]
-type CommandPayload = (
-    SetMedia
-    | PrepareNext
-    | ActivatePrepared
-    | ClearNext
-    | VolumeCommand
-    | MuteCommand
-    | StateRequest
-    | StreamCommand
-)
+type CommandPayload = SetMedia | VolumeCommand | MuteCommand | StateRequest | StreamCommand
 
 
 @dataclass(slots=True)
@@ -149,7 +137,7 @@ class MashinSession:
         self.buffer = DeliveryBuffer()
         self.current: StreamRun | None = None
         self.next: StreamRun | None = None
-        self.next_revision = 0
+        self.media_revision = 0
         self.activation_target: PlaybackContext | None = None
         self.activation: PreparedActivation | None = None
         self.generation = 0
@@ -186,6 +174,7 @@ class MashinSession:
         self.recovery_pacing: PCMPacing | None = None
         self.recovery_pause = False
         self.reissue_revocation = False
+        self.reissue_media: SetMedia | None = None
         self.profile_restart_run: StreamRun | None = None
         self.profile_restart_paused = False
         self.last_profile_change: tuple[SetAudioProfile, AudioProfileChanged] | None = None
@@ -226,7 +215,7 @@ class MashinSession:
             self.adapter.player.player_id,
             "0.1.0",
             server_revision,
-            Version1Limits(),
+            ProtocolLimits(),
             list(AudioProfileId),
             self.profile,
             self.binding,
@@ -234,25 +223,22 @@ class MashinSession:
             "idle"
             if self.current is None
             else ("paused" if self.output_state == "paused" else "playing"),
-            self.next_revision - int(self.reissue_revocation),
+            self.media_revision - int(self.reissue_revocation or self.reissue_media is not None),
             self.snapshot(self.next),
         )
 
     async def after_welcome(self) -> None:
-        """Issue only a still-required revocation using fresh command authority."""
+        """Reissue a still-authorized complete state using fresh command authority."""
+        if self.reissue_media is not None:
+            payload, self.reissue_media = self.reissue_media, None
+            await self.command("set_media", replace(payload, command_id=self._command_id()))
+            return
         if self.activation_target is not None:
             await self._send_activation()
             return
         if self.reissue_revocation and self.current is not None and self.next is not None:
             self.reissue_revocation = False
-            await self.command(
-                "clear_next",
-                ClearNext(
-                    self._command_id(),
-                    self.current.descriptor.stream_id,
-                    self.next_revision,
-                ),
-            )
+            await self._announce(revoke_next=True, advance=False)
 
     def bind_audio(self, hello: AudioHello, send: SendAudio) -> None:
         """Consume the binding and monotonically claim an audio connection atomically."""
@@ -291,6 +277,9 @@ class MashinSession:
             and successor.context.queue_item_id == context.queue_item_id
             and successor.context.seek_seconds == context.seek_seconds
             and successor.context.source_identity == context.source_identity
+            and successor.context.item is context.item
+            and getattr(successor.context, "processing_identity", None)
+            == getattr(context, "processing_identity", None)
             and successor.descriptor.output_format.profile_id == self.profile
             and self.adapter.valid(context)
         ):
@@ -318,6 +307,27 @@ class MashinSession:
             and context.queue_id == self.profile_restart_run.context.queue_id
         ):
             autoplay = False
+        retained = None
+        if successor is not None and self.current is not None:
+            retained = self.adapter.reauthorize_successor(successor.context, context)
+            if retained is not None and (
+                successor.context.queue_item_id == context.queue_item_id
+                or successor.descriptor.output_format.profile_id != self.profile
+                or successor.error is not None
+                or not successor.accepted
+            ):
+                retained = None
+        saved_stream = None
+        if retained is not None and successor is not None:
+            await self._close_run(successor, release=True)
+            if not self.adapter.valid(context):
+                raise ProtocolViolation("stale_playback", "MA load changed during reauthorization")
+            successor.context = retained
+            successor.loaded = False
+            saved_stream = self.buffer.streams.pop(successor.descriptor.stream_id)
+            self.next = None
+            if saved_stream.final_index is None:
+                successor.incident = successor.incident or RecoveryIncident()
         self.generation = integer(self.generation + 1, 1)
         generation = self.generation
         await self.reset()
@@ -337,10 +347,11 @@ class MashinSession:
         self.buffer.register(
             self.current.descriptor.stream_id, self.current.descriptor.output_format.sample_rate_hz
         )
-        self.buffer.load_accepted = False
-        await self.command(
-            "set_media", SetMedia(self._command_id(), self.current.descriptor, autoplay)
-        )
+        if saved_stream is not None:
+            assert successor is not None
+            self.next = successor
+            self.buffer.streams[successor.descriptor.stream_id] = saved_stream
+        await self._announce(autoplay=autoplay)
 
     async def prepare(self, context: PlaybackContext) -> None:
         """Register exactly the MA-authorized next occurrence without fetching PCM."""
@@ -357,20 +368,11 @@ class MashinSession:
             await self.clear_next()
         if self.current is None or self.current is not current:
             raise ProtocolViolation("stale_playback", "Current playback changed during enqueue")
-        self.next_revision += 1
         self.next = self._run(context)
         self.buffer.register(
             self.next.descriptor.stream_id, self.next.descriptor.output_format.sample_rate_hz
         )
-        await self.command(
-            "prepare_next",
-            PrepareNext(
-                self._command_id(),
-                self.current.descriptor.stream_id,
-                self.next.descriptor,
-                self.next_revision,
-            ),
-        )
+        await self._announce()
 
     async def clear_next(self) -> None:
         """Freeze B delivery immediately and retain its authority until conflict resolution."""
@@ -379,15 +381,7 @@ class MashinSession:
         if self.pending is not None:
             raise ProtocolViolation("source_busy", "A playback command is unresolved")
         self.revoking = True
-        self.next_revision = integer(self.next_revision + 1)
-        await self.command(
-            "clear_next",
-            ClearNext(
-                self._command_id(),
-                self.current.descriptor.stream_id,
-                self.next_revision,
-            ),
-        )
+        await self._announce(revoke_next=True)
 
     async def control(self, kind: str, value: int | bool | None = None) -> None:
         """Send MA transport/device commands without optimistic player-state updates."""
@@ -543,9 +537,9 @@ class MashinSession:
         self.current = self.next = None
         self.activation_target = None
         self.activation = None
-        self.next_revision = 0
         self.revoking = False
         self.reissue_revocation = False
+        self.reissue_media = None
         old_buffer = self.buffer
         self.buffer = DeliveryBuffer()
         if old_buffer.audio_connection_id is not None:
@@ -789,6 +783,35 @@ class MashinSession:
         self.command_counter = integer(self.command_counter + 1, 1, MAX_INTEGER - 1)
         return self.command_counter
 
+    async def _announce(
+        self,
+        *,
+        autoplay: bool | None = None,
+        revoke_next: bool = False,
+        advance: bool = True,
+    ) -> None:
+        if advance:
+            self.media_revision = integer(self.media_revision + 1, 1)
+        current = self.current
+        target = self.next if self.activation_target is not None else current
+        prepared = None if revoke_next or self.activation_target is not None else self.next
+        initial: Literal["playing", "paused"] = (
+            "paused"
+            if autoplay is False or (autoplay is None and self.output_state == "paused")
+            else "playing"
+        )
+        self.buffer.load_accepted = False
+        await self.command(
+            "set_media",
+            SetMedia(
+                self._command_id(),
+                self.media_revision,
+                target.descriptor if target else None,
+                prepared.descriptor if prepared else None,
+                initial,
+            ),
+        )
+
     async def _send_activation(self) -> None:
         if self.activation_target is None or self.current is None or self.next is None:
             return
@@ -797,15 +820,7 @@ class MashinSession:
         if self.send_control is None:
             return
         try:
-            await self.command(
-                "activate_prepared",
-                ActivatePrepared(
-                    self._command_id(),
-                    self.current.descriptor.stream_id,
-                    self.next.descriptor.stream_id,
-                    self.next_revision,
-                ),
-            )
+            await self._announce()
         except ProtocolViolation as err:
             if err.code != "stream_unavailable" and not (
                 err.code == "command_failed" and self.pending is not None
@@ -833,7 +848,7 @@ class MashinSession:
             TrackStarted(
                 1,
                 activation.stream_id,
-                activation.next_revision,
+                activation.media_revision,
                 output_revision,
                 position_frame,
             ),
@@ -926,12 +941,14 @@ class MashinSession:
         ):
             if (
                 not self.adapter.valid(self.activation_target)
-                or state.next_revision != self.next_revision
+                or state.media_revision != self.media_revision - 1
             ):
                 raise ProtocolViolation(
                     "stale_playback", "Pending activation is no longer authorized"
                 )
             self._cursors(state.received_streams)
+            if self.pending is not None and isinstance(self.pending.payload, SetMedia):
+                self.reissue_media = self.pending.payload
             self._resolve_pending("accepted")
             self.volume_percent, self.is_muted = state.volume_percent, state.is_muted
             self.output_state = state.output_state
@@ -956,6 +973,7 @@ class MashinSession:
         if self._reconcile_activation(state):
             return
         pending = self.pending
+        was_revoking = self.revoking
         promotion = (
             self.next is not None and state.current_stream_id == self.next.descriptor.stream_id
         )
@@ -963,21 +981,22 @@ class MashinSession:
             self.revoking
             and not promotion
             and self.next is not None
-            and state.next_revision == self.next_revision - 1
+            and state.media_revision == self.media_revision - 1
             and any(
                 cursor.stream_id == self.next.descriptor.stream_id
                 for cursor in state.received_streams
             )
         )
-        expected_revision = self.next_revision - int(
+        expected_revision = self.media_revision - int(
             self.revoking and (promotion or retained_revocation)
         )
-        if state.next_revision != expected_revision:
+        if state.media_revision != expected_revision:
             raise ProtocolViolation("stale_playback", "Resume has a different successor revision")
-        if pending and pending.kind == "clear_next" and isinstance(pending.payload, ClearNext):
+        if pending and self.revoking and isinstance(pending.payload, SetMedia):
             if (
-                state.current_stream_id == pending.payload.current_stream_id
-                and state.next_revision == pending.payload.next_revision
+                pending.payload.current is not None
+                and state.current_stream_id == pending.payload.current.stream_id
+                and state.media_revision == pending.payload.media_revision
             ):
                 if self.next and all(
                     cursor.stream_id != self.next.descriptor.stream_id
@@ -991,22 +1010,14 @@ class MashinSession:
             or not self.adapter.valid(candidate.context)
         ):
             raise ProtocolViolation("stale_playback", "Cannot reconcile current playback identity")
-        if pending and pending.kind == "set_media":
+        if pending and pending.kind == "set_media" and not (promotion and was_revoking):
             if (
                 not isinstance(pending.payload, SetMedia)
-                or pending.payload.stream != candidate.descriptor
-                or promotion
+                or pending.payload.current != candidate.descriptor
             ):
                 raise ProtocolViolation("stale_playback", "Pending load identity changed")
-        if pending and pending.kind == "prepare_next":
-            if (
-                not isinstance(pending.payload, PrepareNext)
-                or self.next is None
-                or pending.payload.stream != self.next.descriptor
-            ):
-                raise ProtocolViolation("stale_playback", "Pending prepare identity changed")
         self._cursors(state.received_streams, promotion=promotion)
-        if pending and pending.kind in ("set_media", "prepare_next"):
+        if pending and pending.kind == "set_media":
             assert self.current is not None
             self.current.accepted = True
             if self.next:
@@ -1017,7 +1028,7 @@ class MashinSession:
                 TrackStarted(
                     1,
                     state.current_stream_id,
-                    state.next_revision,
+                    state.media_revision,
                     state.output_revision,
                     state.position_frame,
                 ),
@@ -1042,7 +1053,7 @@ class MashinSession:
             and state.position_frame == stream.final_frame_count
         ):
             self._ended(state.current_stream_id)
-        if pending and pending.kind == "clear_next" and (self.revoking or promotion):
+        if pending and was_revoking and (self.revoking or promotion):
             if not promotion and not retained_revocation:
                 raise ProtocolViolation("cache_unavailable", "Successor revocation is unresolved")
             self.reissue_revocation = retained_revocation
@@ -1084,20 +1095,20 @@ class MashinSession:
         if report.status == "accepted":
             if pending.kind == "set_media" and self.current:
                 self.current.accepted = True
+                if self.next is not None and not self.revoking:
+                    self.next.accepted = True
                 self.buffer.accept_load()
                 self.capacity_after_order = received_order or 0
                 if self.buffer.ready:
                     self._capacity_deadline()
-            elif pending.kind == "prepare_next" and self.next:
-                self.next.accepted = True
-            elif pending.kind == "clear_next":
+            if pending.kind == "set_media" and self.revoking:
                 run, self.next = self.next, None
                 self.revoking = False
                 if run is not None:
                     self.buffer.discard(run.descriptor.stream_id)
                     self.spawn(self._close_run(run, release=True))
-        elif pending.kind in ("set_media", "prepare_next"):
-            run = self.current if pending.kind == "set_media" else self.next
+        elif pending.kind == "set_media" and not self.revoking:
+            run = self.current
             if run is not None:
                 run.error = report.error or safe_error(
                     "command_failed", "Client rejected playback context"
@@ -1220,9 +1231,11 @@ class MashinSession:
         run = self.next
         if run is None or run.descriptor.stream_id != report.stream_id:
             raise ProtocolViolation("stale_playback", "Successor was not authorized")
-        expected_revision = self.next_revision - int(self.revoking)
+        expected_revision = self.media_revision - int(
+            self.revoking or self.activation_target is not None
+        )
         if (
-            report.next_revision != expected_revision
+            report.media_revision != expected_revision
             or not run.accepted
             or run.error
             or not self.adapter.valid(run.context)
@@ -1250,7 +1263,7 @@ class MashinSession:
             self.buffer.discard(self.current.descriptor.stream_id)
             self.spawn(self._close_run(self.current, release=activation is not None))
         self.current, self.next = run, None
-        self.next_revision = report.next_revision
+        self.media_revision = max(self.media_revision, report.media_revision)
         self.revoking = self.reissue_revocation = False
         run.position_frame, run.output_revision = report.position_frame, report.output_revision
         run.position_validated = True
