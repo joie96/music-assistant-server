@@ -1,28 +1,29 @@
-# Mashin player provider
+# Mashin Stream player provider
 
 Connects Mashin clients to Music Assistant (MA) through token-free LAN Control and Audio
 WebSockets. Each device has its own MA player and queue, with a stable identity across
 reconnects and server restarts. One provider instance serves multiple independent devices.
 
 This provider is under development and is not yet production-ready. The
-[V1 contract](doc/contract.md) defines the protocol and required acceptance tests.
+[V3 contract](doc/contract.md) defines the protocol and required acceptance tests.
 
 ## Requirements
 
 - A complete MA Linux runtime with Python 3.14+, FFmpeg 7+ and libopus.
-- A client implementing the Mashin V1 protocol.
+- A client implementing the Mashin Stream V3 protocol.
 - Trusted network access to MA's main webserver. Both `ws://` over HTTP and `wss://`
   over HTTPS are supported, without an MA token or user account.
 
 ## Setup
 
-1. Deploy this directory as `music_assistant/providers/mashin` in the MA installation
+1. Deploy this directory as `music_assistant/providers/mashin_stream` in the MA installation
    and restart MA for discovery. No core changes or external plugin installer are needed.
-2. Add a Mashin provider instance through MA's setup flow.
-3. Connect the client to `GET /mashin/v1/control` and `GET /mashin/v1/audio` on MA's main
-  webserver using WebSocket upgrades. Use `ws://<ma-host>:<port>/mashin/v1/control`
-  for HTTP, or `wss://<ma-host>:<port>/mashin/v1/control` for HTTPS, and the matching
-  `/mashin/v1/audio` route. No Authorization header is required.
+2. Add a Mashin Stream provider instance through MA's setup flow.
+3. Connect the client to `GET /mashin-stream/v3/control` and
+  `GET /mashin-stream/v3/audio` on MA's main webserver using WebSocket upgrades.
+  Use `ws://<ma-host>:<port>/mashin-stream/v3/control` for HTTP, or
+  `wss://<ma-host>:<port>/mashin-stream/v3/control` for HTTPS, and the matching
+  `/mashin-stream/v3/audio` route. No Authorization header is required.
 4. Send a Control `hello` with a stable `device_id`, client name and explicit
   `audio_profile`. Bind Audio using the one-time binding returned in `welcome`.
 
@@ -34,6 +35,13 @@ transport but does not add access control. Do not put Audio bindings in URLs.
 WSS requires TLS on the webserver or a reverse proxy that forwards WebSocket upgrades.
 No provider-specific proxy IP or forwarded-protocol configuration is needed. The provider
 does not create certificates or enable HTTPS on MA itself.
+
+The provider domain is `mashin_stream`; the client routes are
+`/mashin-stream/v3/control` and `/mashin-stream/v3/audio`. Server and clients must
+be updated together; the old routes are not registered as aliases.
+Existing installations of the unreleased `mashin`
+provider must remove it and configure Mashin Stream again. Provider configuration and
+device bindings are not migrated automatically.
 
 ### Provider settings
 
@@ -78,8 +86,8 @@ URLs and audio payloads are not logged.
 Run from the repository root in the MA development environment:
 
 ```text
-python -m pytest --noconftest -o addopts= tests/providers/mashin
-python -m ruff check music_assistant/providers/mashin tests/providers/mashin
+python -m pytest --noconftest -o addopts= tests/providers/mashin_stream
+python -m ruff check music_assistant/providers/mashin_stream tests/providers/mashin_stream
 ```
 
 Native provider and codec tests require the complete Linux MA/FFmpeg runtime; Windows

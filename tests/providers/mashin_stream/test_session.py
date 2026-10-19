@@ -13,7 +13,7 @@ import pytest
 from music_assistant_models.errors import MusicAssistantError
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
-from music_assistant.providers.mashin.models import (
+from music_assistant.providers.mashin_stream.models import (
     AudioHello,
     AudioProfileChanged,
     AudioProfileId,
@@ -32,14 +32,14 @@ from music_assistant.providers.mashin.models import (
     TrackStarted,
     TransportStatus,
 )
-from music_assistant.providers.mashin.recovery import RecoveryIncident
-from music_assistant.providers.mashin.session import MashinSession, safe_error
-from music_assistant.providers.mashin.wire import AudioChunk, ProtocolViolation
+from music_assistant.providers.mashin_stream.recovery import RecoveryIncident
+from music_assistant.providers.mashin_stream.session import MashinStreamSession, safe_error
+from music_assistant.providers.mashin_stream.wire import AudioChunk, ProtocolViolation
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
-    from music_assistant.providers.mashin.adapter import MAAdapter, PlaybackContext
+    from music_assistant.providers.mashin_stream.adapter import MAAdapter, PlaybackContext
 
 
 class TestSession(unittest.IsolatedAsyncioTestCase):
@@ -58,7 +58,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.publish = Mock()
         self.stop = AsyncMock()
         self.fallback = AsyncMock()
-        self.session = MashinSession(
+        self.session = MashinStreamSession(
             cast("MAAdapter", self.adapter),
             "device",
             AudioProfileId.FLAC,
@@ -198,7 +198,9 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                     self.session.binding_consumed = False
                     self.session.buffer.ready = True
                     self.messages.clear()
-                    with patch("music_assistant.providers.mashin.session.asyncio.sleep", sleep):
+                    with patch(
+                        "music_assistant.providers.mashin_stream.session.asyncio.sleep", sleep
+                    ):
                         task = self.spawn(self.session._deadline(5, kind))
                         setattr(self.session, f"{kind}_timer", task)
                         await entered.wait()
@@ -256,7 +258,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         run.owned_buffer = Mock()
         tasks_before = len(self.tasks)
         with patch(
-            "music_assistant.providers.mashin.session.time.monotonic", return_value=0
+            "music_assistant.providers.mashin_stream.session.time.monotonic", return_value=0
         ) as clock:
             await self.session.audio_lost()
             clock.return_value = 1000
@@ -329,7 +331,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                     patch.dict(
                         "sys.modules",
                         {
-                            "music_assistant.providers.mashin.adapter": SimpleNamespace(
+                            "music_assistant.providers.mashin_stream.adapter": SimpleNamespace(
                                 PCMSource=Mock(return_value=source)
                             )
                         },
@@ -361,7 +363,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
             patch.dict(
                 "sys.modules",
                 {
-                    "music_assistant.providers.mashin.adapter": SimpleNamespace(
+                    "music_assistant.providers.mashin_stream.adapter": SimpleNamespace(
                         PCMSource=Mock(return_value=source)
                     )
                 },
@@ -379,7 +381,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_pcm_repair_uses_pause_safe_seek_fallback(self) -> None:
         """Both failed PCM attempts lead to exactly one validated paused fallback."""
         try:
-            module = importlib.import_module("music_assistant.providers.mashin.adapter")
+            module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         except ModuleNotFoundError as err:
             if err.name is None or err.name.startswith("music_assistant"):
                 raise
@@ -417,7 +419,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
             patch.object(module, "PCMSource", return_value=source),
             patch.object(self.session, "_recovery_grant", AsyncMock(return_value=True)),
             patch(
-                "music_assistant.providers.mashin.session.match_pcm",
+                "music_assistant.providers.mashin_stream.session.match_pcm",
                 return_value=output.sample_rate_hz * 5 + 7,
             ),
         ):
@@ -625,7 +627,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         logger = self.adapter.player.logger
         logger.isEnabledFor.return_value = True
         with patch(
-            "music_assistant.providers.mashin.session.time.monotonic", return_value=10
+            "music_assistant.providers.mashin_stream.session.time.monotonic", return_value=10
         ) as clock:
             self.session._log_transport(sent_bytes=100, send_millis=20)
             self.session._log_transport(acknowledged=True)
@@ -653,7 +655,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         """DEBUG/INFO do not enable high-frequency diagnostics or retain old samples."""
         logger = self.adapter.player.logger
         logger.isEnabledFor.return_value = False
-        with patch("music_assistant.providers.mashin.session.time.monotonic") as clock:
+        with patch("music_assistant.providers.mashin_stream.session.time.monotonic") as clock:
             self.session._log_transport(sent_bytes=100, acknowledged=True, status=True)
             clock.assert_not_called()
         logger.isEnabledFor.assert_called_with(VERBOSE_LOG_LEVEL)
@@ -667,7 +669,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         logger = self.adapter.player.logger
         logger.isEnabledFor.return_value = False
         with patch(
-            "music_assistant.providers.mashin.session.time.monotonic", return_value=10
+            "music_assistant.providers.mashin_stream.session.time.monotonic", return_value=10
         ) as clock:
             self.session._log_transport(sent_bytes=100, send_millis=500)
             logger.warning.assert_called_once()
@@ -687,7 +689,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         """One client's activity cannot trigger or clear another client's summary window."""
         adapter = Mock()
         adapter.player.player_id = "mashin_other"
-        other = MashinSession(
+        other = MashinStreamSession(
             cast("MAAdapter", adapter),
             "other",
             AudioProfileId.FLAC,
@@ -700,7 +702,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         adapter.player.logger.isEnabledFor.return_value = True
         try:
             with patch(
-                "music_assistant.providers.mashin.session.time.monotonic", return_value=10
+                "music_assistant.providers.mashin_stream.session.time.monotonic", return_value=10
             ) as clock:
                 self.session._log_transport(sent_bytes=100)
                 clock.return_value = 12
@@ -952,7 +954,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         """Replacing one client's epoch cannot alter another client's Audio grant."""
         adapter = Mock()
         adapter.release = AsyncMock()
-        other = MashinSession(
+        other = MashinStreamSession(
             adapter,
             "phone",
             AudioProfileId.FLAC,
@@ -992,7 +994,7 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         """The same command ID on two devices represents independent pending commands."""
         adapter = Mock()
         adapter.release = AsyncMock()
-        other = MashinSession(
+        other = MashinStreamSession(
             adapter,
             "phone",
             AudioProfileId.FLAC,

@@ -1,12 +1,12 @@
-# Implementierungsvertrag: Mashin PlayerProvider und Clients V3
+# Implementierungsvertrag: Mashin Stream PlayerProvider und Clients V3
 
 Control-Wireversion 3 verwendet einen vollstaendigen, revisionierten A/B-Sollzustand.
 Provider, Rust-/Flutter-Client und Python-CLI sprechen dieselbe Wireversion.
-Die Endpunkte sind `/mashin/v1/control` und `/mashin/v1/audio`.
+Die Endpunkte sind `/mashin-stream/v3/control` und `/mashin-stream/v3/audio`.
 
 Datum: 2026-10-17
 Status: Verbindlicher Provider-/Clientvertrag.
-Domain: `mashin`. Protokollversion: `3`. Provider-Version: eigenstaendige SemVer.
+Domain: `mashin_stream`. Protokollversion: `3`. Provider-Version: eigenstaendige SemVer.
 MA-Referenz: Music Assistant Server `1611ea10b`, Branch `dev`.
 
 Dieses Dokument ist eigenstaendig an ein Provider-/Client-Zielrepository
@@ -65,7 +65,7 @@ oder Transport geschuetzter Musikservice-URLs zum Client.
 | --- | --- |
 | Queue, Quellenrechte, Quellenabruf, Enqueue und Quellen-Seek | MA |
 | Dekodierung der Quelle, Normalisierung, DSP und Ausgabeplan | MA |
-| Auswahl und sequenzielle Push-Lieferung des freigegebenen A/B, Chunkencoder und Lieferpuffer | Mashin Provider |
+| Auswahl und sequenzielle Push-Lieferung des freigegebenen A/B, Chunkencoder und Lieferpuffer | Mashin Stream Provider |
 | Empfangsannahme/-ablehnung, freie buffer_capacity und begrenzter Chunkcache | Rust-Client |
 | Lokale UI-Aktionen fuer Play/Pause/Stop und Lautstaerke/Mute | Rust-Client, unmittelbar angewendet und als Istzustand an Provider gemeldet |
 | Lokaler Sekunden-Seek, Decoder und Audioausgabe | Rust-Client |
@@ -97,7 +97,7 @@ flowchart LR
 		UI[Mashin App] -->|MA API fuer Queueaktionen und Quellen-Seek| MA[MA Queue und Player]
 		UI -->|Lokales Play/Pause/Stop und Lautstaerke/Mute| Client[Rust Client]
 		MA -->|Queue Event Hub| UI
-		Provider[Mashin Provider] <-->|Commands und Istzustandsreports ueber Control| Client
+		Provider[Mashin Stream Provider] <-->|Commands und Istzustandsreports ueber Control| Client
 		MA <-->|Playeradapter und Reports| Provider
 		Source[MA Quelle] --> DSP[MA DSP und Resampling]
 		DSP --> Encoder[Unabhaengige Codecchunks]
@@ -117,8 +117,8 @@ Quellen, nicht Client-Seeks, Replay oder der Wiederherstellung geloeschter Chunk
 
 ## 3. MA-Integration und Providerstruktur
 
-Manifest: type=player, domain=mashin, multi_instance=false, builtin=false.
-Basisklassen PlayerProvider/Player. Zielpfad music_assistant/providers/mashin.
+Manifest: type=player, domain=mashin_stream, multi_instance=false, builtin=false.
+Basisklassen PlayerProvider/Player. Zielpfad music_assistant/providers/mashin_stream.
 Player-ID aus autorisierter Devicebindung ableiten, nie durch Reconnect ersetzen.
 Device-ID und Anzeigename sind keine Credentials.
 
@@ -716,7 +716,7 @@ Kein MA-JSON-RPC auf den Mashin-WebSockets. Alle Attribute Englisch/snake_case.
 
 ## 6. LAN-Verbindung und Handshake
 
-Control: WebSocket GET /mashin/v1/control, Audio: GET /mashin/v1/audio am
+Control: WebSocket GET /mashin-stream/v3/control, Audio: GET /mashin-stream/v3/audio am
 MA-Hauptwebserver. Dieselben beiden Routes bedienen alle Clients einer
 Providerinstanz. Je Device genau eine Verbindung je Kanal, eine aktive
 Audiolieferung und ein aktiver Mashin-Quellen-/Encoderproduzent. A/B je Player

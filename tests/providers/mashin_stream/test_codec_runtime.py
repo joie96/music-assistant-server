@@ -8,9 +8,9 @@ import unittest
 
 import numpy as np
 
-from music_assistant.providers.mashin.codec import ChunkEncoder
-from music_assistant.providers.mashin.models import AudioProfileId, OutputFormat
-from music_assistant.providers.mashin.wire import MAX_PAYLOAD_BYTES
+from music_assistant.providers.mashin_stream.codec import ChunkEncoder
+from music_assistant.providers.mashin_stream.models import AudioProfileId, OutputFormat
+from music_assistant.providers.mashin_stream.wire import MAX_PAYLOAD_BYTES
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "Requires the pinned Linux MA/FFmpeg runtime")

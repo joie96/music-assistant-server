@@ -6,8 +6,12 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from music_assistant.providers.mashin.recovery import RecoveryIncident, RecoveryRateLimit, match_pcm
-from music_assistant.providers.mashin.wire import ProtocolViolation
+from music_assistant.providers.mashin_stream.recovery import (
+    RecoveryIncident,
+    RecoveryRateLimit,
+    match_pcm,
+)
+from music_assistant.providers.mashin_stream.wire import ProtocolViolation
 
 
 class TestPCMMatcher(unittest.TestCase):
@@ -104,24 +108,36 @@ class TestPCMMatcher(unittest.TestCase):
     def test_active_budget_excludes_real_waits_without_reset(self) -> None:
         """Consumed active seconds survive long waits and the fallback boundary."""
         incident = RecoveryIncident()
-        with patch("music_assistant.providers.mashin.recovery.time.monotonic", return_value=100):
+        with patch(
+            "music_assistant.providers.mashin_stream.recovery.time.monotonic", return_value=100
+        ):
             incident.start()
-        with patch("music_assistant.providers.mashin.recovery.time.monotonic", return_value=110):
+        with patch(
+            "music_assistant.providers.mashin_stream.recovery.time.monotonic", return_value=110
+        ):
             incident.wait()
-        with patch("music_assistant.providers.mashin.recovery.time.monotonic", return_value=1000):
+        with patch(
+            "music_assistant.providers.mashin_stream.recovery.time.monotonic", return_value=1000
+        ):
             assert incident.remaining == 20
             incident.start()
-        with patch("music_assistant.providers.mashin.recovery.time.monotonic", return_value=1005):
+        with patch(
+            "music_assistant.providers.mashin_stream.recovery.time.monotonic", return_value=1005
+        ):
             assert incident.remaining == 15
 
     def test_rolling_rate_limit_survives_incident_replacement(self) -> None:
         """Exactly six opening claims fit the same rolling minute."""
         limiter = RecoveryRateLimit()
-        with patch("music_assistant.providers.mashin.recovery.time.monotonic", return_value=100):
+        with patch(
+            "music_assistant.providers.mashin_stream.recovery.time.monotonic", return_value=100
+        ):
             for _ in range(6):
                 limiter.claim()
             with pytest.raises(ProtocolViolation):
                 limiter.claim()
-        with patch("music_assistant.providers.mashin.recovery.time.monotonic", return_value=160):
+        with patch(
+            "music_assistant.providers.mashin_stream.recovery.time.monotonic", return_value=160
+        ):
             limiter.claim()
         assert len(limiter.openings) == 1

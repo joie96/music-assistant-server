@@ -1,1 +1,0 @@
-"""Mashin provider contract tests."""

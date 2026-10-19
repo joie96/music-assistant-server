@@ -5,8 +5,12 @@ from uuid import uuid4
 
 import pytest
 
-from music_assistant.providers.mashin.buffer import DeliveryBuffer
-from music_assistant.providers.mashin.wire import MAX_PAYLOAD_BYTES, AudioChunk, ProtocolViolation
+from music_assistant.providers.mashin_stream.buffer import DeliveryBuffer
+from music_assistant.providers.mashin_stream.wire import (
+    MAX_PAYLOAD_BYTES,
+    AudioChunk,
+    ProtocolViolation,
+)
 
 
 class TestDeliveryBuffer(unittest.TestCase):

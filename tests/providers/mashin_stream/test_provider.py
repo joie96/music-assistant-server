@@ -30,8 +30,8 @@ from music_assistant_models.errors import AudioError, PlayerCommandFailed
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.provider import ProviderManifest
 
-from music_assistant.providers.mashin.devices import DeviceBinding, DeviceRegistry
-from music_assistant.providers.mashin.models import (
+from music_assistant.providers.mashin_stream.devices import DeviceBinding, DeviceRegistry
+from music_assistant.providers.mashin_stream.models import (
     AudioHello,
     AudioProfileId,
     ClientCapabilities,
@@ -41,7 +41,7 @@ from music_assistant.providers.mashin.models import (
     encode_message,
     parse_model,
 )
-from music_assistant.providers.mashin.wire import ProtocolViolation
+from music_assistant.providers.mashin_stream.wire import ProtocolViolation
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -49,9 +49,12 @@ if TYPE_CHECKING:
     from music_assistant_models.player import PlayerMedia
     from music_assistant_models.queue_item import QueueItem
 
-    from music_assistant.providers.mashin.adapter import MAAdapter, PlaybackContext
-    from music_assistant.providers.mashin.provider import MashinDevice, MashinProvider
-    from music_assistant.providers.mashin.session import SendControl
+    from music_assistant.providers.mashin_stream.adapter import MAAdapter, PlaybackContext
+    from music_assistant.providers.mashin_stream.provider import (
+        MashinStreamDevice,
+        MashinStreamProvider,
+    )
+    from music_assistant.providers.mashin_stream.session import SendControl
 
 
 class TestProvider(unittest.IsolatedAsyncioTestCase):
@@ -62,7 +65,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         if sys.platform == "win32":
             self.skipTest("Complete MA runtime requires POSIX signals (SIGKILL)")
         try:
-            module = importlib.import_module("music_assistant.providers.mashin.provider")
+            module = importlib.import_module("music_assistant.providers.mashin_stream.provider")
         except ModuleNotFoundError as err:
             if err.name is None or err.name.startswith("music_assistant"):
                 raise
@@ -82,11 +85,11 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             PlayerConfig({}, provider, player_id)
         )
         self.provider = cast(
-            "MashinProvider",
-            module.MashinProvider(
+            "MashinStreamProvider",
+            module.MashinStreamProvider(
                 self.mass,
-                ProviderManifest(ProviderType.PLAYER, "mashin", "Mashin", "Test", []),
-                ProviderConfig({}, ProviderType.PLAYER, "mashin", "mashin_instance"),
+                ProviderManifest(ProviderType.PLAYER, "mashin_stream", "Mashin Stream", "Test", []),
+                ProviderConfig({}, ProviderType.PLAYER, "mashin_stream", "mashin_stream_instance"),
             ),
         )
         self.provider.server_revision = "test"
@@ -109,7 +112,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         self.provider.sockets.add(socket)
         with pytest.raises(web.HTTPTooManyRequests):
             await self.provider._route(
-                make_mocked_request("GET", "/mashin/v1/control"), audio=False
+                make_mocked_request("GET", "/mashin-stream/v3/control"), audio=False
             )
         assert len(self.provider.sockets) == 1
 
@@ -121,7 +124,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 self.mass.build_info = build
                 with (
                     patch(
-                        "music_assistant.providers.mashin.provider.check_ffmpeg_version",
+                        "music_assistant.providers.mashin_stream.provider.check_ffmpeg_version",
                         AsyncMock(),
                     ),
                     patch.object(self.provider, "get_setup_value", return_value=None),
@@ -130,7 +133,9 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 assert self.provider.server_revision == expected
         del self.mass.build_info
         with (
-            patch("music_assistant.providers.mashin.provider.check_ffmpeg_version", AsyncMock()),
+            patch(
+                "music_assistant.providers.mashin_stream.provider.check_ffmpeg_version", AsyncMock()
+            ),
             patch.object(self.provider, "get_setup_value", return_value=None),
         ):
             await self.provider.handle_async_init()
@@ -181,12 +186,12 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
     async def test_token_free_websocket_control_and_audio_handshake(self) -> None:
         """Real WS upgrades bind Audio to Control without an Authorization header."""
         app = web.Application()
-        app.router.add_get("/mashin/v1/control", self.provider._control_route)
-        app.router.add_get("/mashin/v1/audio", self.provider._audio_route)
+        app.router.add_get("/mashin-stream/v3/control", self.provider._control_route)
+        app.router.add_get("/mashin-stream/v3/audio", self.provider._audio_route)
         capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
         async with (
             TestClient(TestServer(app)) as client,
-            client.ws_connect("/mashin/v1/control") as control,
+            client.ws_connect("/mashin-stream/v3/control") as control,
         ):
             await control.send_json(
                 {
@@ -209,7 +214,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
             response = await asyncio.wait_for(control.receive_json(), 1)
             assert response["type"] == "welcome"
             welcome = parse_model(Welcome, response["payload"])
-            async with client.ws_connect("/mashin/v1/audio") as audio:
+            async with client.ws_connect("/mashin-stream/v3/audio") as audio:
                 await audio.send_str(
                     encode_message(
                         "audio_hello",
@@ -226,7 +231,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         """A rejected resume reaches the new socket without an old Control sender."""
         device = await self._device("desktop")
         app = web.Application()
-        app.router.add_get("/mashin/v1/control", self.provider._control_route)
+        app.router.add_get("/mashin-stream/v3/control", self.provider._control_route)
         capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
         with patch.object(
             device.session,
@@ -235,7 +240,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         ):
             async with (
                 TestClient(TestServer(app)) as client,
-                client.ws_connect("/mashin/v1/control") as control,
+                client.ws_connect("/mashin-stream/v3/control") as control,
             ):
                 await control.send_json(
                     {
@@ -278,11 +283,11 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
         self.mass.player_queues.stop.side_effect = stop
         app = web.Application()
-        app.router.add_get("/mashin/v1/control", self.provider._control_route)
+        app.router.add_get("/mashin-stream/v3/control", self.provider._control_route)
         with patch.object(device.session, "connect", side_effect=reconcile):
             async with (
                 TestClient(TestServer(app)) as client,
-                client.ws_connect("/mashin/v1/control") as control,
+                client.ws_connect("/mashin-stream/v3/control") as control,
             ):
                 await control.send_json(
                     {
@@ -322,7 +327,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         """LAN recovery can seek its player while retaining the requested pause."""
         device = await self._device("desktop")
         device.control_socket = AsyncMock()
-        device.control_request = make_mocked_request("GET", "/mashin/v1/control")
+        device.control_request = make_mocked_request("GET", "/mashin-stream/v3/control")
         self.mass.player_queues.seek = AsyncMock()
         self.mass.player_queues.pause = AsyncMock()
         await device._fallback(42, True)
@@ -442,7 +447,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
         socket.close.side_effect = close
         with patch(
-            "music_assistant.providers.mashin.provider.asyncio.timeout", lambda _: timeout(0)
+            "music_assistant.providers.mashin_stream.provider.asyncio.timeout", lambda _: timeout(0)
         ):
             device._retire_socket(socket, request)
             device._retire_socket(socket, request)
@@ -472,7 +477,10 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 if isinstance(error, ConnectionError):
                     old.ping.side_effect = fail
                 with (
-                    patch("music_assistant.providers.mashin.provider.asyncio.sleep", AsyncMock()),
+                    patch(
+                        "music_assistant.providers.mashin_stream.provider.asyncio.sleep",
+                        AsyncMock(),
+                    ),
                     patch.object(device, "_check_connection", AsyncMock(side_effect=fail)),
                     patch.object(device, "_disable", AsyncMock()) as disable,
                     patch.object(device.session, "control_lost", AsyncMock()) as lost,
@@ -572,7 +580,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(device.session, "shutdown", shutdown),
-            patch("music_assistant.providers.mashin.provider.asyncio.wait", deadline),
+            patch("music_assistant.providers.mashin_stream.provider.asyncio.wait", deadline),
         ):
             try:
                 await device.unload()
@@ -588,7 +596,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
     async def test_capture_verbose_identifies_rejected_queue_context(self) -> None:
         """Rejected contexts log discriminating fields without exposing source URLs."""
-        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         player = Mock(player_id="mashin_test")
         player.state.group_members = []
         player.logger = logging.getLogger("mashin.test.capture")
@@ -723,7 +731,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
     async def test_pcm_source_uses_provider_pacing_without_repair_burst(self) -> None:
         """FFmpeg uses the Mashin budget and never grants a new repair burst."""
-        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         adapter = Mock()
         adapter.valid.return_value = True
         pcm = AudioFormat(content_type=ContentType.PCM_F32LE, sample_rate=48000, channels=2)
@@ -768,7 +776,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
     async def test_repair_keeps_ma_processing_without_dsp_precheck(self) -> None:
         """DSP, normalization, fade and conversion cannot preempt the PCM match."""
-        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         adapter = Mock()
         adapter.valid.return_value = True
         context = cast(
@@ -836,7 +844,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 audio.get_audio_buffer.assert_awaited_once_with(
                     context.item,
                     seek_position_ms=5000,
-                    reason="mashin_recovery",
+                    reason="mashin_stream_recovery",
                     allow_provider_match=False,
                 )
                 assert "volume=2dB" not in str(adapter.player.logger.mock_calls)
@@ -879,7 +887,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
     async def test_ma_buffer_release_is_source_loss_not_eof(self) -> None:
         """MA cleanup before or during a read cannot masquerade as normal EOF."""
-        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         source = module.PCMSource(Mock(), Mock(), Mock())
         process = Mock()
         process.read = AsyncMock(return_value=bytes(8))
@@ -902,7 +910,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
 
     async def test_completed_ma_buffer_remains_readable_and_ends_normally(self) -> None:
         """A closed upstream producer does not invalidate its healthy buffered PCM."""
-        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         source = module.PCMSource(Mock(), Mock(), Mock())
         source.owned_buffer = Mock(cancelled=False, is_buffering=False, eof=True)
         process = Mock(returncode=0, stdin_feeder_exception=None)
@@ -916,7 +924,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
     def _next_context(
         self, *, details_present: bool = False
     ) -> tuple[MAAdapter, PlayerMedia, PlaybackContext]:
-        module = importlib.import_module("music_assistant.providers.mashin.adapter")
+        module = importlib.import_module("music_assistant.providers.mashin_stream.adapter")
         player = Mock(player_id="mashin_test")
         player.state.group_members = []
         adapter = module.MAAdapter(self.mass, player)
@@ -965,7 +973,7 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(module, "overlay_active", return_value=False))
         return cast("MAAdapter", adapter), cast("PlayerMedia", media), current
 
-    async def _device(self, device_id: str) -> MashinDevice:
+    async def _device(self, device_id: str) -> MashinStreamDevice:
         device = await self.provider.registry.register(device_id, device_id)
         update = patch.object(device.player, "update_state", Mock())
         update.start()

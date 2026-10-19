@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from music_assistant.providers.mashin.devices import DeviceRegistry
-from music_assistant.providers.mashin.wire import ProtocolViolation
+from music_assistant.providers.mashin_stream.devices import DeviceRegistry
+from music_assistant.providers.mashin_stream.wire import ProtocolViolation
 
 
 class TestDevices(unittest.IsolatedAsyncioTestCase):

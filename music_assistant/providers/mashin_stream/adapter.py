@@ -295,7 +295,7 @@ class PCMSource:
         prepared = await audio.get_audio_buffer(
             context.item,
             seek_position_ms=seek * 1000,
-            reason="mashin_recovery" if repair else "streaming",
+            reason="mashin_stream_recovery" if repair else "streaming",
             allow_provider_match=not repair,
         )
         self.owned_buffer = prepared

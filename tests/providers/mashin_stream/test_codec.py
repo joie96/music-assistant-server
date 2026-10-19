@@ -9,15 +9,15 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from mutagen.ogg import OggPage
 
-from music_assistant.providers.mashin.codec import (
+from music_assistant.providers.mashin_stream.codec import (
     ChunkEncoder,
     PCMChunkReader,
     PCMPacing,
     remux_opus,
     strip_flac_metadata,
 )
-from music_assistant.providers.mashin.models import AudioProfileId, OutputFormat
-from music_assistant.providers.mashin.wire import MAX_PAYLOAD_BYTES, ProtocolViolation
+from music_assistant.providers.mashin_stream.models import AudioProfileId, OutputFormat
+from music_assistant.providers.mashin_stream.wire import MAX_PAYLOAD_BYTES, ProtocolViolation
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -45,7 +45,9 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                     ]
                 ),
             ) as encode,
-            patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
+            patch(
+                "music_assistant.providers.mashin_stream.codec.asyncio.sleep", AsyncMock()
+            ) as sleep,
         ):
             assert await encoder.encode(pcm) == b"valid"
         assert encode.await_count == 3
@@ -62,7 +64,9 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 encoder, "_encode_once", AsyncMock(side_effect=OSError("private-token"))
             ) as encode,
-            patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
+            patch(
+                "music_assistant.providers.mashin_stream.codec.asyncio.sleep", AsyncMock()
+            ) as sleep,
             pytest.raises(ProtocolViolation, match="after 3 attempts: OSError") as failure,
         ):
             await encoder.encode(bytes(8))
@@ -116,11 +120,11 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                         "sys.modules", {"music_assistant.helpers.ffmpeg": Mock(FFMpeg=ffmpeg)}
                     ),
                     patch(
-                        "music_assistant.providers.mashin.codec.get_global_cache_value",
+                        "music_assistant.providers.mashin_stream.codec.get_global_cache_value",
                         return_value="7.1.2",
                     ),
                     self.assertLogs(
-                        "music_assistant.providers.mashin.codec", level="WARNING"
+                        "music_assistant.providers.mashin_stream.codec", level="WARNING"
                     ) as logs,
                     pytest.raises(ProtocolViolation) as failure,
                 ):
@@ -189,7 +193,7 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
                         {"music_assistant.helpers.ffmpeg": Mock(FFMpeg=Mock(return_value=process))},
                     ),
                     self.assertLogs(
-                        "music_assistant.providers.mashin.codec", level="WARNING"
+                        "music_assistant.providers.mashin_stream.codec", level="WARNING"
                     ) as logs,
                     pytest.raises((ProtocolViolation, OSError, TimeoutError)),
                 ):
@@ -224,7 +228,9 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
             + bytes(bound + 1 - 42)
         )
         with (
-            self.assertLogs("music_assistant.providers.mashin.codec", level="WARNING") as logs,
+            self.assertLogs(
+                "music_assistant.providers.mashin_stream.codec", level="WARNING"
+            ) as logs,
             pytest.raises(ProtocolViolation, match="FLAC exceeds chunk payload limit") as failure,
         ):
             strip_flac_metadata(data, 48000, 2)
@@ -241,7 +247,9 @@ class TestChunkEncoder(unittest.IsolatedAsyncioTestCase):
         """Best-effort diagnostics preserve the encoder error even for malformed metadata."""
         data = b"fLaC\x80\x00\x00\x22" + bytes(34 + MAX_PAYLOAD_BYTES)
         with (
-            self.assertLogs("music_assistant.providers.mashin.codec", level="WARNING") as logs,
+            self.assertLogs(
+                "music_assistant.providers.mashin_stream.codec", level="WARNING"
+            ) as logs,
             pytest.raises(ProtocolViolation, match="FLAC exceeds chunk payload limit"),
         ):
             strip_flac_metadata(data, 48000, 2)
@@ -266,8 +274,10 @@ class TestPCMPacing(unittest.IsolatedAsyncioTestCase):
         assert pacing.rate == 1.2
         assert pacing.burst == 120
         with (
-            patch("music_assistant.providers.mashin.codec.time.monotonic", return_value=10),
-            patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
+            patch("music_assistant.providers.mashin_stream.codec.time.monotonic", return_value=10),
+            patch(
+                "music_assistant.providers.mashin_stream.codec.asyncio.sleep", AsyncMock()
+            ) as sleep,
         ):
             pacing.configure(False)
             await pacing.wait(120)
@@ -287,8 +297,10 @@ class TestPCMPacing(unittest.IsolatedAsyncioTestCase):
         pacing = PCMPacing()
         pacing.configure(True)
         with (
-            patch("music_assistant.providers.mashin.codec.time.monotonic", return_value=10),
-            patch("music_assistant.providers.mashin.codec.asyncio.sleep", AsyncMock()) as sleep,
+            patch("music_assistant.providers.mashin_stream.codec.time.monotonic", return_value=10),
+            patch(
+                "music_assistant.providers.mashin_stream.codec.asyncio.sleep", AsyncMock()
+            ) as sleep,
         ):
             await pacing.wait(3)
             pacing.commit(3)

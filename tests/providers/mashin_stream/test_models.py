@@ -3,12 +3,14 @@
 import json
 import unittest
 from dataclasses import asdict, fields
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from music_assistant.providers.mashin.config import entries
-from music_assistant.providers.mashin.models import (
+from music_assistant.providers import mashin_stream
+from music_assistant.providers.mashin_stream.config import entries
+from music_assistant.providers.mashin_stream.models import (
     AudioProfileChanged,
     AudioProfileId,
     BufferStatus,
@@ -23,11 +25,25 @@ from music_assistant.providers.mashin.models import (
     decode_message,
     parse_model,
 )
-from music_assistant.providers.mashin.wire import ProtocolViolation
+from music_assistant.providers.mashin_stream.wire import ProtocolViolation
 
 
 class TestModels(unittest.TestCase):
-    """Reject loose JSON and incomplete V1 handshakes."""
+    """Reject loose JSON and incomplete V3 handshakes."""
+
+    def test_provider_identity_matches_package(self) -> None:
+        """The provider is discovered under its streaming-specific domain and name."""
+        assert mashin_stream.__file__ is not None
+        provider_path = Path(mashin_stream.__file__).parent
+        manifest = json.loads((provider_path / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["domain"] == provider_path.name == "mashin_stream"
+        assert manifest["name"] == "Mashin Stream"
+        assert manifest["type"] == "player"
+
+    def test_streaming_paths_match_v3_namespace(self) -> None:
+        """The registered control and audio routes use the V3 streaming namespace."""
+        assert mashin_stream.CONTROL_WEBSOCKET_PATH == "/mashin-stream/v3/control"
+        assert mashin_stream.AUDIO_WEBSOCKET_PATH == "/mashin-stream/v3/audio"
 
     def test_complete_media_state_requires_revision_and_valid_empty_slots(self) -> None:
         """V3 accepts a complete empty state and rejects partial or contradictory states."""

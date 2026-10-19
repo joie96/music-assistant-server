@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from music_assistant.providers.mashin.wire import (
+from music_assistant.providers.mashin_stream.wire import (
     CHUNK_HEADER,
     MAX_INTEGER,
     MAX_PAYLOAD_BYTES,

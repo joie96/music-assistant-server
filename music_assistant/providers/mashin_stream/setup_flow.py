@@ -1,4 +1,4 @@
-"""Configure the shared Mashin provider independently of connected devices."""
+"""Configure the shared Mashin Stream provider independently of connected devices."""
 
 from __future__ import annotations
 

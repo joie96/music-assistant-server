@@ -19,6 +19,7 @@ from music_assistant_models.errors import SetupFailedError
 from music_assistant.helpers.ffmpeg import check_ffmpeg_version
 from music_assistant.models.player_provider import PlayerProvider
 
+from . import AUDIO_WEBSOCKET_PATH, CONTROL_WEBSOCKET_PATH
 from .adapter import MAAdapter
 from .config import entries
 from .devices import DeviceBinding, DeviceRegistry
@@ -34,8 +35,8 @@ from .models import (
     encode_message,
     parse_model,
 )
-from .player import MashinPlayer
-from .session import MashinSession, safe_error
+from .player import MashinStreamPlayer
+from .session import MashinStreamSession, safe_error
 from .wire import ProtocolViolation
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
 
 
-class MashinProvider(PlayerProvider):
+class MashinStreamProvider(PlayerProvider):
     """Serve independent LAN devices through one pair of shared routes."""
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
@@ -67,7 +68,7 @@ class MashinProvider(PlayerProvider):
         if stored is not None and not isinstance(stored, str):
             raise SetupFailedError("Invalid stored Mashin device bindings")
         try:
-            self.registry = DeviceRegistry[MashinDevice](
+            self.registry = DeviceRegistry[MashinStreamDevice](
                 stored,
                 self._save_bindings,
                 self._create_device,
@@ -84,10 +85,10 @@ class MashinProvider(PlayerProvider):
         self.removers.extend(
             [
                 self.mass.webserver.register_dynamic_route(
-                    "/mashin/v1/control", self._control_route, "GET"
+                    CONTROL_WEBSOCKET_PATH, self._control_route, "GET"
                 ),
                 self.mass.webserver.register_dynamic_route(
-                    "/mashin/v1/audio", self._audio_route, "GET"
+                    AUDIO_WEBSOCKET_PATH, self._audio_route, "GET"
                 ),
             ]
         )
@@ -102,7 +103,9 @@ class MashinProvider(PlayerProvider):
         if not hasattr(self, "registry"):
             return
         self.registry.closed = True
-        self.logger.debug("Unloading Mashin provider with %s devices", len(self.registry.devices))
+        self.logger.debug(
+            "Unloading Mashin Stream provider with %s devices", len(self.registry.devices)
+        )
         tasks = [
             self.mass.create_task(device.unload())
             for device in list(self.registry.devices.values())
@@ -127,10 +130,10 @@ class MashinProvider(PlayerProvider):
     def _save_bindings(self, stored: str) -> None:
         self._update_setup_data("device_bindings", stored, immediate=True)
 
-    async def _create_device(self, binding: DeviceBinding) -> MashinDevice:
+    async def _create_device(self, binding: DeviceBinding) -> MashinStreamDevice:
         if not self.mass.config.get_raw_player_config_value(binding.player_id, "enabled", True):
             raise ProtocolViolation("forbidden", "Mashin player is disabled")
-        device = MashinDevice(self, binding)
+        device = MashinStreamDevice(self, binding)
         registered = False
         try:
             await device.register()
@@ -153,7 +156,7 @@ class MashinProvider(PlayerProvider):
         if len(self.sockets) >= self.max_sockets:
             raise web.HTTPTooManyRequests(reason="Mashin connection admission limit reached")
         socket = web.WebSocketResponse(autoping=False, compress=False, max_msg_size=65536)
-        device: MashinDevice | None = None
+        device: MashinStreamDevice | None = None
         self.sockets.add(socket)
         try:
             await socket.prepare(request)
@@ -206,10 +209,10 @@ class MashinProvider(PlayerProvider):
             await socket.close()
 
 
-class MashinDevice:
+class MashinStreamDevice:
     """Own one client's player, session, sockets, locks and cancellable workers."""
 
-    def __init__(self, provider: MashinProvider, binding: DeviceBinding) -> None:
+    def __init__(self, provider: MashinStreamProvider, binding: DeviceBinding) -> None:
         """Initialize an independent runtime without restoring playback or sockets."""
         self.provider = provider
         self.mass = provider.mass
@@ -224,8 +227,8 @@ class MashinDevice:
         self.retired_sockets: dict[web.WebSocketResponse, asyncio.Task[None]] = {}
         self.handshake_lock = asyncio.Lock()
         self.cleanup_task: asyncio.Task[None] | None = None
-        self.player = MashinPlayer(provider, self, binding.player_id, binding.name)
-        self.session = MashinSession(
+        self.player = MashinStreamPlayer(provider, self, binding.player_id, binding.name)
+        self.session = MashinStreamSession(
             MAAdapter(self.mass, self.player),
             self.device_id,
             AudioProfileId.FLAC,

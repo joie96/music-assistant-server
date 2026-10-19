@@ -106,7 +106,8 @@ class DeviceRegistry[DeviceT]:
             or not isinstance(data["devices"], list)
         ):
             raise ProtocolViolation(
-                "incompatible_server", "Recreate the Mashin provider for LAN device registration"
+                "incompatible_server",
+                "Recreate the Mashin Stream provider for LAN device registration",
             )
         for value in data["devices"]:
             if not isinstance(value, dict) or set(value) != {"device_id", "name"}:

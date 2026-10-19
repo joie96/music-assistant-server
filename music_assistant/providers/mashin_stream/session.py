@@ -113,7 +113,7 @@ class TransportLogWindow:
     slow_sends: int = 0
 
 
-class MashinSession:
+class MashinStreamSession:
     """Coordinate one bound player's commands, receipt and actual output reports."""
 
     def __init__(  # noqa: PLR0915

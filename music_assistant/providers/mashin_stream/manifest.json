@@ -1,8 +1,8 @@
 {
   "type": "player",
-  "domain": "mashin",
-  "name": "Mashin",
-  "description": "Token-free LAN playback for multiple independent Mashin clients.",
+  "domain": "mashin_stream",
+  "name": "Mashin Stream",
+  "description": "Chunk-based streaming playback for multiple independent Mashin clients.",
   "codeowners": ["@ericb"],
   "requirements": ["scipy==1.18.1"],
   "multi_instance": false,

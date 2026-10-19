@@ -19,18 +19,18 @@ if TYPE_CHECKING:
 
     from .adapter import PlaybackContext
     from .models import PlayerState
-    from .provider import MashinDevice, MashinProvider
+    from .provider import MashinStreamDevice, MashinStreamProvider
 
 
-class MashinPlayer(Player):
+class MashinStreamPlayer(Player):
     """One stable player belonging to its registered device, never to a socket."""
 
     def __init__(
-        self, provider: MashinProvider, device: MashinDevice, player_id: str, name: str
+        self, provider: MashinStreamProvider, device: MashinStreamDevice, player_id: str, name: str
     ) -> None:
         """Initialize a non-groupable, event-driven player."""
         super().__init__(provider, player_id)
-        self.mashin = device
+        self.device = device
         self._attr_name = name
         self._attr_device_info = DeviceInfo(
             model="Mashin client",
@@ -65,14 +65,14 @@ class MashinPlayer(Player):
     async def play_media(self, media: PlayerMedia) -> None:
         """Load authorized MA queue media with its captured source seek origin."""
         try:
-            context = self.mashin.session.adapter.capture(media)
-            await self.mashin.session.load(context)
+            context = self.device.session.adapter.capture(media)
+            await self.device.session.load(context)
         except ProtocolViolation as err:
             raise PlayerCommandFailed(str(err)) from err
 
     async def enqueue_next_media(self, media: PlayerMedia) -> None:
         """Register the actual MA successor without opening its source."""
-        session = self.mashin.session
+        session = self.device.session
         self.logger.log(
             VERBOSE_LOG_LEVEL,
             "Next-track requested player=%s queue=%s item=%s current_item=%s next_item=%s",
@@ -128,7 +128,7 @@ class MashinPlayer(Player):
 
     async def stop(self) -> None:
         """Invalidate playback and finish the regular MA stop path."""
-        session = self.mashin.session
+        session = self.device.session
         session.generation = integer(session.generation + 1, 1)
         generation = session.generation
         session.buffer.load_accepted = False
@@ -176,8 +176,8 @@ class MashinPlayer(Player):
             self._attr_current_media = context.media
             self._attr_active_source = context.queue_id
             rate = (
-                self.mashin.session.current.descriptor.output_format.sample_rate_hz
-                if self.mashin.session.current
+                self.device.session.current.descriptor.output_format.sample_rate_hz
+                if self.device.session.current
                 else 48000
             )
             self._attr_elapsed_time = state.position_frame / rate
@@ -195,6 +195,6 @@ class MashinPlayer(Player):
 
     async def _control(self, kind: str, value: int | bool | None = None) -> None:
         try:
-            await self.mashin.session.control(kind, value)
+            await self.device.session.control(kind, value)
         except ProtocolViolation as err:
             raise PlayerCommandFailed(str(err)) from err
