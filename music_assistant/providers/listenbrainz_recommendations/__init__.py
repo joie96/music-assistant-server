@@ -124,22 +124,29 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         self._artist_cache: dict[str, Artist] = {}
         self._refresh_lock = asyncio.Lock()
 
-        self.mass.tasks.register_scheduled_task(
-            task_id=f"{REFRESH_TASK_ID}_{self.instance_id}",
+        task_id = f"{REFRESH_TASK_ID}_{self.instance_id}"
+        schedule = TaskSchedule.hourly(every=REFRESH_INTERVAL_HOURS)
+        task = self.mass.tasks.register_scheduled_task(
+            task_id=task_id,
             name="Refresh ListenBrainz recommendations",
             handler=self._refresh_recommendations,
-            schedule=TaskSchedule.hourly(every=REFRESH_INTERVAL_HOURS),
+            schedule=schedule,
         )
+        if task.schedule is not None:
+            schedule.enabled = task.schedule.enabled
+            if task.schedule != schedule:
+                self.mass.tasks.update_task_schedule(task_id, schedule)
 
-        # Populate on startup so recommendations are available before the first interval tick.
+        # Run through the task manager so startup also records last_run and resets its timer.
         self.mass.call_later(
             20,
-            self._refresh_recommendations,
+            partial(self.mass.tasks.run_task, task_id),
             task_id=f"{REFRESH_TASK_ID}_initial_{self.instance_id}",
         )
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unload the provider."""
+        self.mass.cancel_timer(f"{REFRESH_TASK_ID}_initial_{self.instance_id}")
         self.mass.tasks.unregister_scheduled_task(
             f"{REFRESH_TASK_ID}_{self.instance_id}",
             clear_persisted_state=is_removed,
@@ -335,6 +342,14 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
             folders.append(exploration_folder)
         resolved_virtual_playlists.update(exploration_playlists)
 
+        jam_folder, jam_playlists = await self._run_build_step(
+            "similar-users weekly Jam",
+            self._build_folder_similar_users_jam,
+        )
+        if jam_folder.items:
+            folders.append(jam_folder)
+        resolved_virtual_playlists.update(jam_playlists)
+
         for entity, folder_id, name in (
             ("recordings", "sitewide_top_tracks_weekly", "Global Top Tracks"),
             ("release-groups", "sitewide_top_albums_weekly", "Global Top Albums"),
@@ -437,7 +452,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
     async def _build_folder_exploration(
         self,
     ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
-        """Build playable Exploration playlists from the previous and current week."""
+        """Build the latest playable Exploration playlist, regardless of its age."""
         self.logger.debug("Building weekly Exploration folder")
         folder = RecommendationFolder(
             item_id="user_exploration_weekly",
@@ -449,45 +464,14 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         if not isinstance(username, str) or not username.strip():
             self.logger.debug("Skipping weekly Exploration: no username configured")
             return folder, playlists
-        rows = await self.api_client.get_weekly_exploration(username.strip(), utc().date())
+        rows = await self.api_client.get_weekly_exploration(username.strip())
         self.logger.debug("Weekly Exploration playlist rows received: %d", len(rows))
         for row in rows:
-            identifier = row.get("identifier")
-            title = row.get("title")
-            if not isinstance(identifier, str) or not isinstance(title, str):
+            resolved = await self._resolve_generated_playlist(row, "user_exploration", "Exploration")
+            if resolved is None:
                 continue
-            try:
-                playlist_mbid = str(UUID(urlparse(identifier).path.rstrip("/").rsplit("/", 1)[-1]))
-            except ValueError:
-                self.logger.warning("Skipping Exploration playlist with invalid identifier")
-                continue
-            track_rows = await self.api_client.get_playlist_tracks(playlist_mbid)
-            self.logger.debug(
-                "Exploration playlist %s: %d track rows received", playlist_mbid, len(track_rows)
-            )
-            tracks: list[Track] = []
-            for offset in range(0, len(track_rows), DISCOVERY_RESOLVE_BATCH_SIZE):
-                batch = track_rows[offset : offset + DISCOVERY_RESOLVE_BATCH_SIZE]
-                resolved = await asyncio.gather(
-                    *(
-                        self.resolve_provider_track_by_name(row.get("creator", ""), row["title"])
-                        for row in batch
-                        if isinstance(row.get("title"), str)
-                        and isinstance(row.get("creator", ""), str)
-                    )
-                )
-                tracks.extend(track for track in resolved if track is not None)
-            self.logger.debug(
-                "Exploration playlist %s: %d track candidates, %d tracks resolved",
-                playlist_mbid,
-                len(track_rows),
-                len(tracks),
-            )
-            if not tracks:
-                continue
-            item_id = f"user_exploration_{playlist_mbid}"
-            playlist = await self._create_virtual_playlist(item_id, title)
-            playlists[item_id] = (playlist, tracks)
+            playlist, tracks = resolved
+            playlists[playlist.item_id] = (playlist, tracks)
             folder.items.append(playlist)
         self.logger.debug(
             "Weekly Exploration build completed: %d playlist candidates, %d playlists created",
@@ -495,6 +479,78 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
             len(playlists),
         )
         return folder, playlists
+
+    async def _build_folder_similar_users_jam(
+        self,
+    ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
+        """Build the latest playable Jam from the closest listener with a Jam."""
+        self.logger.debug("Building similar-users weekly Jam folder")
+        folder = RecommendationFolder(
+            item_id="similarusers_jam_weekly", provider=self.instance_id, name="Similar Users Jam"
+        )
+        username = self.get_setup_value(CONF_USERNAME)
+        if not isinstance(username, str) or not username.strip():
+            self.logger.debug("Skipping similar-users Jam: no username configured")
+            return folder, {}
+        users = await self.api_client.get_similar_users(username.strip())
+        self.logger.debug("Similar-users rows received: %d", len(users))
+        for user in users:
+            name = user["user_name"]
+            rows = await self.api_client.get_weekly_jams(name)
+            self.logger.debug(
+                "Similar listener %s (similarity=%s): %d Weekly Jams playlists found",
+                name, user["similarity"], len(rows),
+            )
+            for row in rows:
+                resolved = await self._resolve_generated_playlist(row, "similarusers_jam", "Weekly Jams")
+                if resolved is None:
+                    continue
+                playlist, tracks = resolved
+                folder.items.append(playlist)
+                self.logger.debug(
+                    "Similar-users Jam build completed: user=%s, similarity=%s, date=%s, tracks=%d",
+                    name, user["similarity"], row.get("date"), len(tracks),
+                )
+                return folder, {playlist.item_id: (playlist, tracks)}
+        self.logger.debug("Similar-users Jam build completed: no playable Weekly Jams found")
+        return folder, {}
+
+    async def _resolve_generated_playlist(
+        self, row: dict[str, Any], item_id_prefix: str, log_label: str
+    ) -> tuple[Playlist, list[Track]] | None:
+        """Resolve a generated ListenBrainz playlist against connected music providers."""
+        identifier, title = row.get("identifier"), row.get("title")
+        if not isinstance(identifier, str) or not isinstance(title, str):
+            return None
+        try:
+            playlist_mbid = str(UUID(urlparse(identifier).path.rstrip("/").rsplit("/", 1)[-1]))
+        except ValueError:
+            self.logger.warning("Skipping %s playlist with invalid identifier", log_label)
+            return None
+        track_rows = await self.api_client.get_playlist_tracks(playlist_mbid)
+        self.logger.debug(
+            "%s playlist %s: %d track rows received", log_label, playlist_mbid, len(track_rows)
+        )
+        tracks: list[Track] = []
+        for offset in range(0, len(track_rows), DISCOVERY_RESOLVE_BATCH_SIZE):
+            batch = track_rows[offset : offset + DISCOVERY_RESOLVE_BATCH_SIZE]
+            resolved = await asyncio.gather(
+                *(
+                    self.resolve_provider_track_by_name(track.get("creator", ""), track["title"])
+                    for track in batch
+                    if isinstance(track.get("title"), str)
+                    and isinstance(track.get("creator", ""), str)
+                )
+            )
+            tracks.extend(track for track in resolved if track is not None)
+        self.logger.debug(
+            "%s playlist %s: %d track candidates, %d tracks resolved",
+            log_label, playlist_mbid, len(track_rows), len(tracks),
+        )
+        if not tracks:
+            return None
+        playlist = await self._create_virtual_playlist(f"{item_id_prefix}_{playlist_mbid}", title)
+        return playlist, tracks
 
     async def _run_build_step[T](
         self,

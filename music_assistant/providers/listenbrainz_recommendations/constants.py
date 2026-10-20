@@ -10,7 +10,7 @@ CONF_LB_RADIO_POP_END = "lb_radio_pop_end"
 CONF_LB_RADIO_MODE = "lb_radio_mode"
 
 DEFAULT_API_BASE_URL = "https://api.listenbrainz.org"
-REFRESH_INTERVAL_HOURS = 6
+REFRESH_INTERVAL_HOURS = 24
 REFRESH_TASK_ID = "refresh_listenbrainz_recommendations"
 
 SUPPORTED_FEATURES = {ProviderFeature.RECOMMENDATIONS}

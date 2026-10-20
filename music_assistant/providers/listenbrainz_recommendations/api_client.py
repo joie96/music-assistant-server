@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
 
@@ -209,34 +209,35 @@ class ListenBrainzAPIClient:
             :count
         ]
 
-    async def get_weekly_exploration(self, username: str, today: date) -> list[dict[str, Any]]:
-        """Get Exploration playlist metadata from the previous and current week."""
+    async def get_weekly_exploration(self, username: str) -> list[dict[str, Any]]:
+        """Get the latest Exploration playlist, regardless of its age."""
+        return await self._get_latest_weekly_playlist(username, "weekly-exploration")
+
+    async def get_weekly_jams(self, username: str) -> list[dict[str, Any]]:
+        """Get the latest Weekly Jams playlist, regardless of its age."""
+        return await self._get_latest_weekly_playlist(username, "weekly-jams")
+
+    async def get_similar_users(self, username: str) -> list[dict[str, Any]]:
+        """Get similar listeners ordered by descending similarity."""
         data = await self._cached_request(
-            f"/1/user/{quote(username, safe='')}/playlists/recommendations", {}
+            f"/1/user/{quote(username, safe='')}/similar-users", {}
         )
-        start = today - timedelta(days=today.weekday() + 7)
-        end = start + timedelta(days=14)
-        playlists: list[dict[str, Any]] = []
-        for entry in data.get("playlists", []):
-            playlist = entry.get("playlist", {})
-            extension = playlist.get("extension", {}).get(
-                "https://musicbrainz.org/doc/jspf#playlist", {}
-            )
-            source = (
-                extension.get("additional_metadata", {})
-                .get("algorithm_metadata", {})
-                .get("source_patch")
-            )
-            if source != "weekly-exploration":
+        users: list[dict[str, Any]] = []
+        for row in data.get("payload", []):
+            if not isinstance(row, dict):
                 continue
-            try:
-                created = datetime.fromisoformat(playlist.get("date", "")).date()
-            except TypeError, ValueError:
-                self.provider.logger.warning("Skipping Exploration playlist with invalid date")
-                continue
-            if start <= created < end:
-                playlists.append(playlist)
-        return sorted(playlists, key=lambda playlist: playlist["date"], reverse=True)
+            name = row.get("user_name")
+            similarity = row.get("similarity")
+            if (
+                isinstance(name, str)
+                and name.strip()
+                and name.casefold() != username.casefold()
+                and isinstance(similarity, (int, float))
+                and not isinstance(similarity, bool)
+                and 0 <= similarity <= 1
+            ):
+                users.append(row)
+        return sorted(users, key=lambda row: row["similarity"], reverse=True)
 
     async def get_playlist_tracks(self, playlist_mbid: str) -> list[dict[str, Any]]:
         """Get all recordings of a ListenBrainz playlist in playlist order."""
@@ -448,6 +449,34 @@ class ListenBrainzAPIClient:
             return []
 
         return payload
+
+    async def _get_latest_weekly_playlist(
+        self, username: str, source: str
+    ) -> list[dict[str, Any]]:
+        """Select the latest generated playlist of the requested kind."""
+        data = await self._cached_request(
+            f"/1/user/{quote(username, safe='')}/playlists/recommendations", {}
+        )
+        latest: dict[str, Any] | None = None
+        latest_date: datetime | None = None
+        for entry in data.get("playlists", []):
+            playlist = entry.get("playlist", {})
+            extension = playlist.get("extension", {}).get(
+                "https://musicbrainz.org/doc/jspf#playlist", {}
+            )
+            algorithm = extension.get("additional_metadata", {}).get("algorithm_metadata", {})
+            if algorithm.get("source_patch") != source:
+                continue
+            try:
+                created = datetime.fromisoformat(playlist.get("date", ""))
+            except TypeError, ValueError:
+                self.provider.logger.warning("Skipping %s playlist with invalid date", source)
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            if latest_date is None or created > latest_date:
+                latest, latest_date = playlist, created
+        return [latest] if latest is not None else []
 
     async def _cached_request(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         """Fetch discovery data using the server cache and paced API requests."""
