@@ -1,0 +1,12 @@
+{
+  "config_entries": {
+    "username": {
+      "label": "ListenBrainz Username",
+      "description": "Needed to build your personalized ListenBrainz recommendations."
+    },
+    "auth_token": {
+      "label": "ListenBrainz User Token",
+      "description": "ListenBrainz API token used for authenticated endpoints such as LB-Radio."
+    }
+  }
+}

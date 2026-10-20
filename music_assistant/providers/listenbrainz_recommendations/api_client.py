@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import aiohttp
 from music_assistant_models.errors import MusicAssistantError
 
+from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.providers.listenbrainz_recommendations.constants import (
     CONF_AUTH_TOKEN,
     DEFAULT_API_BASE_URL,
@@ -27,6 +29,7 @@ class ListenBrainzAPIClient:
         self.provider = provider
         base_url_value = provider.config.get_value("api_base_url")
         self.base_url = (base_url_value or DEFAULT_API_BASE_URL).rstrip("/")
+        self._throttler = Throttler(rate_limit=1, period=1)
 
     async def get_user_top_artists(
         self,
@@ -169,6 +172,106 @@ class ListenBrainzAPIClient:
             return []
         return [listen for listen in listens if isinstance(listen, dict)]
 
+    async def get_sitewide_top_items(self, entity: str, count: int) -> list[dict[str, Any]]:
+        """Get global charts aggregated across the previous and current week."""
+        fields = {
+            "artists": ("artist_mbid", "artist_name"),
+            "recordings": ("recording_mbid", "track_name"),
+            "release-groups": ("release_group_mbid", "release_group_name"),
+        }
+        identity_field, name_field = fields[entity]
+        payload_key = entity.replace("-", "_")
+        aggregated: dict[str, dict[str, Any]] = {}
+        for stats_range in ("week", "this_week"):
+            data = await self._cached_request(
+                f"/1/stats/sitewide/{entity}",
+                {"range": stats_range, "count": count, "offset": 0},
+            )
+            for row in data.get("payload", {}).get(payload_key, []):
+                if not isinstance(row, dict):
+                    continue
+                name = row.get(name_field)
+                listens = row.get("listen_count", 0)
+                if not isinstance(name, str) or not name.strip() or not isinstance(listens, int):
+                    continue
+                identity = row.get(identity_field)
+                key = (
+                    f"mbid:{identity}"
+                    if identity
+                    else f"name:{str(row.get('artist_name', '')).casefold()}::{name.casefold()}"
+                )
+                if key not in aggregated:
+                    aggregated[key] = dict(row)
+                    aggregated[key]["listen_count"] = listens
+                else:
+                    aggregated[key]["listen_count"] += listens
+        return sorted(aggregated.values(), key=lambda row: row["listen_count"], reverse=True)[
+            :count
+        ]
+
+    async def get_weekly_exploration(self, username: str, today: date) -> list[dict[str, Any]]:
+        """Get Exploration playlist metadata from the previous and current week."""
+        data = await self._cached_request(
+            f"/1/user/{quote(username, safe='')}/playlists/recommendations", {}
+        )
+        start = today - timedelta(days=today.weekday() + 7)
+        end = start + timedelta(days=14)
+        playlists: list[dict[str, Any]] = []
+        for entry in data.get("playlists", []):
+            playlist = entry.get("playlist", {})
+            extension = playlist.get("extension", {}).get(
+                "https://musicbrainz.org/doc/jspf#playlist", {}
+            )
+            source = (
+                extension.get("additional_metadata", {})
+                .get("algorithm_metadata", {})
+                .get("source_patch")
+            )
+            if source != "weekly-exploration":
+                continue
+            try:
+                created = datetime.fromisoformat(playlist.get("date", "")).date()
+            except TypeError, ValueError:
+                self.provider.logger.warning("Skipping Exploration playlist with invalid date")
+                continue
+            if start <= created < end:
+                playlists.append(playlist)
+        return sorted(playlists, key=lambda playlist: playlist["date"], reverse=True)
+
+    async def get_playlist_tracks(self, playlist_mbid: str) -> list[dict[str, Any]]:
+        """Get all recordings of a ListenBrainz playlist in playlist order."""
+        data = await self._cached_request(f"/1/playlist/{quote(playlist_mbid, safe='')}", {})
+        return data.get("playlist", {}).get("track", [])
+
+    async def get_fresh_releases(self, today: date) -> list[dict[str, Any]]:
+        """Get global releases dated within the previous and current week."""
+        start = today - timedelta(days=today.weekday() + 7)
+        end = start + timedelta(days=14)
+        data = await self._cached_request(
+            "/1/explore/fresh-releases/",
+            {
+                "release_date": (start + timedelta(days=7)).isoformat(),
+                "days": 14,
+                "past": "true",
+                "future": "true",
+                "sort": "release_date",
+            },
+        )
+        releases: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for release in data.get("payload", {}).get("releases", []):
+            try:
+                released = date.fromisoformat(release.get("release_date", ""))
+            except TypeError, ValueError:
+                self.provider.logger.debug("Skipping release without a complete release date")
+                continue
+            identity = release.get("release_group_mbid") or release.get("release_mbid")
+            if start <= released < end and (not identity or identity not in seen):
+                releases.append(release)
+                if identity:
+                    seen.add(identity)
+        return sorted(releases, key=lambda release: release["release_date"], reverse=True)
+
     async def get_user_genre_activity(
         self,
         username: str,
@@ -223,14 +326,10 @@ class ListenBrainzAPIClient:
 
     async def get_explore_lb_radio(self, prompt: str, mode: str) -> list[dict[str, Any]]:
         """Generate LB-Radio tracks using a prompt and mode."""
-        try:
-            data = await self._request(
-                path="/1/explore/lb-radio",
-                params={"prompt": prompt, "mode": mode},
-            )
-        except MusicAssistantError as err:
-            self.provider.logger.debug("LB-Radio prompt yielded no results, skipping: %s", err)
-            return []
+        data = await self._request(
+            path="/1/explore/lb-radio",
+            params={"prompt": prompt, "mode": mode},
+        )
         payload = data.get("payload", data)
         jspf = payload.get("jspf", {})
         playlist = jspf.get("playlist", {})
@@ -246,20 +345,16 @@ class ListenBrainzAPIClient:
         pop_end: int,
     ) -> dict[str, list[dict[str, Any]]]:
         """Get recordings for use in LB radio with the given seed artist. The endpoint returns a dict of all the similar artists, including the seed artist."""
-        try:
-            data = await self._request(
-                path=f"/1/lb-radio/artist/{quote(seed_artist_mbid, safe='')}",
-                params={
-                    "mode": mode,
-                    "max_similar_artists": max_similar_artists,
-                    "max_recordings_per_artist": max_recordings_per_artist,
-                    "pop_begin": pop_begin,
-                    "pop_end": pop_end,
-                },
-            )
-        except MusicAssistantError as err:
-            self.provider.logger.debug("LB-Radio artist request yielded no results, skipping: %s", err)
-            return {}
+        data = await self._request(
+            path=f"/1/lb-radio/artist/{quote(seed_artist_mbid, safe='')}",
+            params={
+                "mode": mode,
+                "max_similar_artists": max_similar_artists,
+                "max_recordings_per_artist": max_recordings_per_artist,
+                "pop_begin": pop_begin,
+                "pop_end": pop_end,
+            },
+        )
 
         payload = data.get("payload", data)
         if not isinstance(payload, dict):
@@ -296,11 +391,7 @@ class ListenBrainzAPIClient:
         if isinstance(operator, str) and operator.strip():
             params["operator"] = operator.strip().upper()
 
-        try:
-            data = await self._request(path="/1/lb-radio/tags", params=params)
-        except MusicAssistantError as err:
-            self.provider.logger.debug("LB-Radio tags yielded no results, skipping: %s", err)
-            return []
+        data = await self._request(path="/1/lb-radio/tags", params=params)
 
         if isinstance(data, list):
             return data
@@ -358,10 +449,23 @@ class ListenBrainzAPIClient:
 
         return payload
 
+    async def _cached_request(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Fetch discovery data using the server cache and paced API requests."""
+        key = f"{self.base_url}{path}?{urlencode(sorted(params.items()))}"
+        cached = await self.provider.mass.cache.get(key, provider=self.provider.instance_id)
+        if cached is not None:
+            return cached
+        async with self._throttler:
+            data = await self._request(path, params)
+        await self.provider.mass.cache.set(
+            key, data, expiration=3 * 3600, provider=self.provider.instance_id
+        )
+        return data
+
     async def _request(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Execute a GET request and return JSON body or empty dict."""
+        """Execute a GET request, raising when data is unavailable or the request fails."""
         url = f"{self.base_url}{path}"
-        auth_token = self.provider.config.get_value(CONF_AUTH_TOKEN)
+        auth_token = self.provider.get_setup_value(CONF_AUTH_TOKEN)
         headers = (
             {"Authorization": f"Token {auth_token}"}
             if isinstance(auth_token, str) and auth_token.strip()
@@ -374,9 +478,7 @@ class ListenBrainzAPIClient:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
-                if response.status == 204:
-                    return {}
-                if response.status >= 400:
+                if response.status == 204 or response.status >= 400:
                     body = await response.text()
                     msg = f"ListenBrainz request failed ({response.status}) for {path}: {body}"
                     raise MusicAssistantError(msg)

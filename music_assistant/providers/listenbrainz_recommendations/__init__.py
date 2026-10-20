@@ -6,13 +6,18 @@ import asyncio
 import os
 import re
 import unicodedata
+from functools import partial
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+from uuid import UUID
 
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType, ImageType, MediaType
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import (
+    Album,
     Artist,
     MediaItemImage,
     MediaItemMetadata,
@@ -23,19 +28,22 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
+from music_assistant.helpers.datetime import utc
+from music_assistant.models.media_capabilities import MediaCatalogMixin
 from music_assistant.models.metadata_provider import MetadataProvider
 from music_assistant.providers.listenbrainz_recommendations.api_client import ListenBrainzAPIClient
-from music_assistant.providers.listenbrainz_recommendations.cover_art import build_split_cover_png
 from music_assistant.providers.listenbrainz_recommendations.constants import (
     ARTIST_PLAYLISTS_FEATURED_ARTISTS_LIMIT,
     ARTIST_PLAYLISTS_LIMIT,
     CONF_API_BASE_URL,
-    CONF_AUTH_TOKEN,
     CONF_LB_RADIO_MODE,
     CONF_LB_RADIO_POP_BEGIN,
     CONF_LB_RADIO_POP_END,
     CONF_USERNAME,
     DEFAULT_API_BASE_URL,
+    DISCOVERY_CANDIDATES_LIMIT,
+    DISCOVERY_ITEMS_LIMIT,
+    DISCOVERY_RESOLVE_BATCH_SIZE,
     GENRE_ARTISTS_GENRE_LIMIT,
     GENRE_ARTISTS_PER_GENRE_LIMIT,
     GENRE_PLAYLISTS_LIMIT,
@@ -49,9 +57,13 @@ from music_assistant.providers.listenbrainz_recommendations.constants import (
     TOP_ARTISTS_LIMIT,
     TOP_TRACKS_LIMIT,
 )
+from music_assistant.providers.listenbrainz_recommendations.cover_art import build_split_cover_png
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.media_items import BrowseFolder, ItemMapping, MediaItemType
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -63,28 +75,12 @@ async def setup(
     return ListenBrainzRecommendationsProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-class ListenBrainzRecommendationsProvider(MetadataProvider):
+class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
     """ListenBrainz recommendations provider."""
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return configuration entries for this provider."""
         return (
-            ConfigEntry(
-                key=CONF_USERNAME,
-                type=ConfigEntryType.STRING,
-                label="ListenBrainz Username",
-                required=True,
-                description="Needed to build your personalized ListenBrainz recommendations.",
-            ),
-            ConfigEntry(
-                key=CONF_AUTH_TOKEN,
-                type=ConfigEntryType.SECURE_STRING,
-                label="ListenBrainz User Token",
-                required=True,
-                description=(
-                    "ListenBrainz API token used for authenticated endpoints such as LB-Radio."
-                ),
-            ),
             ConfigEntry(
                 key=CONF_API_BASE_URL,
                 type=ConfigEntryType.STRING,
@@ -126,6 +122,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         self._recommendation_folders: list[RecommendationFolder] = []
         self._resolved_virtual_playlists: dict[str, tuple[Playlist, list[Track]]] = {}
         self._artist_cache: dict[str, Artist] = {}
+        self._refresh_lock = asyncio.Lock()
 
         self.mass.tasks.register_scheduled_task(
             task_id=f"{REFRESH_TASK_ID}_{self.instance_id}",
@@ -149,11 +146,25 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
-        """Get this provider's recommendations organized into folders."""
-        return self._recommendation_folders
+        """Get this provider's available recommendation rows, without items."""
+        return [
+            RecommendationFolder(
+                item_id=folder.item_id,
+                provider=folder.provider,
+                name=folder.name,
+                translation_key=folder.translation_key,
+                translation_params=folder.translation_params,
+                icon=folder.icon,
+                subtitle=folder.subtitle,
+            )
+            for folder in self._recommendation_folders
+        ]
 
-    async def get_recommendation_items(self, item_id: str) -> UniqueList:
-        """Return the items in a recommendation folder.
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Return the items in a recommendation folder.
 
         :param item_id: Identifier of the recommendation folder.
         """
@@ -180,6 +191,26 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         _playlist, tracks = payload
         return tracks
 
+    async def resolve_provider_album_by_name(
+        self, artist_name: str, album_name: str
+    ) -> Album | None:
+        """Resolve an album with a matching title and artist on connected providers."""
+        title = self._normalize_text(album_name)
+        artist = self._normalize_text(artist_name)
+        if not title or not artist:
+            return None
+        result = await self.mass.music.search(
+            search_query=f"{artist_name} - {album_name}",
+            media_types=[MediaType.ALBUM],
+            limit=10,
+        )
+        for album in result.albums:
+            if self._normalize_text(album.name) != title:
+                continue
+            if any(self._normalize_text(entry.name) == artist for entry in album.artists):
+                return album
+        return None
+
     def _get_lb_radio_pop_range(self) -> tuple[int, int]:
         """Return LB-Radio popularity bounds from provider configuration."""
         pop_begin = self.config.get_value(CONF_LB_RADIO_POP_BEGIN)
@@ -204,29 +235,32 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         return normalized_mode
 
     async def _refresh_recommendations(self, initial_delay: int = 0) -> None:
-        """Refresh all recommendation folders."""
+        """Publish folders and playlists only after their complete rebuild succeeds."""
         if initial_delay:
             self.logger.debug("ListenBrainz refresh delayed by %ss", initial_delay)
             await asyncio.sleep(initial_delay)
 
-        try:
-            self.logger.info("Building ListenBrainz recommendations")
-            folders, resolved_virtual_playlists = await self._build_recommendations()
-            self._recommendation_folders = folders
-            self._resolved_virtual_playlists = resolved_virtual_playlists
-            self.logger.debug(
-                "Build completed: folders=%d virtual_playlists=%d",
-                len(self._recommendation_folders),
-                len(self._resolved_virtual_playlists),
-            )
-            self.logger.info(
-                "Built %d ListenBrainz recommendation folders",
-                len(self._recommendation_folders),
-            )
-        except MusicAssistantError as err:
-            self.logger.warning("Failed to refresh ListenBrainz recommendations: %s", err)
-        except Exception as err:  # noqa: BLE001
-            self.logger.exception("Unexpected error while refreshing ListenBrainz recommendations: %s", err)
+        async with self._refresh_lock:
+            try:
+                self.logger.info("Building ListenBrainz recommendations")
+                folders, resolved_virtual_playlists = await self._build_recommendations()
+                self._recommendation_folders = folders
+                self._resolved_virtual_playlists = resolved_virtual_playlists
+                self.logger.debug(
+                    "Build completed: folders=%d virtual_playlists=%d",
+                    len(self._recommendation_folders),
+                    len(self._resolved_virtual_playlists),
+                )
+                self.logger.info(
+                    "Built %d ListenBrainz recommendation folders",
+                    len(self._recommendation_folders),
+                )
+            except MusicAssistantError as err:
+                self.logger.warning("Failed to refresh ListenBrainz recommendations: %s", err)
+            except Exception:
+                self.logger.exception(
+                    "Unexpected error while refreshing ListenBrainz recommendations"
+                )
 
     async def _build_recommendations(
         self,
@@ -238,12 +272,6 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         top_artists_folder = await self._run_build_step(
             "top artists",
             self._build_folder_top_artists,
-            RecommendationFolder(
-                item_id="top_artists",
-                provider=self.instance_id,
-                name="Top Artists",
-                items=UniqueList([]),
-            ),
         )
         if top_artists_folder.items:
             folders.append(top_artists_folder)
@@ -251,12 +279,6 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         top_tracks_folder = await self._run_build_step(
             "top tracks",
             self._build_folder_top_tracks,
-            RecommendationFolder(
-                item_id="top_tracks",
-                provider=self.instance_id,
-                name="Top Tracks",
-                items=UniqueList([]),
-            ),
         )
         if top_tracks_folder.items:
             folders.append(top_tracks_folder)
@@ -264,12 +286,6 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         recent_listens_folder = await self._run_build_step(
             "recent listens",
             self._build_folder_recent_listens,
-            RecommendationFolder(
-                item_id="recent_listens",
-                provider=self.instance_id,
-                name="Recent Listens",
-                items=UniqueList([]),
-            ),
         )
         if recent_listens_folder.items:
             folders.append(recent_listens_folder)
@@ -278,19 +294,12 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
             await self._run_build_step(
                 "similar artists",
                 self._build_folder_similar_artists,
-                [],
             )
         )
 
         recommendations_folder = await self._run_build_step(
             "recommendations",
             self._build_folder_recommendations,
-            RecommendationFolder(
-                item_id="recommendations",
-                provider=self.instance_id,
-                name="Recommendations",
-                items=UniqueList([]),
-            ),
         )
         if recommendations_folder.items:
             folders.append(recommendations_folder)
@@ -299,22 +308,12 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
             await self._run_build_step(
                 "genre artists",
                 self._build_folder_genre_artists,
-                [],
             )
         )
 
         genre_playlists_folder, genre_playlists = await self._run_build_step(
             "genre playlists",
             self._build_folder_genre_playlists,
-            (
-                RecommendationFolder(
-                    item_id="genre_playlists",
-                    provider=self.instance_id,
-                    name="Genre Playlists",
-                    items=UniqueList([]),
-                ),
-                {},
-            ),
         )
         if genre_playlists_folder.items:
             folders.append(genre_playlists_folder)
@@ -323,44 +322,196 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         artist_playlists_folder, artist_playlists = await self._run_build_step(
             "artist playlists",
             self._build_folder_artist_playlists,
-            (
-                RecommendationFolder(
-                    item_id="artist_playlists",
-                    provider=self.instance_id,
-                    name="Artist Playlists",
-                    items=UniqueList([]),
-                ),
-                {},
-            ),
         )
         if artist_playlists_folder.items:
             folders.append(artist_playlists_folder)
         resolved_virtual_playlists.update(artist_playlists)
 
+        exploration_folder, exploration_playlists = await self._run_build_step(
+            "weekly exploration",
+            self._build_folder_exploration,
+        )
+        if exploration_folder.items:
+            folders.append(exploration_folder)
+        resolved_virtual_playlists.update(exploration_playlists)
+
+        for entity, folder_id, name in (
+            ("recordings", "sitewide_top_tracks_weekly", "Global Top Tracks"),
+            ("release-groups", "sitewide_top_albums_weekly", "Global Top Albums"),
+            ("artists", "sitewide_top_artists_weekly", "Global Top Artists"),
+        ):
+            folder = await self._run_build_step(
+                name,
+                partial(self._build_folder_sitewide_chart, entity, folder_id, name),
+            )
+            if folder.items:
+                folders.append(folder)
+
+        releases_folder = await self._run_build_step(
+            "fresh releases",
+            self._build_folder_fresh_releases,
+        )
+        if releases_folder.items:
+            folders.append(releases_folder)
+
         return folders, resolved_virtual_playlists
+
+    async def _build_folder_sitewide_chart(
+        self, entity: str, folder_id: str, name: str
+    ) -> RecommendationFolder:
+        """Build a global chart folder for the previous and current week."""
+        self.logger.debug("Building sitewide %s charts folder", entity)
+        rows = await self.api_client.get_sitewide_top_items(entity, DISCOVERY_ITEMS_LIMIT)
+        self.logger.debug("Sitewide %s chart rows received: %d", entity, len(rows))
+        items: UniqueList[Artist | Track | Album] = UniqueList()
+        lookups: list[Callable[[], Awaitable[Artist | Track | Album | None]]] = []
+        for row in rows:
+            artist_name = row.get("artist_name", "")
+            if entity == "artists":
+                lookups.append(partial(self.resolve_provider_artist_by_name, artist_name))
+            elif entity == "recordings":
+                lookups.append(
+                    partial(self.resolve_provider_track_by_name, artist_name, row["track_name"])
+                )
+            else:
+                lookups.append(
+                    partial(
+                        self.resolve_provider_album_by_name, artist_name, row["release_group_name"]
+                    )
+                )
+        for offset in range(0, len(lookups), DISCOVERY_RESOLVE_BATCH_SIZE):
+            resolved = await asyncio.gather(
+                *(lookup() for lookup in lookups[offset : offset + DISCOVERY_RESOLVE_BATCH_SIZE])
+            )
+            items.extend(item for item in resolved if item is not None)
+        self.logger.debug(
+            "Sitewide %s charts build completed: %d candidates, %d items resolved",
+            entity,
+            len(rows),
+            len(items),
+        )
+        return RecommendationFolder(
+            item_id=folder_id, provider=self.instance_id, name=name, items=items
+        )
+
+    async def _build_folder_fresh_releases(self) -> RecommendationFolder:
+        """Build global new releases from the previous and current week."""
+        self.logger.debug("Building fresh releases folder")
+        rows = await self.api_client.get_fresh_releases(utc().date())
+        items: UniqueList[Album] = UniqueList()
+        candidates = rows[:DISCOVERY_CANDIDATES_LIMIT]
+        self.logger.debug(
+            "Fresh release rows received: %d; selected %d candidates (limit=%d)",
+            len(rows),
+            len(candidates),
+            DISCOVERY_CANDIDATES_LIMIT,
+        )
+        for offset in range(0, len(candidates), DISCOVERY_RESOLVE_BATCH_SIZE):
+            batch = candidates[offset : offset + DISCOVERY_RESOLVE_BATCH_SIZE]
+            albums = await asyncio.gather(
+                *(
+                    self.resolve_provider_album_by_name(
+                        row["artist_credit_name"], row["release_name"]
+                    )
+                    for row in batch
+                    if isinstance(row.get("release_name"), str)
+                    and isinstance(row.get("artist_credit_name"), str)
+                )
+            )
+            items.extend(album for album in albums if album is not None)
+            if len(items) >= DISCOVERY_ITEMS_LIMIT:
+                break
+        self.logger.debug(
+            "Fresh releases build completed: %d albums resolved, %d albums included (limit=%d)",
+            len(items),
+            min(len(items), DISCOVERY_ITEMS_LIMIT),
+            DISCOVERY_ITEMS_LIMIT,
+        )
+        return RecommendationFolder(
+            item_id="sitewide_releases_weekly",
+            provider=self.instance_id,
+            name="New Releases",
+            items=UniqueList(items[:DISCOVERY_ITEMS_LIMIT]),
+        )
+
+    async def _build_folder_exploration(
+        self,
+    ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
+        """Build playable Exploration playlists from the previous and current week."""
+        self.logger.debug("Building weekly Exploration folder")
+        folder = RecommendationFolder(
+            item_id="user_exploration_weekly",
+            provider=self.instance_id,
+            name="Weekly Exploration",
+        )
+        playlists: dict[str, tuple[Playlist, list[Track]]] = {}
+        username = self.get_setup_value(CONF_USERNAME)
+        if not isinstance(username, str) or not username.strip():
+            self.logger.debug("Skipping weekly Exploration: no username configured")
+            return folder, playlists
+        rows = await self.api_client.get_weekly_exploration(username.strip(), utc().date())
+        self.logger.debug("Weekly Exploration playlist rows received: %d", len(rows))
+        for row in rows:
+            identifier = row.get("identifier")
+            title = row.get("title")
+            if not isinstance(identifier, str) or not isinstance(title, str):
+                continue
+            try:
+                playlist_mbid = str(UUID(urlparse(identifier).path.rstrip("/").rsplit("/", 1)[-1]))
+            except ValueError:
+                self.logger.warning("Skipping Exploration playlist with invalid identifier")
+                continue
+            track_rows = await self.api_client.get_playlist_tracks(playlist_mbid)
+            self.logger.debug(
+                "Exploration playlist %s: %d track rows received", playlist_mbid, len(track_rows)
+            )
+            tracks: list[Track] = []
+            for offset in range(0, len(track_rows), DISCOVERY_RESOLVE_BATCH_SIZE):
+                batch = track_rows[offset : offset + DISCOVERY_RESOLVE_BATCH_SIZE]
+                resolved = await asyncio.gather(
+                    *(
+                        self.resolve_provider_track_by_name(row.get("creator", ""), row["title"])
+                        for row in batch
+                        if isinstance(row.get("title"), str)
+                        and isinstance(row.get("creator", ""), str)
+                    )
+                )
+                tracks.extend(track for track in resolved if track is not None)
+            self.logger.debug(
+                "Exploration playlist %s: %d track candidates, %d tracks resolved",
+                playlist_mbid,
+                len(track_rows),
+                len(tracks),
+            )
+            if not tracks:
+                continue
+            item_id = f"user_exploration_{playlist_mbid}"
+            playlist = await self._create_virtual_playlist(item_id, title)
+            playlists[item_id] = (playlist, tracks)
+            folder.items.append(playlist)
+        self.logger.debug(
+            "Weekly Exploration build completed: %d playlist candidates, %d playlists created",
+            len(rows),
+            len(playlists),
+        )
+        return folder, playlists
 
     async def _run_build_step[T](
         self,
         step_name: str,
-        builder: Any,
-        default_value: T,
+        builder: Callable[[], Awaitable[T]],
     ) -> T:
-        """Run a single build step and continue on errors."""
+        """Build a folder without allowing failures to publish a partial refresh."""
         try:
             return await builder()
         except MusicAssistantError as err:
-            self.logger.warning("Skipping ListenBrainz %s step: %s", step_name, err)
-        except Exception as err:  # noqa: BLE001
-            self.logger.exception(
-                "Unexpected error in ListenBrainz %s step: %s", step_name, err
-            )
-        return default_value
+            raise MusicAssistantError(f"ListenBrainz {step_name} build failed: {err}") from err
 
     async def _build_folder_genre_artists(
         self,
     ) -> list[RecommendationFolder]:
         """Build a top-level artists folder for each genre."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return []
 
@@ -486,7 +637,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
                 folder_slug = re.sub(r"[^a-z0-9]+", "_", genre.casefold()).strip("_") or "genre"
                 result.append(
                     RecommendationFolder(
-                        item_id=f"genre_artists_{folder_slug}",
+                        item_id=f"user_genre_artists_{folder_slug}_monthly",
                         provider=self.instance_id,
                         name=f"{genre.title()} Artists",
                         items=UniqueList(resolved_artists),
@@ -498,11 +649,13 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
                     len(resolved_artists),
                 )
             except MusicAssistantError as err:
-                self.logger.warning("Skipping genre artists for '%s': %s", genre, err)
-            except Exception as err:  # noqa: BLE001
+                self.logger.warning("Failed to build genre artists for '%s': %s", genre, err)
+                raise
+            except Exception:
                 self.logger.exception(
-                    "Unexpected error while building genre artists for '%s': %s", genre, err
+                    "Unexpected error while building genre artists for '%s'", genre
                 )
+                raise
 
         self.logger.debug("Genre artists build completed: %d folders created", len(result))
         return result
@@ -511,11 +664,11 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         self,
     ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
         """Build one playlist per genre and pre-resolve its tracks."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return (
                 RecommendationFolder(
-                    item_id="genre_playlists",
+                    item_id="user_genre_playlists_monthly",
                     provider=self.instance_id,
                     name="Genre Playlists",
                     items=UniqueList([]),
@@ -530,7 +683,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         if not isinstance(genre_activity, list):
             return (
                 RecommendationFolder(
-                    item_id="genre_playlists",
+                    item_id="user_genre_playlists_monthly",
                     provider=self.instance_id,
                     name="Genre Playlists",
                     items=UniqueList([]),
@@ -673,7 +826,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
 
         return (
             RecommendationFolder(
-                item_id="genre_playlists",
+                item_id="user_genre_playlists_monthly",
                 provider=self.instance_id,
                 name="Genre Playlists",
                 items=playlist_items,
@@ -685,11 +838,11 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         self,
     ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
         """Build one playlist per top artist and pre-resolve its tracks."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return (
                 RecommendationFolder(
-                    item_id="artist_playlists",
+                    item_id="user_artist_playlists_monthly",
                     provider=self.instance_id,
                     name="Artist Playlists",
                     items=UniqueList([]),
@@ -705,7 +858,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         if not isinstance(top_artist_rows, list):
             return (
                 RecommendationFolder(
-                    item_id="artist_playlists",
+                    item_id="user_artist_playlists_monthly",
                     provider=self.instance_id,
                     name="Artist Playlists",
                     items=UniqueList([]),
@@ -873,7 +1026,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
 
         return (
             RecommendationFolder(
-                item_id="artist_playlists",
+                item_id="user_artist_playlists_monthly",
                 provider=self.instance_id,
                 name="Artist Playlists",
                 items=playlist_items,
@@ -885,10 +1038,10 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         self,
     ) -> RecommendationFolder:
         """Build the top artists recommendation folder."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
-                item_id="top_artists",
+                item_id="user_top_artists_monthly",
                 provider=self.instance_id,
                 name="Top Artists",
                 items=UniqueList([]),
@@ -901,7 +1054,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
         if not isinstance(top_artist_rows, list):
             return RecommendationFolder(
-                item_id="top_artists",
+                item_id="user_top_artists_monthly",
                 provider=self.instance_id,
                 name="Top Artists",
                 items=UniqueList([]),
@@ -924,7 +1077,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
 
         return RecommendationFolder(
-            item_id="top_artists",
+            item_id="user_top_artists_monthly",
             provider=self.instance_id,
             name="Top Artists",
             items=resolved_artists,
@@ -932,10 +1085,10 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
 
     async def _build_folder_recommendations(self) -> RecommendationFolder:
         """Build recommendations from LB-Radio recs prompt."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
-                item_id="recommendations",
+                item_id="user_recommendations",
                 provider=self.instance_id,
                 name="Recommendations",
                 items=UniqueList([]),
@@ -948,7 +1101,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
         if not isinstance(explore_tracks, list) or not explore_tracks:
             return RecommendationFolder(
-                item_id="recommendations",
+                item_id="user_recommendations",
                 provider=self.instance_id,
                 name="Recommendations",
                 items=UniqueList([]),
@@ -989,7 +1142,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
 
         return RecommendationFolder(
-            item_id="recommendations",
+            item_id="user_recommendations",
             provider=self.instance_id,
             name="Recommendations",
             items=resolved_tracks,
@@ -997,10 +1150,10 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
 
     async def _build_folder_top_tracks(self) -> RecommendationFolder:
         """Build the top tracks recommendation folder."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
-                item_id="top_tracks",
+                item_id="user_top_tracks_monthly",
                 provider=self.instance_id,
                 name="Top Tracks",
                 items=UniqueList([]),
@@ -1013,7 +1166,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
         if not isinstance(top_track_rows, list):
             return RecommendationFolder(
-                item_id="top_tracks",
+                item_id="user_top_tracks_monthly",
                 provider=self.instance_id,
                 name="Top Tracks",
                 items=UniqueList([]),
@@ -1045,7 +1198,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
 
         return RecommendationFolder(
-            item_id="top_tracks",
+            item_id="user_top_tracks_monthly",
             provider=self.instance_id,
             name="Top Tracks",
             items=resolved_tracks,
@@ -1053,10 +1206,10 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
 
     async def _build_folder_recent_listens(self) -> RecommendationFolder:
         """Build artists from the user's most recent listens."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
-                item_id="recent_listens",
+                item_id="user_recent_artists",
                 provider=self.instance_id,
                 name="Recent Listens",
                 items=UniqueList([]),
@@ -1074,7 +1227,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
         if not isinstance(recent_listens, list) or not recent_listens:
             return RecommendationFolder(
-                item_id="recent_listens",
+                item_id="user_recent_artists",
                 provider=self.instance_id,
                 name="Recent Listens",
                 items=UniqueList([]),
@@ -1146,7 +1299,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         )
 
         return RecommendationFolder(
-            item_id="recent_listens",
+            item_id="user_recent_artists",
             provider=self.instance_id,
             name="Recent Listens",
             items=resolved_artists,
@@ -1156,7 +1309,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         self,
     ) -> list[RecommendationFolder]:
         """Build a top-level similar-artists folder for each seed artist."""
-        username = self.config.get_value(CONF_USERNAME)
+        username = self.get_setup_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return []
 
@@ -1263,7 +1416,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
             )
             result.append(
                 RecommendationFolder(
-                    item_id=f"similar_artists_{folder_slug}",
+                    item_id=f"user_similar_artists_{folder_slug}_monthly",
                     provider=self.instance_id,
                     name=f"Similar Artists for {seed_artist_name}",
                     items=UniqueList(resolved_artists),
@@ -1293,7 +1446,7 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         if cover_image_png:
             collage_dir = os.path.join(self.mass.cache_path, "collage_images")
             await asyncio.to_thread(os.makedirs, collage_dir, exist_ok=True)
-            filename = f"lb_{item_id}.png"
+            filename = f"lb_{item_id}_{sha256(cover_image_png).hexdigest()}.png"
             file_path = os.path.join(collage_dir, filename)
             await asyncio.to_thread(_write_bytes, file_path, cover_image_png)
             playlist_kwargs["metadata"] = MediaItemMetadata(
@@ -1334,15 +1487,11 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         if cache_key in self._artist_cache:
             return self._artist_cache[cache_key]
 
-        try:
-            search_result = await self.mass.music.search(
-                search_query=artist_name,
-                media_types=[MediaType.ARTIST],
-                limit=10,
-            )
-        except Exception as err:  # noqa: BLE001
-            self.logger.debug("Artist resolve failed for '%s': %s", artist_name, err)
-            return None
+        search_result = await self.mass.music.search(
+            search_query=artist_name,
+            media_types=[MediaType.ARTIST],
+            limit=10,
+        )
         if not search_result.artists:
             return None
 
@@ -1370,15 +1519,11 @@ class ListenBrainzRecommendationsProvider(MetadataProvider):
         normalized_track = track_name
         normalized_artist = artist_name
         search_query = f"{artist_name} - {track_name}" if artist_name else track_name
-        try:
-            search_result = await self.mass.music.search(
-                search_query=search_query,
-                media_types=[MediaType.TRACK],
-                limit=10,
-            )
-        except Exception as err:  # noqa: BLE001
-            self.logger.debug("Track resolve failed for query '%s': %s", search_query, err)
-            return None
+        search_result = await self.mass.music.search(
+            search_query=search_query,
+            media_types=[MediaType.TRACK],
+            limit=10,
+        )
         if not search_result.tracks:
             return None
 
