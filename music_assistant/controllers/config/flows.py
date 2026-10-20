@@ -203,12 +203,18 @@ class SetupFlowMixin:
                 result={"instance_id": config.instance_id},
             )
         target_key = f"provider_setup:{provider_domain}"
-        user, _ = self._access_caller()
+        user, manages_all_sources = self._access_caller()
         if manifest.multi_instance and user is not None:
             # users add their own account of a multi-account service side by side,
             # so each user's add flow is its own target
             target_key = f"{target_key}:{user.user_id}"
-        context = SetupFlowContext(kind="setup", reason="user", domain=provider_domain)
+        context = SetupFlowContext(
+            kind="setup",
+            reason="user",
+            domain=provider_domain,
+            manages_all_sources=manages_all_sources,
+            user=user,
+        )
         return await self._start_flow(
             flow_coro=flow_module.run_setup,
             context=context,
@@ -223,7 +229,7 @@ class SetupFlowMixin:
         Start the reconfigure flow on an existing provider instance (covers reauth).
 
         A caller that does not manage every music source may only reconfigure a music
-        source it owns.
+        source it owns, of a provider that members may set up themselves.
 
         :param instance_id: The provider instance to reconfigure.
         """
@@ -234,12 +240,16 @@ class SetupFlowMixin:
         self._check_provider_manage_permission(instance_id)
         domain: str = raw_conf["domain"]
         manifest = self.mass.get_provider_manifest(domain)
+        if not manifest.self_service:
+            # reconfiguring such a provider picks what it reads from, as setting it up does
+            self._check_provider_setup_permission(manifest)
         owner = f"provider.{domain}"
         flow_module = await self._get_setup_flow_module(manifest)
         if flow_module is None:
             # flow-less providers have nothing to reconfigure;
             # their failures are environmental (reload/retry covers them)
             return self._synthesized_step(FlowStepType.ABORT, owner, reason="nothing_to_configure")
+        user, manages_all_sources = self._access_caller()
         context = SetupFlowContext(
             kind="reconfigure",
             reason=self._reconfigure_reason(raw_conf.get("last_error")),
@@ -247,6 +257,8 @@ class SetupFlowMixin:
             instance_id=instance_id,
             setup_data=self._decrypt_values(raw_conf.get("setup_data") or {}),
             values=self._decrypt_values(raw_conf.get("values") or {}),
+            manages_all_sources=manages_all_sources,
+            user=user,
         )
         return await self._start_flow(
             flow_coro=flow_module.run_setup,
@@ -454,7 +466,7 @@ class SetupFlowMixin:
             session.publish_abort("timed_out")
         except SetupFlowError as err:
             # the author did not catch a finish failure: end with the failure message
-            session.publish_abort(str(err) or "internal_error")
+            session.publish_abort(err)
         except asyncio.CancelledError:
             # abort/replace/shutdown: the author's cleanup (finally blocks) has run;
             # the canceller publishes the ABORT step. Never swallow the cancellation.
@@ -517,6 +529,8 @@ class SetupFlowMixin:
             raise SetupFlowError(
                 str(err) or err.__class__.__name__,
                 translation_key=getattr(err, "translation_key", None),
+                translation_args=getattr(err, "translation_args", None),
+                translation_owner=getattr(err, "translation_owner", None),
             ) from err
         session.finish_step_id = self._provider_finish_step_id(config.instance_id)
         return {"instance_id": config.instance_id}
@@ -545,6 +559,8 @@ class SetupFlowMixin:
             raise SetupFlowError(
                 str(err) or err.__class__.__name__,
                 translation_key=getattr(err, "translation_key", None),
+                translation_args=getattr(err, "translation_args", None),
+                translation_owner=getattr(err, "translation_owner", None),
             ) from err
         self.update_provider_last_error(instance_id, None)
         return {"instance_id": instance_id}
@@ -574,6 +590,8 @@ class SetupFlowMixin:
             raise SetupFlowError(
                 str(err) or err.__class__.__name__,
                 translation_key=getattr(err, "translation_key", None),
+                translation_args=getattr(err, "translation_args", None),
+                translation_owner=getattr(err, "translation_owner", None),
             ) from err
         self.mass.signal_event(EventType.PLAYER_CONFIG_UPDATED, object_id=player_id, data=config)
         return {"player_id": player_id}
