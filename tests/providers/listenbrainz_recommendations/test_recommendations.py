@@ -3,6 +3,7 @@
 import asyncio
 from datetime import UTC, date, datetime
 from types import MethodType
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,6 +27,9 @@ from music_assistant.providers.listenbrainz_recommendations import (
 )
 from music_assistant.providers.listenbrainz_recommendations.api_client import ListenBrainzAPIClient
 from music_assistant.providers.listenbrainz_recommendations.setup_flow import run_setup
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 async def test_recommendation_rows_do_not_include_items() -> None:
@@ -1207,3 +1211,55 @@ async def test_new_cover_does_not_overwrite_published_cover() -> None:
 
     assert previous.metadata.images[0].path != replacement.metadata.images[0].path
     assert write.call_args_list[1].args[1] != write.call_args_list[3].args[1]
+    for playlist in (previous, replacement):
+        image = playlist.metadata.images[0]
+        assert image.provider == provider.instance_id
+        assert image.path.startswith("lb_playlist_")
+        assert "/" not in image.path
+        assert not image.remotely_accessible
+
+
+async def test_generated_cover_resolves_through_provider(tmp_path: Path) -> None:
+    """Read a generated cover using the image reference published by the provider."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.instance_id = "listenbrainz-instance"
+    provider.domain = "listenbrainz_recommendations"
+    provider.mass = MagicMock()
+    provider.mass.cache_path = str(tmp_path)
+    cover_bytes = b"generated-cover"
+
+    playlist = await ListenBrainzRecommendationsProvider._create_virtual_playlist(
+        provider, "playlist", "Playlist", cover_bytes
+    )
+    image = playlist.metadata.images[0]
+
+    assert image.provider == provider.instance_id
+    assert await ListenBrainzRecommendationsProvider.resolve_image(provider, image.path) == (
+        cover_bytes
+    )
+
+
+@pytest.mark.parametrize("is_absolute", [False, True])
+async def test_resolve_cover_rejects_paths_outside_cache(
+    tmp_path: Path, is_absolute: bool
+) -> None:
+    """Refuse existing files outside the cover directory."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.mass = MagicMock()
+    provider.mass.cache_path = str(tmp_path)
+    outside_file = tmp_path / "outside.png"
+    outside_file.write_bytes(b"private-file")
+    image_path = str(outside_file) if is_absolute else "../outside.png"
+
+    with pytest.raises(FileNotFoundError, match="Invalid ListenBrainz cover path"):
+        await ListenBrainzRecommendationsProvider.resolve_image(provider, image_path)
+
+
+async def test_resolve_missing_cover_raises(tmp_path: Path) -> None:
+    """Report missing generated covers without falling back to another image source."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.mass = MagicMock()
+    provider.mass.cache_path = str(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="ListenBrainz cover not found"):
+        await ListenBrainzRecommendationsProvider.resolve_image(provider, "missing.png")

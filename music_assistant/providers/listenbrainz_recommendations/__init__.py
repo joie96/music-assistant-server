@@ -8,6 +8,7 @@ import re
 import unicodedata
 from functools import partial
 from hashlib import sha256
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from uuid import UUID
@@ -29,6 +30,7 @@ from music_assistant_models.media_items import (
 )
 
 from music_assistant.helpers.datetime import utc
+from music_assistant.helpers.security import is_safe_path
 from music_assistant.models.media_capabilities import MediaCatalogMixin
 from music_assistant.models.metadata_provider import MetadataProvider
 from music_assistant.providers.listenbrainz_recommendations.api_client import ListenBrainzAPIClient
@@ -197,6 +199,19 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
             raise MediaNotFoundError(f"Unknown ListenBrainz playlist: {prov_playlist_id}")
         _playlist, tracks = payload
         return tracks
+
+    async def resolve_image(self, path: str) -> bytes:
+        """Return the PNG bytes of a generated ListenBrainz playlist cover."""
+        def _read_image() -> bytes:
+            images_dir = (Path(self.mass.cache_path) / "collage_images").resolve()
+            file_path = (images_dir / path).resolve()
+            if not is_safe_path(str(file_path), str(images_dir)):
+                raise FileNotFoundError(f"Invalid ListenBrainz cover path: {path}")
+            if not file_path.is_file():
+                raise FileNotFoundError(f"ListenBrainz cover not found: {path}")
+            return file_path.read_bytes()
+
+        return await asyncio.to_thread(_read_image)
 
     async def resolve_provider_album_by_name(
         self, artist_name: str, album_name: str
@@ -1493,11 +1508,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         name: str,
         cover_image_png: bytes | None = None,
     ) -> Playlist:
-        """Create a minimal virtual playlist item.
-
-        The cover PNG (if provided) is saved to the server's collage_images
-        directory so it is served as a regular HTTP imageproxy URL.
-        """
+        """Create a virtual playlist with an optional provider-resolved cover."""
         playlist_kwargs: dict[str, Any] = {}
         if cover_image_png:
             collage_dir = os.path.join(self.mass.cache_path, "collage_images")
@@ -1510,8 +1521,8 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
                     [
                         MediaItemImage(
                             type=ImageType.THUMB,
-                            path=f"/collage/{filename}",
-                            provider="builtin",
+                            path=filename,
+                            provider=self.instance_id,
                             remotely_accessible=False,
                         )
                     ]
