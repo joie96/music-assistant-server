@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -1216,6 +1217,203 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         )
         await prepare
         assert self.session.next.accepted
+
+    async def test_unapplied_prepare_resumes_previous_revision_and_reissues_after_welcome(
+        self,
+    ) -> None:
+        """A missing B command preserves A and is retried behind the new welcome."""
+        prepare, resume, payload = await self.prepare_without_receipt()
+        current = self.session.current
+        successor = self.session.next
+        assert current is not None
+        assert successor is not None
+        previous_revision = resume.media_revision
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        self.messages.clear()
+        welcome = await self.session.connect(
+            Hello("device", "Client", "0.1.0", resume, capabilities, AudioProfileId.FLAC),
+            self.send,
+            "test",
+        )
+        await prepare
+        assert not self.messages
+        assert welcome.current_stream == self.session.snapshot(current)
+        assert welcome.prepared_next is None
+        assert welcome.media_revision == previous_revision
+        assert self.session.current is current
+        assert self.session.next is successor
+        assert not successor.accepted
+        assert not self.session.buffer.enabled
+        self.sent.clear()
+        reissue = self.spawn(self.session.after_welcome())
+        await self.sent.wait()
+        assert self.session.pending is not None
+        replacement = self.session.pending.payload
+        assert isinstance(replacement, SetMedia)
+        assert replacement.media_revision == payload.media_revision
+        assert replacement.current == payload.current
+        assert replacement.prepared == payload.prepared
+        assert not successor.accepted
+        await self.session.report(CommandAck(replacement.command_id, "accepted", None))
+        await reissue
+        assert successor.accepted
+        assert self.session.current is current
+        self.stop.assert_not_awaited()
+
+    async def test_unapplied_prepare_survives_repeated_disconnects_and_pause(self) -> None:
+        """Repeated losses preserve a local pause and keep B behind its acceptance barrier."""
+        prepare, resume, payload = await self.prepare_without_receipt()
+        resume = replace(resume, output_state="paused")
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        successor = self.session.next
+        assert successor is not None
+        for attempt in range(3):
+            welcome = await self.session.connect(
+                Hello("device", "Client", "0.1.0", resume, capabilities, AudioProfileId.FLAC),
+                self.send,
+                "test",
+            )
+            await prepare
+            assert welcome.media_revision == resume.media_revision
+            assert welcome.desired_output_state == "paused"
+            assert welcome.prepared_next is None
+            self.session.bind_audio(
+                AudioHello("device", welcome.audio_binding_id, 1, resume.received_streams),
+                AsyncMock(),
+            )
+            self.session.audio_ready()
+            await self.session.report(BufferStatus(1, 1, 262144))
+            assert not self.session.buffer.enabled
+            if attempt == 0:
+                await self.session.control_lost()
+                continue
+            self.sent.clear()
+            reissue = self.spawn(self.session.after_welcome())
+            await self.sent.wait()
+            assert self.session.pending is not None
+            replacement = self.session.pending.payload
+            assert isinstance(replacement, SetMedia)
+            assert replacement.media_revision == payload.media_revision
+            assert replacement.initial_output_state == "paused"
+            assert not successor.accepted
+            if attempt == 1:
+                await self.session.control_lost()
+                continue
+            await self.session.report(CommandAck(replacement.command_id, "accepted", None))
+            await reissue
+            assert successor.accepted
+            assert not self.session.buffer.enabled
+            await self.session.report(BufferStatus(2, 1, 262144))
+            assert self.session.buffer.enabled
+            with pytest.raises(ProtocolViolation, match="Registered playback context was lost"):
+                self.session._cursors(resume.received_streams)
+        assert self.session.output_state == "paused"
+        self.stop.assert_not_awaited()
+
+    async def test_unapplied_prepare_rejects_inconsistent_resume(self) -> None:
+        """Only the exact previous revision with valid A-only receipts can be retried."""
+        _, resume, _ = await self.prepare_without_receipt()
+        successor = self.session.next
+        assert successor is not None
+        current_cursor = resume.received_streams[0]
+        invalid_states = (
+            replace(resume, media_revision=resume.media_revision - 1),
+            replace(resume, media_revision=self.session.media_revision),
+            replace(resume, current_stream_id=successor.descriptor.stream_id),
+            replace(resume, received_streams=[]),
+            replace(resume, received_streams=[current_cursor, current_cursor]),
+            replace(resume, received_streams=[replace(current_cursor, next_chunk_index=2)]),
+            replace(
+                resume,
+                received_streams=[
+                    current_cursor,
+                    ClientStreamCursor(successor.descriptor.stream_id, 1),
+                ],
+            ),
+            replace(resume, position_frame=1),
+        )
+        for state in invalid_states:
+            with self.subTest(state=state), pytest.raises(ProtocolViolation):
+                await self.session._reconcile(state)
+            assert self.session.pending is not None
+            assert self.session.reissue_media is None
+            assert not successor.accepted
+        self.adapter.valid.return_value = False
+        with pytest.raises(ProtocolViolation, match="successor revision"):
+            await self.session._reconcile(resume)
+        assert self.session.reissue_media is None
+        self.adapter.valid.side_effect = [True, False]
+        with pytest.raises(ProtocolViolation, match="current playback identity"):
+            await self.session._reconcile(resume)
+        assert self.session.reissue_media is None
+
+    async def test_unapplied_prepare_rechecks_authority_after_welcome(self) -> None:
+        """A queue change before reissue cannot revive the previously authorized target."""
+        prepare, resume, _ = await self.prepare_without_receipt()
+        await self.session._reconcile(resume)
+        await prepare
+        self.adapter.valid.return_value = False
+        self.messages.clear()
+        with pytest.raises(ProtocolViolation, match="no longer authorized"):
+            await self.session.after_welcome()
+        assert not self.messages
+        assert self.session.pending is None
+
+    async def test_unapplied_prepare_does_not_override_local_stop(self) -> None:
+        """An offline local stop revokes A and the still-unapplied successor command."""
+        prepare, resume, _ = await self.prepare_without_receipt()
+        resume = replace(resume, current_stream_id=None, output_state="idle", received_streams=[])
+        await self.session._reconcile(resume)
+        with pytest.raises(ProtocolViolation):
+            await prepare
+        assert self.session.current is None
+        assert self.session.next is None
+        assert self.session.pending is None
+        assert self.session.reissue_media is None
+        self.messages.clear()
+        await self.session.after_welcome()
+        assert not self.messages
+        self.stop.assert_awaited_once()
+
+    async def prepare_without_receipt(
+        self,
+    ) -> tuple[asyncio.Task[None], ClientResumeState, SetMedia]:
+        """Disconnect before the client applies the first successor command."""
+        await self.accept_load()
+        current = self.session.current
+        assert current is not None
+        previous_revision = self.session.media_revision
+        self.sent.clear()
+        context = cast(
+            "PlaybackContext",
+            SimpleNamespace(
+                media=SimpleNamespace(),
+                queue_id="mashin_test",
+                queue_item_id="next-item",
+                session_id="ma-session",
+                seek_seconds=0,
+                item=SimpleNamespace(duration=200),
+            ),
+        )
+        prepare = self.spawn(self.session.prepare(context))
+        await self.sent.wait()
+        successor = self.session.next
+        assert successor is not None
+        assert self.session.pending is not None
+        payload = self.session.pending.payload
+        assert isinstance(payload, SetMedia)
+        await self.session.control_lost()
+        resume = ClientResumeState(
+            current.descriptor.stream_id,
+            0,
+            "buffering",
+            0,
+            50,
+            False,
+            previous_revision,
+            [ClientStreamCursor(current.descriptor.stream_id, 1)],
+        )
+        return prepare, resume, payload
 
     async def prepare_transition(self) -> tuple[str, str]:
         """Retain completed A and one actually offered, unacknowledged B chunk."""

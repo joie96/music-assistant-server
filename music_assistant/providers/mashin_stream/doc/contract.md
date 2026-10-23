@@ -809,8 +809,12 @@ Ein manueller Beleg erklaert keinen regulaeren A-Abschluss.
 Meldet der Client noch den vorherigen gueltigen Zustand, bleibt nur der konkrete,
 weiterhin autorisierte MA-Zielauftrag erhalten. Nach welcome denselben Sollzustand
 mit seiner media_revision und frischer command_id senden. Gleiche Revision mit
-identischem Payload ist idempotent. Ein lokal bekannter Stop gewinnt und loest
-Cleanup aus. Widerspruechliche Revisionen/Slots explizit ablehnen. Pending-Daten
+identischem Payload ist idempotent. Bei noch nicht angenommenem B bestaetigt
+welcome den vorherigen A-only-Zustand mit dessen Revision und prepared_next=null.
+Auch AudioHello darf bis zur erneuten Commandannahme nur den A-Cursor enthalten;
+B bleibt unbestaetigt und die Audio-/Kapazitaetsbarriere geschlossen. Eine lokal
+gemeldete Pause bleibt beim erneuten set_media erhalten. Ein lokal bekannter Stop
+gewinnt und loest Cleanup aus. Widerspruechliche Revisionen/Slots explizit ablehnen. Pending-Daten
 nach eindeutiger Entscheidung freigeben.
 
 Verlorenes track_ended ohne Promotion vor welcome einmalig abstimmen:
