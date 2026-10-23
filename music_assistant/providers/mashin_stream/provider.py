@@ -30,6 +30,8 @@ from .models import (
     EmptyPayload,
     ErrorMessage,
     Hello,
+    PlayerState,
+    TrackStarted,
     decode_envelope,
     decode_message,
     encode_message,
@@ -318,7 +320,7 @@ class MashinStreamDevice:
                 welcome = await self.session.connect(hello, send, self.provider.server_revision)
                 await send("welcome", welcome)
                 welcome_sent = True
-                self._spawn(self.session.after_welcome())
+                self._spawn(self._after_welcome())
             epoch = self.session.epoch
             worker = self._spawn(self._reports(socket, queue))
             pinger = self._spawn(self._pings(request, socket, expected, pong))
@@ -451,6 +453,8 @@ class MashinStreamDevice:
                 if self.control_socket is not socket:
                     return
                 await self.session.report(report, received_order=received_order)
+                if isinstance(report, (PlayerState, TrackStarted)):
+                    await self._queue_changed()
         except ProtocolViolation as err:
             self.player.logger.debug(
                 "Client report rejected for player %s: %s", self.player.player_id, err.code
@@ -587,7 +591,13 @@ class MashinStreamDevice:
         if paused:
             await self.mass.player_queues.pause(self.player.player_id)
 
-    async def _queue_changed(self, event: MassEvent) -> None:
+    async def _after_welcome(self) -> None:
+        epoch = self.session.epoch
+        await self.session.after_welcome()
+        if self.session.epoch == epoch:
+            await self._queue_changed()
+
+    async def _queue_changed(self, event: MassEvent | None = None) -> None:
         del event
         run = self.session.next
         current = self.session.current
@@ -606,7 +616,8 @@ class MashinStreamDevice:
                 and data.queue.current_item is current.context.item
                 and self.session.adapter.reauthorize_successor(
                     run.context, replace(current.context, session_id=data.session_id)
-                ) is not None
+                )
+                is not None
             ):
                 return
         if (
@@ -617,6 +628,31 @@ class MashinStreamDevice:
             )
         ):
             await self.session.clear_next()
+        if (
+            current is None
+            or current is not self.session.current
+            or current.error is not None
+            or self.session.closed
+            or self.session.send_control is None
+            or self.session.pending is not None
+            or self.session.next is not None
+            or self.session.output_state not in ("playing", "buffering")
+            or not self.session.adapter.valid(current.context)
+        ):
+            return
+        data = self.mass.player_queues.queue_data_or_none(current.context.queue_id)
+        if data is None or data.queue.current_item is not current.context.item:
+            return
+        if (
+            current.ended
+            and self.mass.player_queues.get_next_item(
+                current.context.queue_id, current.context.queue_item_id
+            )
+            is None
+        ):
+            await self.session.control("stop")
+            return
+        self.mass.player_queues.update_next_item_on_player(current.context.queue_id, force=True)
 
     async def _disable(self) -> None:
         self.player.logger.info("Mashin player %s disabled", self.player.player_id)

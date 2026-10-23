@@ -827,6 +827,13 @@ einen schon abgeschlossenen niemals wiederholen. Dies verlangt keinen alten
 A-Descriptor fuer die B-Startpruefung. Kleine Abschluss-/Freigabemetadaten bis
 zur Abstimmung erhalten; Stop, Fehler oder ersetzender Load sind kein Endnachweis.
 
+Nach welcome, Queue-Ereignissen und validierten Ausgabe-/Promotionsreports eine
+fehlende Nachfolgeruebergabe erneut ueber MA anfordern. Nur bei weiterhin
+gueltiger aktueller Session und von MA bestaetigtem aktuellen Item, ohne offenen
+Playback-Befehl und ohne registrierten B. Die bestehende MA-Uebergabe darf dabei
+erneut angefordert werden, auch wenn MA B schon als enqueued gespeichert hat.
+Keinen Queue-Next, neuen A-Load oder vorgezogenen B-Start daraus erzeugen.
+
 welcome.payload hat genau player_id, provider_version, server_revision, limits,
 audio_profiles, selected_audio_profile, audio_binding_id, current_stream,
 desired_output_state, media_revision und prepared_next. current_stream/prepared_next
@@ -2072,6 +2079,13 @@ player_state melden: ended ohne weitere Wiedergabe, buffering bei beabsichtigter
 Fortsetzung ohne nutzbares Audio. B-Start spaeter separat melden; A-Ende bleibt
 idempotent und wird nicht wiederholt angewendet. Kein kuenstlicher idle/ended-
 Zwischenzustand bei direkt angeschlossenen Tracks. Best Effort, kein Gapless-Feature.
+
+Bei fortbestehender Wiedergabeabsicht bleibt der Client auch nach lokalem A-Ende
+ohne Verbindung oder nutzbaren B in buffering. Pause und Stop gewinnen weiterhin.
+B kann nach dem Reconnect spaet eintreffen und wird nach derselben Freigabe
+gestartet, ohne A-Ende zu wiederholen. Bestaetigt MA dagegen nach validiertem
+realem A-Ende, dass kein Nachfolger existiert, beendet der Provider das Warten
+mit dem bestehenden Stop-Befehl.
 
 set_media mit unveraendertem current und prepared=null widerruft B, sperrt dessen
 Produktion und Lieferung und erhaelt die A-Ausgabe durch deren unveraenderte ID.

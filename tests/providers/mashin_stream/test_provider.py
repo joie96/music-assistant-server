@@ -37,6 +37,7 @@ from music_assistant.providers.mashin_stream.models import (
     ClientCapabilities,
     Hello,
     OutputFormat,
+    PlayerState,
     Welcome,
     encode_message,
     parse_model,
@@ -593,6 +594,109 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 if device.cleanup_task is not None:
                     await asyncio.wait_for(device.cleanup_task, 1)
         self.mass.players.unregister.assert_awaited_once_with(device.player.player_id)
+
+    async def test_missing_successor_is_refreshed_after_welcome_and_queue_updates(self) -> None:
+        """A retained current item can recover a lost MA successor handover."""
+        device = await self._device("desktop")
+        context = SimpleNamespace(queue_id=device.player.player_id, item=Mock())
+        device.session.current = Mock(context=context, ended=False, error=None)
+        device.session.next = None
+        device.session.pending = None
+        device.session.send_control = AsyncMock()
+        self.mass.player_queues.queue_data_or_none.return_value = SimpleNamespace(
+            queue=SimpleNamespace(current_item=context.item)
+        )
+        with (
+            patch.object(device.session.adapter, "valid", return_value=True),
+            patch.object(device.session, "after_welcome", AsyncMock()),
+        ):
+            for output_state in ("playing", "buffering"):
+                device.session.output_state = output_state
+                self.mass.player_queues.update_next_item_on_player.reset_mock()
+                await device._after_welcome()
+                self.mass.player_queues.update_next_item_on_player.assert_called_once_with(
+                    context.queue_id, force=True
+                )
+                self.mass.player_queues.update_next_item_on_player.reset_mock()
+                await device._queue_changed()
+                self.mass.player_queues.update_next_item_on_player.assert_called_once_with(
+                    context.queue_id, force=True
+                )
+        device.session.current = None
+
+    async def test_successor_refresh_does_not_override_commands_or_stale_playback(self) -> None:
+        """Only a connected, settled current queue item may request another handover."""
+        device = await self._device("desktop")
+        context = SimpleNamespace(queue_id=device.player.player_id, item=Mock())
+        with patch.object(device.session.adapter, "valid", return_value=True):
+            for condition in ("disconnected", "pending", "paused", "stale", "prepared"):
+                with self.subTest(condition=condition):
+                    device.session.current = Mock(context=context, ended=False, error=None)
+                    device.session.next = Mock(context=context) if condition == "prepared" else None
+                    device.session.pending = Mock() if condition == "pending" else None
+                    device.session.send_control = (
+                        None if condition == "disconnected" else AsyncMock()
+                    )
+                    device.session.output_state = "paused" if condition == "paused" else "buffering"
+                    self.mass.player_queues.queue_data_or_none.return_value = SimpleNamespace(
+                        queue=SimpleNamespace(
+                            current_item=Mock() if condition == "stale" else context.item
+                        )
+                    )
+                    self.mass.player_queues.update_next_item_on_player.reset_mock()
+                    await device._queue_changed()
+                    self.mass.player_queues.update_next_item_on_player.assert_not_called()
+        device.session.current = device.session.next = device.session.pending = None
+
+    async def test_confirmed_queue_end_stops_waiting_instead_of_refreshing(self) -> None:
+        """A fully played final queue item is not left buffering indefinitely."""
+        device = await self._device("desktop")
+        context = SimpleNamespace(
+            queue_id=device.player.player_id, queue_item_id="last-item", item=Mock()
+        )
+        device.session.current = Mock(context=context, ended=True, error=None)
+        device.session.next = None
+        device.session.send_control = AsyncMock()
+        device.session.output_state = "buffering"
+        self.mass.player_queues.queue_data_or_none.return_value = SimpleNamespace(
+            queue=SimpleNamespace(current_item=context.item)
+        )
+        self.mass.player_queues.get_next_item.return_value = None
+        with (
+            patch.object(device.session.adapter, "valid", return_value=True),
+            patch.object(device.session, "control", AsyncMock()) as stop,
+        ):
+            await device._queue_changed()
+            stop.assert_awaited_once_with("stop")
+            self.mass.player_queues.update_next_item_on_player.assert_not_called()
+        device.session.current = None
+
+    async def test_player_report_retries_successor_refresh_without_a_queue_change(self) -> None:
+        """Repeated valid state reports recover a handover the core could not deliver."""
+        device = await self._device("desktop")
+        socket = Mock()
+        device.control_socket = socket
+        reports: asyncio.Queue[tuple[int, object]] = asyncio.Queue()
+        report = PlayerState(1, "stream", 0, "buffering", 48000, 50, False, None)
+        await reports.put((1, report))
+        refreshed = asyncio.Event()
+
+        async def refresh() -> None:
+            refreshed.set()
+
+        with (
+            patch.object(device.session, "report", AsyncMock()) as accept,
+            patch.object(device, "_queue_changed", side_effect=refresh) as retry,
+        ):
+            task = asyncio.create_task(device._reports(socket, reports))
+            try:
+                await asyncio.wait_for(refreshed.wait(), 1)
+                accept.assert_awaited_once_with(report, received_order=1)
+                retry.assert_awaited_once()
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                device.control_socket = None
 
     async def test_capture_verbose_identifies_rejected_queue_context(self) -> None:
         """Rejected contexts log discriminating fields without exposing source URLs."""

@@ -1242,6 +1242,48 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.session.buffer.streams[successor].highest_offered = 1
         return current, successor
 
+    async def test_finished_current_resumes_buffering_and_accepts_late_successor(self) -> None:
+        """A real offline end retains A until MA supplies the missing successor."""
+        await self.accept_load()
+        run = self.session.current
+        assert run is not None
+        identifier = run.descriptor.stream_id
+        stream = self.session.buffer.streams[identifier]
+        stream.final_index = 1
+        stream.final_frame_count = stream.produced_frames = 48000
+        stream.next_received = stream.next_produced = 2
+        stream.highest_offered = 1
+        resume = ClientResumeState(
+            identifier,
+            0,
+            "buffering",
+            48000,
+            50,
+            False,
+            self.session.media_revision,
+            [ClientStreamCursor(identifier, 2)],
+        )
+        capabilities = ClientCapabilities(list(AudioProfileId), [48000], [16], 2, True, True, True)
+        await self.session.connect(
+            Hello("device", "Client", "0.1.0", resume, capabilities, AudioProfileId.FLAC),
+            self.send,
+            "test",
+        )
+        assert self.session.current is run
+        assert run.ended
+        assert self.session.output_state == "buffering"
+        self.stop.assert_not_awaited()
+        self.sent.clear()
+        prepare = self.spawn(self.session.prepare(self.context))
+        await self.sent.wait()
+        assert self.session.pending is not None
+        await self.session.report(CommandAck(self.session.pending.command_id, "accepted", None))
+        await prepare
+        assert self.session.current is run
+        assert self.session.next is not None
+        assert self.session.next.accepted
+        assert self.session.tombstones.count(identifier) == 1
+
     async def test_manual_activation_resumes_without_final_a_or_duplicate_switch(self) -> None:
         """An offline manual skip consumes B once without inventing a natural A end."""
         current, successor = await self.prepare_transition()
