@@ -837,6 +837,10 @@ gueltiger aktueller Session und von MA bestaetigtem aktuellen Item, ohne offenen
 Playback-Befehl und ohne registrierten B. Die bestehende MA-Uebergabe darf dabei
 erneut angefordert werden, auch wenn MA B schon als enqueued gespeichert hat.
 Keinen Queue-Next, neuen A-Load oder vorgezogenen B-Start daraus erzeugen.
+Wiederholte Reports duerfen eine bereits geplante MA-Uebergabe nicht durch
+erneutes Debouncing verschieben. Je Control-Epoche und aktuellem Stream
+hoechstens alle 5 s erneut anfordern; waehrend einer laufenden providerseitigen
+Nachfolgeraufloesung keinen weiteren Versuch planen.
 
 welcome.payload hat genau player_id, provider_version, server_revision, limits,
 audio_profiles, selected_audio_profile, audio_binding_id, current_stream,
@@ -849,6 +853,13 @@ zufaelliger Entropie. limits/audio_profiles/selected_audio_profile sind die in
 Abschnitt 5 definierten Typen; media_revision ist ein nichtnegativer Integer.
 Caps/Pflichtprofile vor Annahme pruefen. Welcome ist kein Autoplay; Sollzustand
 und Streamidentitaet gegen lokalen Zustand validieren.
+Welcome gegen den tatsaechlich gesendeten hello-Snapshot validieren, nicht gegen
+eine inzwischen weitergelaufene lokale Ausgabe. Nach hello entstandene End-,
+Promotions- und Zustandsreports vor AudioHello senden. Dessen Cursor stammen aus
+demselben Snapshot wie diese Reports. Provider arbeitet bereits eingegangene
+Controlreports vor der Audiobindung ab; ein inzwischen nach validierter Promotion
+verworfener bekannter A-Cursor darf ignoriert werden. Unbekannte Cursor oder
+fehlende weiterhin registrierte Streams bleiben Fehler.
 
 Client wartet ab hello-Sendebeginn hoechstens welcome_timeout_seconds auf ein
 gueltiges welcome. Provider begrenzt seine Handshake-/Reconciliationarbeit ab
@@ -887,6 +898,10 @@ data ab dem validierten Cursor liefern, kein separater Streamabruf. Control-
 Epoche, Clientvorrat und Stream bleiben unveraendert. Keine Quelle allein durch
 Binding starten. Identischer Reconnectrequest liefert gleiche noch unverbrauchte
 Bindung; verbrauchte/abgelaufene ID verlangt neue request_id. Maximal ein Request.
+Ein retrybarer stream_unavailable fuer die aktuelle Audioverbindung verwendet
+denselben Audio-only-Reconnect, ohne Control oder gueltigen Cache zu ersetzen.
+Verspaetete Fehler einer alten Audioverbindung ignorieren. Bei fehlender Binding-
+Antwort oder fehlgeschlagenem Audioaufbau bleibt der Control-Reconnect zulaessig.
 
 Client wartet ab erstem Sendebeginn des Requests hoechstens
 audio_binding_response_timeout_seconds auf die zugeordnete audio_binding;

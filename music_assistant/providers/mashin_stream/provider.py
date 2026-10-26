@@ -226,9 +226,13 @@ class MashinStreamDevice:
         self.control_request: web.Request | None = None
         self.audio_request: web.Request | None = None
         self.control_workers: set[asyncio.Task[None]] = set()
+        self.control_reports: asyncio.Queue[tuple[int, object]] | None = None
         self.retired_sockets: dict[web.WebSocketResponse, asyncio.Task[None]] = {}
         self.handshake_lock = asyncio.Lock()
         self.cleanup_task: asyncio.Task[None] | None = None
+        self.successor_refresh_key: tuple[str | None, int, str] | None = None
+        self.successor_refresh_after = 0.0
+        self.successor_preparing = False
         self.player = MashinStreamPlayer(provider, self, binding.player_id, binding.name)
         self.session = MashinStreamSession(
             MAAdapter(self.mass, self.player),
@@ -307,6 +311,7 @@ class MashinStreamDevice:
                 await self._close_audio()
                 self.control_socket = socket
                 self.control_request = request
+                self.control_reports = queue
 
                 async def send(kind: str, payload: object) -> None:
                     async with control_lock:
@@ -365,6 +370,7 @@ class MashinStreamDevice:
             if self.control_socket is socket:
                 self.control_socket = None
                 self.control_request = None
+                self.control_reports = None
                 await self.session.control_lost()
                 await self._close_audio()
                 self.player.connected(False)
@@ -395,6 +401,9 @@ class MashinStreamDevice:
                         raise ConnectionError("Stale Audio connection")
                     await socket.send_bytes(data)
 
+                if self.control_reports is not None:
+                    async with asyncio.timeout(5):
+                        await self.control_reports.join()
                 self.session.bind_audio(hello, send)
                 previous, self.audio_socket = self.audio_socket, socket
                 previous_request, self.audio_request = self.audio_request, request
@@ -450,17 +459,29 @@ class MashinStreamDevice:
         try:
             while self.control_socket is socket:
                 received_order, report = await queue.get()
-                if self.control_socket is not socket:
-                    return
-                await self.session.report(report, received_order=received_order)
-                if isinstance(report, (PlayerState, TrackStarted)):
-                    await self._queue_changed()
-        except ProtocolViolation as err:
+                try:
+                    if self.control_socket is not socket:
+                        return
+                    await self.session.report(report, received_order=received_order)
+                    if isinstance(report, (PlayerState, TrackStarted)):
+                        await self._queue_changed()
+                finally:
+                    queue.task_done()
+        except (ProtocolViolation, ConnectionError, OSError) as err:
             self.player.logger.debug(
-                "Client report rejected for player %s: %s", self.player.player_id, err.code
+                "Client report rejected for player %s: %s",
+                self.player.player_id,
+                err.code if isinstance(err, ProtocolViolation) else type(err).__name__,
             )
-            await self._error(socket, err.code)
-            await socket.close()
+            if isinstance(err, ProtocolViolation):
+                with suppress(ConnectionError, OSError):
+                    await self._error(socket, err.code)
+            async with self.handshake_lock:
+                if self.control_socket is socket:
+                    await self._close_control()
+                    await self._close_audio()
+                    self.player.connected(False)
+            self._retire_socket(socket)
 
     async def _pings(
         self,
@@ -524,6 +545,7 @@ class MashinStreamDevice:
 
     async def _close_control(self) -> None:
         socket, self.control_socket = self.control_socket, None
+        self.control_reports = None
         request, self.control_request = self.control_request, None
         workers = tuple(self.control_workers)
         self.control_workers.clear()
@@ -636,6 +658,7 @@ class MashinStreamDevice:
             or self.session.send_control is None
             or self.session.pending is not None
             or self.session.next is not None
+            or self.successor_preparing
             or self.session.output_state not in ("playing", "buffering")
             or not self.session.adapter.valid(current.context)
         ):
@@ -652,6 +675,12 @@ class MashinStreamDevice:
         ):
             await self.session.control("stop")
             return
+        key = (self.session.epoch, self.session.generation, current.descriptor.stream_id)
+        now = asyncio.get_running_loop().time()
+        if self.successor_refresh_key == key and now < self.successor_refresh_after:
+            return
+        self.successor_refresh_key = key
+        self.successor_refresh_after = now + 5
         self.mass.player_queues.update_next_item_on_player(current.context.queue_id, force=True)
 
     async def _disable(self) -> None:

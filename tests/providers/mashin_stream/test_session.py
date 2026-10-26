@@ -1440,6 +1440,51 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         self.session.buffer.streams[successor].highest_offered = 1
         return current, successor
 
+    async def test_audio_binding_accepts_cursor_snapshot_before_confirmed_promotion(self) -> None:
+        """A delayed AudioHello may retain A only when its promotion was already validated."""
+        current, successor = await self.prepare_transition()
+        self.session.buffer.resume(successor, 2)
+        self.session._ended(current)
+        self.session._promote(TrackStarted(1, successor, self.session.media_revision, 0, 0))
+        await self.session.audio_lost()
+        self.session.binding = self.session._issue_binding()
+        self.session.bind_audio(
+            AudioHello(
+                "device",
+                self.session.binding,
+                2,
+                [ClientStreamCursor(current, 2), ClientStreamCursor(successor, 2)],
+            ),
+            AsyncMock(),
+        )
+        assert set(self.session.buffer.streams) == {successor}
+        assert self.session.buffer.audio_connection_id == 2
+
+    async def test_audio_binding_still_requires_active_cursors_and_rejects_unknown_streams(
+        self,
+    ) -> None:
+        """An ended but registered A remains mandatory; unrelated receipts remain invalid."""
+        current, successor = await self.prepare_transition()
+        self.session._ended(current)
+        for connection_id, cursors in enumerate(
+            (
+                [ClientStreamCursor(successor, 1)],
+                [
+                    ClientStreamCursor(current, 2),
+                    ClientStreamCursor(successor, 1),
+                    ClientStreamCursor("00000000-0000-4000-8000-000000000099", 1),
+                ],
+            ),
+            start=2,
+        ):
+            with self.subTest(connection_id=connection_id):
+                self.session.binding = self.session._issue_binding()
+                with pytest.raises(ProtocolViolation):
+                    self.session.bind_audio(
+                        AudioHello("device", self.session.binding, connection_id, cursors),
+                        AsyncMock(),
+                    )
+
     async def test_finished_current_resumes_buffering_and_accepts_late_successor(self) -> None:
         """A real offline end retains A until MA supplies the missing successor."""
         await self.accept_load()

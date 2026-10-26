@@ -83,6 +83,7 @@ class MashinStreamPlayer(Player):
             session.next.context.queue_item_id if session.next is not None else None,
         )
         stage = "capture"
+        self.device.successor_preparing = True
         try:
             current = session.current
             generation = session.generation
@@ -111,6 +112,8 @@ class MashinStreamPlayer(Player):
                 str(err),
             )
             raise PlayerCommandFailed(str(err)) from err
+        finally:
+            self.device.successor_preparing = False
         self.logger.log(
             VERBOSE_LOG_LEVEL,
             "Next-track prepare completed player=%s item=%s",

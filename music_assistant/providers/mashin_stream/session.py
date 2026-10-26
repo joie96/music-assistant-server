@@ -268,7 +268,12 @@ class MashinStreamSession:
         self.audio_counter = hello.audio_connection_id
         self.binding_consumed = True
         self._cursors(
-            hello.received_streams,
+            [
+                cursor
+                for cursor in hello.received_streams
+                if cursor.stream_id in self.buffer.streams
+                or cursor.stream_id not in self.tombstones
+            ],
             unregistered_next=(
                 self.next is not None
                 and not self.next.accepted

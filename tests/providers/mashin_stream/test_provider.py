@@ -619,9 +619,32 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 )
                 self.mass.player_queues.update_next_item_on_player.reset_mock()
                 await device._queue_changed()
-                self.mass.player_queues.update_next_item_on_player.assert_called_once_with(
-                    context.queue_id, force=True
-                )
+                self.mass.player_queues.update_next_item_on_player.assert_not_called()
+                device.successor_refresh_key = None
+        device.session.current = None
+
+    async def test_successor_reports_do_not_debounce_pending_handover(self) -> None:
+        """Frequent state reports leave the scheduled MA successor handover intact."""
+        device = await self._device("desktop")
+        context = SimpleNamespace(queue_id=device.player.player_id, item=Mock())
+        device.session.current = Mock(context=context, ended=False, error=None)
+        device.session.send_control = AsyncMock()
+        device.session.output_state = "buffering"
+        self.mass.player_queues.queue_data_or_none.return_value = SimpleNamespace(
+            queue=SimpleNamespace(current_item=context.item)
+        )
+        with patch.object(device.session.adapter, "valid", return_value=True):
+            for _ in range(40):
+                await device._queue_changed()
+            self.mass.player_queues.update_next_item_on_player.assert_called_once_with(
+                context.queue_id, force=True
+            )
+            device.successor_refresh_after = 0
+            await device._queue_changed()
+            assert self.mass.player_queues.update_next_item_on_player.call_count == 2
+            device.session.epoch = "new-connection"
+            await device._queue_changed()
+            assert self.mass.player_queues.update_next_item_on_player.call_count == 3
         device.session.current = None
 
     async def test_successor_refresh_does_not_override_commands_or_stale_playback(self) -> None:
@@ -629,8 +652,16 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
         device = await self._device("desktop")
         context = SimpleNamespace(queue_id=device.player.player_id, item=Mock())
         with patch.object(device.session.adapter, "valid", return_value=True):
-            for condition in ("disconnected", "pending", "paused", "stale", "prepared"):
+            for condition in (
+                "disconnected",
+                "pending",
+                "paused",
+                "stale",
+                "prepared",
+                "preparing",
+            ):
                 with self.subTest(condition=condition):
+                    device.successor_preparing = condition == "preparing"
                     device.session.current = Mock(context=context, ended=False, error=None)
                     device.session.next = Mock(context=context) if condition == "prepared" else None
                     device.session.pending = Mock() if condition == "pending" else None
@@ -697,6 +728,40 @@ class TestProvider(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 device.control_socket = None
+
+    async def test_report_transport_failure_closes_only_its_control_epoch(self) -> None:
+        """A failed report worker cannot strand reports or close a replacement connection."""
+        device = await self._device("desktop")
+        for replaced in (False, True):
+            with self.subTest(replaced=replaced):
+                socket = AsyncMock()
+                device.control_socket = socket
+                reports: asyncio.Queue[tuple[int, object]] = asyncio.Queue()
+                await reports.put((1, object()))
+
+                async def fail(
+                    *_args: object, is_replaced: bool = replaced, **_kwargs: object
+                ) -> None:
+                    if is_replaced:
+                        device.control_socket = AsyncMock()
+                    raise ConnectionResetError("Cannot write to closing transport")
+
+                with (
+                    patch.object(device.session, "report", side_effect=fail),
+                    patch.object(device, "_close_control", AsyncMock()) as close_control,
+                    patch.object(device, "_close_audio", AsyncMock()) as close_audio,
+                    patch.object(device, "_retire_socket") as retire,
+                ):
+                    await device._reports(socket, reports)
+                    await asyncio.wait_for(reports.join(), 1)
+                    if replaced:
+                        close_control.assert_not_awaited()
+                        close_audio.assert_not_awaited()
+                    else:
+                        close_control.assert_awaited_once()
+                        close_audio.assert_awaited_once()
+                    retire.assert_called_once_with(socket)
+        device.control_socket = None
 
     async def test_capture_verbose_identifies_rejected_queue_context(self) -> None:
         """Rejected contexts log discriminating fields without exposing source URLs."""
