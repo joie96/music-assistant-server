@@ -2003,6 +2003,33 @@ commit/Sendefreigabe Gueltigkeit pruefen. Alte Completioncallbacks duerfen keine
 neuen Handles schliessen, neuen Cache fuellen oder EOF melden. Cancel allein
 genuegt nicht. Zwei schnelle Seeks: nur letzte autorisierte Generation aktiv.
 
+### 10.4 Clientgesteuerte Wiederanfrage nach Streamablehnung
+
+Bei cache_unavailable, stale_playback oder nicht retryable stream_unavailable
+sowie endgueltigem stream_failed, encoder_failed oder recovery_failed fuer A
+trennt der Client unbrauchbaren Streamzustand von seiner Wiedergabeabsicht.
+Vor dem Verwerfen speichert er Queue/Titel und den tatsaechlichen Ausgabe-Abspielpunkt
+aus media_start_position_millis plus position_frame, ausserdem Play/Pause.
+Der leere Reconnect bleibt ein ehrlicher Idle-/Cache-Snapshot und ist keine
+serverseitige Neustartfreigabe.
+
+Nach erfolgreichem Control-/Audioaufbau prueft der Client den aktuellen MA-Queue-Titel
+und fordert ausdruecklich player_queues/play_index mit dessen queue_item_id und
+seek_position in ganzen Sekunden an. Damit kann MA auch eine inzwischen inaktive
+Queue regulaer neu laden. MA prueft Rechte und Inhalt; weder alte Freigaben noch
+verlorene Bytes werden rekonstruiert. Pause wird vor der Annahme des Ersatzstreams
+lokal erhalten, ohne zwischenzeitlich Audio zu starten.
+
+Fehlgeschlagene Anfragen werden bei unveraenderter Wiedergabeabsicht ohne
+Versuchslimit wiederholt: Backoff 1/2/4/8/16/30 Sekunden, danach maximal ein Versuch
+je 30 Sekunden, jeweils nur bei verbundenen Kanaelen und erneut geprueftem Titel.
+Ein angenommener, aber erneut scheiternder Ersatzstream behaelt diesen Backoff.
+HTTP-Erfolg oder set_media-ACK allein gelten noch nicht als nutzbares Audio.
+Stop, eine neue Wiedergabeaktion oder ein anderer aktueller Queue-Titel verwerfen
+die alte Wiederanfrage; Lautstaerke und Queue-Einstellungen tun dies nicht.
+Rechteentzug beendet sie ohne automatische Auth-Retryschleife. Retryable
+stream_unavailable bleibt unveraendert ein reiner Audio-Rebind mit gueltigem Cache.
+
 ## 11. Nachfolger, Pause und Trackende
 
 Dieser Abschnitt beschreibt die natuerliche Promotion nach hoerbarem Ende.
@@ -2303,7 +2330,7 @@ der betroffenen Operation, keine pauschale Quellen-Reopenberechtigung.
 | source_idle_timeout oder stream_start_timeout bei erlaubter PCM-Anforderung | source_failed; als nachgewiesenen Quellenstillstand genau einen begrenzten Reparaturvorfall gemaess 4.4 ausloesen. Kein falsches EOF. | Bestaetigter PCM-Ursprung, gespeicherte Codecchunks und gueltiger Clientvorrat; neue Quelle nur ueber den Reparaturpfad. |
 | Externer MA-/Quellenabschluss oder PCM-Pufferfreigabe bei Disconnect/Pause/Backpressure ohne regulaeres EOF | Ressourcenverlust einmalig fuer Abschnitt 4.4 markieren, bei fehlender Empfangsfreigabe warten; Reopen/MA-Quellen-Seek und PCM-Matching erst bei gueltiger Freigabe/Kapazitaet. Kein sofortiges error/EOF/Queue-Next allein durch Ressourcen-Cleanup. | Playbackkontext, Codecchunks, Cursor und PCM-Endfenster; Pausezustand und gueltiger Clientcache. Bei sicherem Abgleich unveraendert fortsetzen, sonst begrenzter Rueckfall. |
 | Endgueltiges recovery_failed, encoder_failed oder stream_failed | Betroffene Produktion/Lieferung beenden und error melden; Verbindung nicht allein deshalb schliessen. Client kann bereits validiertes Audio ausgeben, danach error statt regulaerem Trackende/automatischer B-Promotion. Neuer Inhalt nur durch regulaeren MA-Load. B-Fehler widerruft nur B und haelt A nicht an. | Kein Anspruch auf weitere Chunks; gueltiger Cache bis Ausgabe oder ersetzendem Load/Stop. Fehler ist kein Final-Chunk. |
-| cache_unavailable, stream_unavailable oder stale_playback beim Resume | Betroffenen Resume ablehnen, keine geloeschten Bytes rekonstruieren. MA-Kontext erneut pruefen; nur ausdruecklich autorisierter regulaerer Seek/Load kann ersetzen, niemals stilles Resume oder erfundene Position. | Unabhaengig weiterhin gueltige Kontexte; keine Wiederherstellung alter Freigaben. |
+| cache_unavailable, stream_unavailable oder stale_playback beim Resume | Betroffenen Resume ablehnen, keine geloeschten Bytes rekonstruieren. Nur ausdruecklich autorisierter regulaerer Seek/Load kann ersetzen, niemals stilles Resume oder erfundene Position. Der Client behaelt seine Wiedergabeabsicht getrennt vom verworfenen Cache und fragt nach Reconnect gemaess 10.4 einen regulaeren MA-Load an; bei unveraenderter Absicht mit Backoff ohne Versuchslimit. Kein serverseitiger Auto-Reload wegen eines leeren Reconnects. | Unabhaengig weiterhin gueltige Kontexte; keine Wiederherstellung alter Freigaben. |
 | unauthorized / forbidden / Rechteentzug | Beide Kanaele sperren/schliessen, MA-/Quellencleanup und weitere Ausgabe geschuetzten Audios sofort beenden; kein Offline-Ausspielen oder automatische Auth-Retryschleife. | Keine geschuetzten A/B-Audiocaches oder Freigaben behalten. |
 | unsupported_version / incompatible_server | Sicheren Fehler melden und betroffene Verbindung schliessen; kein Retry derselben inkompatiblen Konfiguration oder Codec-/Protokollfallback. | Keine neue Audiofreigabe. |
 | device_conflict / source_busy / rate_limited | Betroffene Operation ohne neue Freigabe ablehnen; Retry nur bei is_retryable=true mit Backoff und frischer Rechte-/Kontextpruefung. | Weiterhin gueltige bestehende Wiedergabe; keine zusaetzlichen Devices/Source-Slots. |

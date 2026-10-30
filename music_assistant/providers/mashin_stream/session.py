@@ -946,6 +946,14 @@ class MashinStreamSession:
                 raise ProtocolViolation("invalid_message", "Resume promotion lacks final A receipt")
             expected.remove(self.current.descriptor.stream_id)
         if identifiers != expected or len(identifiers) != len(cursors):
+            self.logger.warning(
+                "Resume rejected for player %s: registered stream mismatch; "
+                "expected=%s received=%s media_revision=%s",
+                self.adapter.player.player_id,
+                sorted(expected),
+                [(cursor.stream_id, cursor.next_chunk_index) for cursor in cursors],
+                self.media_revision,
+            )
             raise ProtocolViolation("cache_unavailable", "Registered playback context was lost")
         for cursor in cursors:
             stream = self.buffer.streams[cursor.stream_id]
@@ -954,6 +962,17 @@ class MashinStreamSession:
                 <= cursor.next_chunk_index
                 <= min(stream.next_produced, stream.highest_offered + 1)
             ):
+                self.logger.warning(
+                    "Resume rejected for player %s: invalid receipt cursor; "
+                    "stream=%s received_cursor=%s next_received=%s "
+                    "next_produced=%s highest_offered=%s",
+                    self.adapter.player.player_id,
+                    cursor.stream_id,
+                    cursor.next_chunk_index,
+                    stream.next_received,
+                    stream.next_produced,
+                    stream.highest_offered,
+                )
                 raise ProtocolViolation("cache_unavailable", "Invalid retained receipt cursor")
         for cursor in cursors:
             self.buffer.resume(cursor.stream_id, cursor.next_chunk_index)

@@ -423,7 +423,13 @@ class MashinStreamDevice:
         except (ProtocolViolation, TimeoutError, ConnectionError) as err:
             code = err.code if isinstance(err, ProtocolViolation) else "stream_unavailable"
             self.player.logger.debug(
-                "Audio connection failed for player %s: %s", self.player.player_id, code
+                "Audio connection failed for player %s: code=%s reason=%s "
+                "epoch=%s audio_connection_id=%s",
+                self.player.player_id,
+                code,
+                str(err) if isinstance(err, ProtocolViolation) else type(err).__name__,
+                epoch,
+                self.session.buffer.audio_connection_id,
             )
             if (
                 self.session.epoch == epoch

@@ -1049,6 +1049,36 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
         assert self.session.audio_counter == 2
         assert self.session.binding_consumed
 
+    async def test_resume_rejection_logs_expected_streams_and_receipt_bounds(self) -> None:
+        """Cache failures identify missing registrations and stale receipt cursors."""
+        await self.accept_load()
+        run = self.session.current
+        assert run is not None
+        identifier = run.descriptor.stream_id
+        with pytest.raises(ProtocolViolation, match="Registered playback context was lost"):
+            self.session._cursors([])
+        self.adapter.player.logger.warning.assert_called_once_with(
+            "Resume rejected for player %s: registered stream mismatch; "
+            "expected=%s received=%s media_revision=%s",
+            "mashin_test",
+            [identifier],
+            [],
+            self.session.media_revision,
+        )
+        self.adapter.player.logger.warning.reset_mock()
+        with pytest.raises(ProtocolViolation, match="Invalid retained receipt cursor"):
+            self.session._cursors([ClientStreamCursor(identifier, 2)])
+        self.adapter.player.logger.warning.assert_called_once_with(
+            "Resume rejected for player %s: invalid receipt cursor; "
+            "stream=%s received_cursor=%s next_received=%s next_produced=%s highest_offered=%s",
+            "mashin_test",
+            identifier,
+            2,
+            1,
+            1,
+            0,
+        )
+
     async def test_new_identical_capacity_snapshot_is_processed(self) -> None:
         """Report high-water state deduplicates sequences, not repeated values."""
         await self.accept_load()
