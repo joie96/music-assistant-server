@@ -5,22 +5,33 @@ from __future__ import annotations
 import hashlib
 import socket
 from asyncio import TaskGroup
-from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from collections.abc import AsyncGenerator, Sequence
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+from aiojellyfin import ItemFields, NotFound, authenticate_by_name
 from aiojellyfin import MediaLibrary as JellyMediaLibrary
-from aiojellyfin import NotFound, authenticate_by_name
 from aiojellyfin.session import SessionConfiguration
 from music_assistant_models.enums import MediaType, ProviderFeature, StreamType
-from music_assistant_models.errors import LoginFailed, MediaNotFoundError
+from music_assistant_models.errors import (
+    InvalidDataError,
+    LoginFailed,
+    MediaNotFoundError,
+    ProviderPermissionDenied,
+    UnsupportedFeaturedException,
+)
 from music_assistant_models.media_items import (
     Album,
     Artist,
+    BrowseFolder,
+    ItemMapping,
+    MediaItemType,
     Playlist,
     ProviderMapping,
+    RecommendationFolder,
     SearchResults,
     Track,
+    UniqueList,
 )
 from music_assistant_models.streamdetails import StreamDetails
 
@@ -33,10 +44,12 @@ from music_assistant.providers.jellyfin.parsers import (
     audio_format,
     parse_album,
     parse_artist,
+    parse_lyrics,
     parse_playlist,
     parse_track,
 )
 
+from .client import JellyfinClient, rating_sort_key
 from .const import (
     ALBUM_FIELDS,
     ARTIST_FIELDS,
@@ -49,12 +62,16 @@ from .const import (
     ITEM_KEY_NAME,
     ITEM_KEY_RUNTIME_TICKS,
     MEDIA_TYPE_AUDIO,
+    RECOMMENDATION_ROWS,
     SUPPORTED_CONTAINER_FORMATS,
     TRACK_FIELDS,
     USER_APP_NAME,
 )
 
 if TYPE_CHECKING:
+    from aiojellyfin import Album as JellyAlbum
+    from aiojellyfin import Artist as JellyArtist
+    from aiojellyfin import Track as JellyTrack
     from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
@@ -67,9 +84,23 @@ SUPPORTED_FEATURES = {
     ProviderFeature.LIBRARY_ALBUMS,
     ProviderFeature.LIBRARY_TRACKS,
     ProviderFeature.LIBRARY_PLAYLISTS,
+    ProviderFeature.FAVORITE_ARTISTS_EDIT,
+    ProviderFeature.FAVORITE_ALBUMS_EDIT,
+    ProviderFeature.FAVORITE_TRACKS_EDIT,
+    ProviderFeature.FAVORITE_PLAYLISTS_EDIT,
+    ProviderFeature.PLAYLIST_CREATE,
+    ProviderFeature.PLAYLIST_TRACKS_EDIT,
+    ProviderFeature.ARTIST_METADATA,
+    ProviderFeature.ALBUM_METADATA,
+    ProviderFeature.TRACK_METADATA,
+    ProviderFeature.LYRICS,
     ProviderFeature.BROWSE,
     ProviderFeature.SEARCH,
     ProviderFeature.ARTIST_ALBUMS,
+    ProviderFeature.ARTIST_TOPALBUMS,
+    ProviderFeature.ARTIST_TOPTRACKS,
+    ProviderFeature.RECOMMENDATIONS,
+    ProviderFeature.SIMILAR_ARTISTS,
     ProviderFeature.SIMILAR_TRACKS,
 }
 
@@ -129,6 +160,8 @@ class JellyfinProvider(MusicProvider):
         except Exception as err:
             raise LoginFailed(f"Authentication failed: {err}") from err
 
+        self._api = JellyfinClient(self._client)
+
     @property
     def is_streaming_provider(self) -> bool:
         """Return True if the provider is a streaming provider."""
@@ -141,59 +174,6 @@ class JellyfinProvider(MusicProvider):
         :param path: Artwork URL or provider path to resolve.
         """
         return _normalize_jellyfin_media_url(path)
-
-    async def _search_track(self, search_query: str, limit: int) -> list[Track]:
-        resultset = (
-            await self._client.tracks.search_term(search_query)
-            .limit(limit)
-            .enable_userdata()
-            .fields(*TRACK_FIELDS)
-            .request()
-        )
-        tracks = []
-        for item in resultset["Items"]:
-            tracks.append(parse_track(self.logger, self.instance_id, self._client, item))
-        return tracks
-
-    async def _search_album(self, search_query: str, limit: int) -> list[Album]:
-        # an "Artist - Album" style query: search on the album part only
-        albumname = search_query.split(" - ", 1)[1] if " - " in search_query else search_query
-        resultset = (
-            await self._client.albums.search_term(albumname)
-            .limit(limit)
-            .enable_userdata()
-            .fields(*ALBUM_FIELDS)
-            .request()
-        )
-        albums = []
-        for item in resultset["Items"]:
-            albums.append(parse_album(self.logger, self.instance_id, self._client, item))
-        return albums
-
-    async def _search_artist(self, search_query: str, limit: int) -> list[Artist]:
-        resultset = (
-            await self._client.artists.search_term(search_query)
-            .limit(limit)
-            .enable_userdata()
-            .fields(*ARTIST_FIELDS)
-            .request()
-        )
-        artists = []
-        for item in resultset["Items"]:
-            artists.append(parse_artist(self.logger, self.instance_id, self._client, item))
-        return artists
-
-    async def _search_playlist(self, search_query: str, limit: int) -> list[Playlist]:
-        resultset = (
-            await self._client.playlists.search_term(search_query)
-            .limit(limit)
-            .enable_userdata()
-            .request()
-        )
-        playlists = []
-        for item in resultset["Items"]:
-            playlists.append(parse_playlist(self.instance_id, self._client, item))
-        return playlists
 
     @use_cache(60 * 15)  # Cache for 15 minutes
     async def search(
@@ -297,13 +277,11 @@ class JellyfinProvider(MusicProvider):
                 else:  # emby playlists are only audio type
                     yield parse_playlist(self.instance_id, self._client, playlist)
 
+    @use_cache(900)
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
-        try:
-            album = await self._client.get_album(prov_album_id)
-        except NotFound:
-            raise MediaNotFoundError(f"Item {prov_album_id} not found")
-        return parse_album(self.logger, self.instance_id, self._client, album)
+        album = await self._api.get_item(prov_album_id, "MusicAlbum", ALBUM_FIELDS)
+        return parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", album))
 
     @use_cache(3600)  # Cache for 1 hour
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
@@ -338,20 +316,19 @@ class JellyfinProvider(MusicProvider):
             artist.mbid = UNKNOWN_ARTIST_ID_MBID
             return artist
 
-        try:
-            jellyfin_artist = await self._client.get_artist(prov_artist_id)
-        except NotFound:
-            raise MediaNotFoundError(f"Item {prov_artist_id} not found")
-        return parse_artist(self.logger, self.instance_id, self._client, jellyfin_artist)
+        jellyfin_artist = await self._api.get_item(prov_artist_id, "MusicArtist", ARTIST_FIELDS)
+        return parse_artist(
+            self.logger, self.instance_id, self._client, cast("JellyArtist", jellyfin_artist)
+        )
 
     @use_cache(60 * 15)  # Cache for 15 minutes
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
-        try:
-            track = await self._client.get_track(prov_track_id)
-        except NotFound:
-            raise MediaNotFoundError(f"Item {prov_track_id} not found")
-        return parse_track(self.logger, self.instance_id, self._client, track)
+        track = await self._api.get_item(prov_track_id, "Audio", TRACK_FIELDS)
+        result = parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", track))
+        if lyrics := await self._api.get_lyrics(prov_track_id):
+            result.metadata.lyrics, result.metadata.lrc_lyrics = parse_lyrics(lyrics)
+        return result
 
     @use_cache(60 * 15)  # Cache for 15 minutes
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
@@ -360,25 +337,21 @@ class JellyfinProvider(MusicProvider):
             playlist = await self._client.get_playlist(prov_playlist_id)
         except NotFound:
             raise MediaNotFoundError(f"Item {prov_playlist_id} not found")
-        return parse_playlist(self.instance_id, self._client, playlist)
+        result = parse_playlist(self.instance_id, self._client, playlist)
+        result.is_editable = await self._api.can_edit_playlist(prov_playlist_id)
+        return result
 
-    @use_cache(3600)  # Cache for 1 hour
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
+        if page < 0:
+            raise InvalidDataError("Playlist page must not be negative")
         result: list[Track] = []
-        playlist_items = (
-            await self._client.tracks.in_playlist(prov_playlist_id)
-            .enable_userdata()
-            .fields(*TRACK_FIELDS)
-            .limit(100)
-            .start_index(page * 100)
-            .request()
-        )
-        for index, jellyfin_track in enumerate(playlist_items["Items"], 1):
+        playlist_items = await self._get_playlist_items(prov_playlist_id)
+        for index, jellyfin_track in enumerate(playlist_items[page * 100 : (page + 1) * 100], 1):
             pos = (page * 100) + index
             try:
                 if track := parse_track(
-                    self.logger, self.instance_id, self._client, jellyfin_track
+                    self.logger, self.instance_id, self._client, cast("JellyTrack", jellyfin_track)
                 ):
                     track.position = pos
                     result.append(track)
@@ -388,19 +361,110 @@ class JellyfinProvider(MusicProvider):
                 )
         return result
 
+    async def set_favorite(self, prov_item_id: str, media_type: MediaType, favorite: bool) -> None:
+        """Update a Jellyfin favorite without adding or deleting library items."""
+        if media_type not in (
+            MediaType.ARTIST,
+            MediaType.ALBUM,
+            MediaType.TRACK,
+            MediaType.PLAYLIST,
+        ):
+            raise UnsupportedFeaturedException(f"Jellyfin favorites do not support {media_type}")
+        await self._api.set_favorite(prov_item_id, favorite)
+        await self.mass.cache.delete(None, provider=self.instance_id)
+
+    async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
+        """Create an audio playlist owned by the connected Jellyfin user."""
+        if media_types != {MediaType.TRACK}:
+            raise UnsupportedFeaturedException("Jellyfin playlists support tracks only")
+        if not name.strip():
+            raise InvalidDataError("Playlist name must not be empty")
+        response = await self._api.request(
+            "POST", "/Playlists", {"name": name, "mediaType": "Audio"}
+        )
+        await self.mass.cache.delete(None, provider=self.instance_id)
+        return await self.get_playlist(response["Id"])
+
+    async def add_playlist_tracks(self, prov_playlist_id: str, prov_track_ids: list[str]) -> None:
+        """Append tracks to a writable Jellyfin playlist, preserving duplicates."""
+        if not prov_track_ids:
+            return
+        await self._assert_playlist_editable(prov_playlist_id)
+        await self._api.request(
+            "POST", f"/Playlists/{prov_playlist_id}/Items", {"ids": ",".join(prov_track_ids)}
+        )
+        await self.mass.cache.delete(None, provider=self.instance_id)
+
+    async def remove_playlist_tracks(
+        self, prov_playlist_id: str, positions_to_remove: tuple[int, ...]
+    ) -> None:
+        """Remove specific playlist entries by one-based position, not track identity."""
+        if not positions_to_remove:
+            return
+        await self._assert_playlist_editable(prov_playlist_id)
+        items = await self._get_playlist_items(prov_playlist_id)
+        if any(position < 1 or position > len(items) for position in positions_to_remove):
+            raise InvalidDataError("Playlist position is out of range")
+        entry_ids = [
+            items[position - 1]["PlaylistItemId"] for position in sorted(set(positions_to_remove))
+        ]
+        await self._api.request(
+            "DELETE", f"/Playlists/{prov_playlist_id}/Items", {"entryIds": ",".join(entry_ids)}
+        )
+        await self.mass.cache.delete(None, provider=self.instance_id)
+
     @use_cache(3600)  # Cache for 1 hour
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
-        albums = (
-            await self._client.albums.parent(prov_artist_id)
-            .fields(*ALBUM_FIELDS)
-            .enable_userdata()
-            .request()
-        )
+        if prov_artist_id == UNKNOWN_ARTIST:
+            return []
+        albums = await self._get_artist_items(prov_artist_id, "MusicAlbum", ALBUM_FIELDS)
         return [
-            parse_album(self.logger, self.instance_id, self._client, album)
-            for album in albums["Items"]
+            parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", album))
+            for album in albums
         ]
+
+    @use_cache(3600)
+    async def get_artist_topalbums(self, prov_artist_id: str) -> list[Album]:
+        """Get an artist's albums ranked by Jellyfin community rating."""
+        if prov_artist_id == UNKNOWN_ARTIST:
+            return []
+        albums = await self._get_artist_items(prov_artist_id, "MusicAlbum", ALBUM_FIELDS)
+        return [
+            parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", album))
+            for album in sorted(albums, key=rating_sort_key)
+        ]
+
+    @use_cache(3600)
+    async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
+        """Get an artist's tracks ranked by Jellyfin community rating."""
+        if prov_artist_id == UNKNOWN_ARTIST:
+            return []
+        tracks = await self._get_artist_items(prov_artist_id, "Audio", TRACK_FIELDS)
+        return [
+            parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", track))
+            for track in sorted(tracks, key=rating_sort_key)
+        ]
+
+    @use_cache(3600)
+    async def get_similar_artists(self, prov_artist_id: str, limit: int = 25) -> list[Artist]:
+        """Get related artists in Jellyfin's similarity order."""
+        if limit <= 0 or prov_artist_id == UNKNOWN_ARTIST:
+            return []
+        response = await self._api.get_json(
+            f"/Artists/{prov_artist_id}/Similar",
+            {"limit": str(limit + 1), "fields": ",".join(field.value for field in ARTIST_FIELDS)},
+        )
+        artists: list[Artist] = []
+        seen_ids = {prov_artist_id}
+        for artist in response["Items"]:
+            if artist["Id"] in seen_ids or artist.get("Type") != "MusicArtist":
+                continue
+            seen_ids.add(artist["Id"])
+            artists.append(parse_artist(self.logger, self.instance_id, self._client, artist))
+            if len(artists) == limit:
+                break
+        return artists
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
@@ -431,12 +495,234 @@ class JellyfinProvider(MusicProvider):
     @use_cache(3600)  # Cache for 1 hour
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Retrieve a dynamic list of tracks based on the provided item."""
-        resp = await self._client.get_similar_tracks(
-            prov_track_id, limit=limit, fields=TRACK_FIELDS
+        if limit <= 0:
+            return []
+        resp = await self._api.get_json(
+            f"/Items/{prov_track_id}/Similar",
+            {
+                "limit": str(limit + 1),
+                "enableUserData": "true",
+                "fields": ",".join(field.value for field in TRACK_FIELDS),
+            },
         )
+        tracks: list[Track] = []
+        seen_ids = {prov_track_id}
+        for track in resp["Items"]:
+            if track["Id"] in seen_ids or track.get("Type") != "Audio":
+                continue
+            seen_ids.add(track["Id"])
+            tracks.append(parse_track(self.logger, self.instance_id, self._client, track))
+            if len(tracks) == limit:
+                break
+        return tracks
+
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Return static library discovery rows without making backend calls."""
+        rows = [
+            RecommendationFolder(
+                item_id=item_id,
+                provider=self.instance_id,
+                name=definition[0],
+                translation_key=item_id,
+                is_playable=True,
+            )
+            for item_id, definition in RECOMMENDATION_ROWS.items()
+        ]
+        rows.append(
+            RecommendationFolder(
+                item_id="genres", provider=self.instance_id, name="Genres", translation_key="genres"
+            )
+        )
+        return rows
+
+    @use_cache(900)
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """Fetch one recommendation row from the connected user's music library."""
+        if item_id == "genres":
+            return UniqueList(await self._get_genre_folders())
+        if item_id not in RECOMMENDATION_ROWS:
+            raise MediaNotFoundError(f"Unknown Jellyfin recommendation row: {item_id}")
+        _, item_type, sort_by = RECOMMENDATION_ROWS[item_id]
+        params = {"sortBy": f"{sort_by},SortName", "sortOrder": "Descending,Ascending"}
+        if sort_by == "CommunityRating":
+            params["minCommunityRating"] = "0"
+        elif sort_by in ("PlayCount", "DatePlayed"):
+            params["isPlayed"] = "true"
+        fields = ALBUM_FIELDS if item_type == "MusicAlbum" else TRACK_FIELDS
+        items = await self._api.get_items(item_type, fields, params)
+        if item_type == "MusicAlbum":
+            return UniqueList(
+                parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", item))
+                for item in items
+            )
+        return UniqueList(
+            parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", item))
+            for item in items
+        )
+
+    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
+        """Browse standard library folders and genre-specific music or instant mixes."""
+        prefix = f"{self.instance_id}://"
+        if not path.startswith(prefix):
+            raise MediaNotFoundError("Invalid Jellyfin browse path")
+        parts = path[len(prefix) :].strip("/").split("/")
+        if parts[0] != "genres":
+            folders = list(await super().browse(path))
+            if parts == [""]:
+                folders.append(
+                    BrowseFolder(
+                        item_id="genres",
+                        provider=self.instance_id,
+                        name="Genres",
+                        translation_key="genres",
+                        path=f"{prefix}genres",
+                    )
+                )
+            return folders
+        if len(parts) == 1:
+            return await self._get_genre_folders()
+        if len(parts) == 2:
+            return [
+                BrowseFolder(
+                    item_id=f"{parts[1]}_{section}",
+                    provider=self.instance_id,
+                    name=name,
+                    translation_key=section,
+                    is_playable=True,
+                    path=f"{prefix}genres/{parts[1]}/{section}",
+                )
+                for section, name in (
+                    ("albums", "Albums"),
+                    ("tracks", "Tracks"),
+                    ("mix", "Instant mix"),
+                )
+            ]
+        if len(parts) != 3 or parts[2] not in ("albums", "tracks", "mix"):
+            raise MediaNotFoundError("Invalid Jellyfin genre path")
+        return await self._get_genre_items(parts[1], parts[2])
+
+    async def _search_track(self, search_query: str, limit: int) -> list[Track]:
+        resultset = (
+            await self._client.tracks.search_term(search_query)
+            .limit(limit)
+            .enable_userdata()
+            .fields(*TRACK_FIELDS)
+            .request()
+        )
+        tracks = []
+        for item in resultset["Items"]:
+            tracks.append(parse_track(self.logger, self.instance_id, self._client, item))
+        return tracks
+
+    async def _search_album(self, search_query: str, limit: int) -> list[Album]:
+        # an "Artist - Album" style query: search on the album part only
+        albumname = search_query.split(" - ", 1)[1] if " - " in search_query else search_query
+        resultset = (
+            await self._client.albums.search_term(albumname)
+            .limit(limit)
+            .enable_userdata()
+            .fields(*ALBUM_FIELDS)
+            .request()
+        )
+        albums = []
+        for item in resultset["Items"]:
+            albums.append(parse_album(self.logger, self.instance_id, self._client, item))
+        return albums
+
+    async def _search_artist(self, search_query: str, limit: int) -> list[Artist]:
+        resultset = (
+            await self._client.artists.search_term(search_query)
+            .limit(limit)
+            .enable_userdata()
+            .fields(*ARTIST_FIELDS)
+            .request()
+        )
+        artists = []
+        for item in resultset["Items"]:
+            artists.append(parse_artist(self.logger, self.instance_id, self._client, item))
+        return artists
+
+    async def _search_playlist(self, search_query: str, limit: int) -> list[Playlist]:
+        resultset = (
+            await self._client.playlists.search_term(search_query)
+            .limit(limit)
+            .enable_userdata()
+            .request()
+        )
+        playlists = []
+        for item in resultset["Items"]:
+            playlists.append(parse_playlist(self.instance_id, self._client, item))
+        return playlists
+
+    @use_cache(3600)
+    async def _get_artist_items(
+        self, artist_id: str, item_type: str, fields: list[ItemFields]
+    ) -> list[dict[str, Any]]:
+        """Share raw rated artist listings between album and top-list requests."""
+        return await self._api.get_artist_items(artist_id, item_type, fields)
+
+    @use_cache(900)
+    async def _get_playlist_items(self, playlist_id: str) -> list[dict[str, Any]]:
+        """Preserve playlist order and entry IDs across every page."""
+        return await self._api.get_items(
+            "Audio", TRACK_FIELDS, {}, limit=None, path=f"/Playlists/{playlist_id}/Items"
+        )
+
+    async def _assert_playlist_editable(self, playlist_id: str) -> None:
+        """Reject writes to shared or legacy playlists without explicit write permission."""
+        if not await self._api.can_edit_playlist(playlist_id):
+            raise ProviderPermissionDenied("Jellyfin playlist is read-only for this user")
+
+    @use_cache(900)
+    async def _get_genres(self) -> list[dict[str, Any]]:
+        """Get every genre associated with accessible music, rather than video genres."""
+        return await self._api.get_items("Audio,MusicAlbum", [], {}, limit=None, path="/Genres")
+
+    async def _get_genre_folders(self) -> list[BrowseFolder]:
+        """Map music genres to provider-owned browse folders."""
         return [
-            parse_track(self.logger, self.instance_id, self._client, track)
-            for track in resp["Items"]
+            BrowseFolder(
+                item_id=genre["Id"],
+                provider=self.instance_id,
+                name=genre["Name"],
+                path=f"{self.instance_id}://genres/{genre['Id']}",
+            )
+            for genre in await self._get_genres()
+        ]
+
+    @use_cache(900)
+    async def _get_genre_items(self, genre_id: str, section: str) -> list[Album] | list[Track]:
+        """Fetch a complete genre listing or a bounded Jellyfin instant mix."""
+        genre = next((item for item in await self._get_genres() if item["Id"] == genre_id), None)
+        if genre is None:
+            raise MediaNotFoundError(f"Unknown Jellyfin genre: {genre_id}")
+        if section == "mix":
+            response = await self._api.get_json(
+                f"/MusicGenres/{quote(genre['Name'], safe='')}/InstantMix",
+                {
+                    "limit": "50",
+                    "enableUserData": "true",
+                    "fields": ",".join(f.value for f in TRACK_FIELDS),
+                },
+            )
+            return [
+                parse_track(self.logger, self.instance_id, self._client, item)
+                for item in response["Items"]
+                if item.get("Type") == "Audio"
+            ]
+        item_type = "MusicAlbum" if section == "albums" else "Audio"
+        fields = ALBUM_FIELDS if section == "albums" else TRACK_FIELDS
+        items = await self._api.get_items(item_type, fields, {"genreIds": genre_id}, limit=None)
+        if section == "albums":
+            return [
+                parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", item))
+                for item in items
+            ]
+        return [
+            parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", item))
+            for item in items
         ]
 
     async def _get_music_libraries(self) -> list[JellyMediaLibrary]:

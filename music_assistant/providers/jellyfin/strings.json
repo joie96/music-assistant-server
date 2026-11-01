@@ -17,6 +17,20 @@
       "description": "[%key:common::config_entries::verify_ssl::description%]"
     }
   },
+  "media": {
+    "folder": {
+      "genres": {"name": "Genres"},
+      "mix": {"name": "Instant mix"}
+    },
+    "recommendations": {
+      "recently_added": {"name": "Recently added albums"},
+      "highest_rated_albums": {"name": "Highest rated albums"},
+      "highest_rated_tracks": {"name": "Highest rated tracks"},
+      "most_played": {"name": "Most played tracks"},
+      "recently_played": {"name": "Recently played tracks"},
+      "genres": {"name": "Genres"}
+    }
+  },
   "manifest": {
     "description": "Stream music from your self-hosted Jellyfin server."
   }

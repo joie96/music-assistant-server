@@ -1,16 +1,18 @@
 """Tests for the Jellyfin provider."""
 
-from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING
+from collections.abc import AsyncGenerator, Mapping
+from typing import TYPE_CHECKING, Any
 from unittest import mock
 
 import pytest
+from aiojellyfin import Connection, NotFound
 from aiojellyfin.testing import FixtureBuilder
 
 from music_assistant.mass import MusicAssistant
 from tests.common import get_fixtures_dir, wait_for_sync_completion
 
 if TYPE_CHECKING:
+    from aiojellyfin.session import SessionConfiguration
     from music_assistant_models.config_entries import ProviderConfig
 
 
@@ -27,7 +29,22 @@ async def jellyfin_provider(mass: MusicAssistant) -> AsyncGenerator[ProviderConf
     async for _, track in get_fixtures_dir("tracks", "jellyfin"):
         f.add_json_bytes(track)
 
-    authenticate_by_name = f.to_authenticate_by_name()
+    fixture_authenticate = f.to_authenticate_by_name()
+
+    async def authenticate_by_name(
+        session_config: SessionConfiguration, username: str, password: str
+    ) -> Connection:
+        connection = await fixture_authenticate(session_config, username, password)
+        fixture_get_json = connection._session.get_json
+
+        async def get_json(url: str, params: Mapping[str, str]) -> dict[str, Any]:
+            if url.endswith("/Lyrics") or ("/Playlists/" in url and "/Users/" in url):
+                raise NotFound("Optional resource absent in fixture")
+            return await fixture_get_json(url, params)
+
+        method_name = "get_json"
+        setattr(connection._session, method_name, get_json)
+        return connection
 
     with mock.patch(
         "music_assistant.providers.jellyfin.authenticate_by_name", authenticate_by_name

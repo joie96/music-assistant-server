@@ -29,7 +29,6 @@ music_assistant/providers/ibroadcast/__init__.py	4
 music_assistant/providers/internet_archive/helpers.py	6
 music_assistant/providers/internet_archive/provider.py	13
 music_assistant/providers/itunes_podcasts/__init__.py	5
-music_assistant/providers/jellyfin/__init__.py	14
 music_assistant/providers/kion_music/api_client.py	43
 music_assistant/providers/kion_music/provider.py	24
 music_assistant/providers/kion_music/streaming.py	2

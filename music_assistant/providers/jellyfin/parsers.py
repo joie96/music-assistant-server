@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from logging import Logger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from aiojellyfin import ImageType as JellyImageType
 from music_assistant_models.enums import ContentType, ExternalID, ImageType, MediaType
@@ -90,6 +90,8 @@ def parse_album(
     album.metadata.images = _get_artwork(instance_id, connection, jellyfin_album)
     if ITEM_KEY_OVERVIEW in jellyfin_album:
         album.metadata.description = jellyfin_album[ITEM_KEY_OVERVIEW]
+    if genres := cast("list[str] | None", jellyfin_album.get("Genres")):
+        album.metadata.genres = set(genres)
     if ITEM_KEY_MUSICBRAINZ_ALBUM in jellyfin_album[ITEM_KEY_PROVIDER_IDS]:
         try:
             album.add_external_id(
@@ -163,6 +165,8 @@ def parse_artist(
     )
     if ITEM_KEY_OVERVIEW in jellyfin_artist:
         artist.metadata.description = jellyfin_artist[ITEM_KEY_OVERVIEW]
+    if genres := cast("list[str] | None", jellyfin_artist.get("Genres")):
+        artist.metadata.genres = set(genres)
     if ITEM_KEY_MUSICBRAINZ_ARTIST in jellyfin_artist[ITEM_KEY_PROVIDER_IDS]:
         try:
             artist.mbid = jellyfin_artist[ITEM_KEY_PROVIDER_IDS][ITEM_KEY_MUSICBRAINZ_ARTIST]
@@ -233,6 +237,8 @@ def parse_track(
         track.position = track.track_number
 
     track.metadata.images = _get_artwork(instance_id, client, jellyfin_track)
+    if genres := cast("list[str] | None", jellyfin_track.get("Genres")):
+        track.metadata.genres = set(genres)
 
     if jellyfin_track[ITEM_KEY_ARTIST_ITEMS]:
         for artist_item in jellyfin_track[ITEM_KEY_ARTIST_ITEMS]:
@@ -301,6 +307,23 @@ def parse_playlist(
     playlist.favorite = user_data.get(USER_DATA_KEY_IS_FAVORITE, False)
     playlist.is_editable = False
     return playlist
+
+
+def parse_lyrics(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Convert Jellyfin lyric lines and optional tick timestamps to plain text and LRC."""
+    lines = payload.get("Lyrics") or []
+    if not lines:
+        return None, None
+    plain_text = "\n".join(line.get("Text") or "" for line in lines)
+    synced_lines = []
+    for line in lines:
+        if (start := line.get("Start")) is None:
+            continue
+        centiseconds = max(0, int(start) // 100000)
+        minutes, remainder = divmod(centiseconds, 6000)
+        seconds, fraction = divmod(remainder, 100)
+        synced_lines.append(f"[{minutes:02}:{seconds:02}.{fraction:02}]{line.get('Text') or ''}")
+    return plain_text or None, "\n".join(synced_lines) or None
 
 
 def _unknown_artist_mapping(instance_id: str) -> ItemMapping:

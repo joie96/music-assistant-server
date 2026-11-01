@@ -49,15 +49,19 @@ SUPPORTED_CONTAINER_FORMATS: Final = "ogg,flac,mp3,aac,mpeg,alac,wav,aiff,wma,m4
 
 ARTIST_FIELDS: Final = [
     ItemFields.Overview,
+    ItemFields.Genres,
     ItemFields.ProviderIds,
     ItemFields.SortName,
 ]
 ALBUM_FIELDS: Final = [
     ItemFields.Overview,
+    ItemFields.Genres,
     ItemFields.ProviderIds,
     ItemFields.SortName,
 ]
 TRACK_FIELDS: Final = [
+    ItemFields.Genres,
+    ItemFields.Overview,
     ItemFields.ProviderIds,
     ItemFields.CanDownload,
     ItemFields.SortName,
@@ -66,6 +70,14 @@ TRACK_FIELDS: Final = [
 ]
 
 USER_APP_NAME: Final = "Music Assistant"
+
+RECOMMENDATION_ROWS: Final = {
+    "recently_added": ("Recently added albums", "MusicAlbum", "DateCreated"),
+    "highest_rated_albums": ("Highest rated albums", "MusicAlbum", "CommunityRating"),
+    "highest_rated_tracks": ("Highest rated tracks", "Audio", "CommunityRating"),
+    "most_played": ("Most played tracks", "Audio", "PlayCount"),
+    "recently_played": ("Recently played tracks", "Audio", "DatePlayed"),
+}
 
 MEDIA_IMAGE_TYPES: Final = {
     JellyImageType.Primary: ImageType.THUMB,
