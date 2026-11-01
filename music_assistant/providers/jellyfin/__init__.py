@@ -535,7 +535,6 @@ class JellyfinProvider(MusicProvider):
         )
         return rows
 
-    @use_cache(900)
     async def get_recommendation_items(
         self, item_id: str
     ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
@@ -544,14 +543,8 @@ class JellyfinProvider(MusicProvider):
             return UniqueList(await self._get_genre_folders())
         if item_id not in RECOMMENDATION_ROWS:
             raise MediaNotFoundError(f"Unknown Jellyfin recommendation row: {item_id}")
-        _, item_type, sort_by = RECOMMENDATION_ROWS[item_id]
-        params = {"sortBy": f"{sort_by},SortName", "sortOrder": "Descending,Ascending"}
-        if sort_by == "CommunityRating":
-            params["minCommunityRating"] = "0"
-        elif sort_by in ("PlayCount", "DatePlayed"):
-            params["isPlayed"] = "true"
-        fields = ALBUM_FIELDS if item_type == "MusicAlbum" else TRACK_FIELDS
-        items = await self._api.get_items(item_type, fields, params)
+        _, item_type, _ = RECOMMENDATION_ROWS[item_id]
+        items = await self._get_recommendation_items(item_id)
         if item_type == "MusicAlbum":
             return UniqueList(
                 parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", item))
@@ -655,6 +648,18 @@ class JellyfinProvider(MusicProvider):
         for item in resultset["Items"]:
             playlists.append(parse_playlist(self.instance_id, self._client, item))
         return playlists
+
+    @use_cache(900)
+    async def _get_recommendation_items(self, item_id: str) -> list[dict[str, Any]]:
+        """Cache raw recommendation records before converting them to media models."""
+        _, item_type, sort_by = RECOMMENDATION_ROWS[item_id]
+        params = {"sortBy": f"{sort_by},SortName", "sortOrder": "Descending,Ascending"}
+        if sort_by == "CommunityRating":
+            params["minCommunityRating"] = "0"
+        elif sort_by in ("PlayCount", "DatePlayed"):
+            params["isPlayed"] = "true"
+        fields = ALBUM_FIELDS if item_type == "MusicAlbum" else TRACK_FIELDS
+        return await self._api.get_items(item_type, fields, params)
 
     @use_cache(3600)
     async def _get_artist_items(

@@ -1,5 +1,7 @@
 """Tests for Jellyfin fields and endpoints missing from aiojellyfin."""
 
+import asyncio
+import json
 import logging
 from collections.abc import Callable
 from typing import Any, cast
@@ -18,6 +20,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
     UnsupportedFeaturedException,
 )
+from music_assistant_models.media_items import Album, BrowseFolder, Track, UniqueList
 
 from music_assistant.providers.jellyfin import SUPPORTED_FEATURES, JellyfinProvider
 from music_assistant.providers.jellyfin.client import JellyfinClient, rating_sort_key
@@ -33,6 +36,9 @@ def provider() -> MagicMock:
     instance.manifest = MagicMock(domain="jellyfin")
     instance.mass = MagicMock()
     instance.mass.cache.delete = AsyncMock()
+    instance.mass.cache.get_with_freshness = AsyncMock(return_value=(None, False, False))
+    instance.mass.cache.set = AsyncMock()
+    instance.mass.create_task.side_effect = lambda coroutine, **_kwargs: asyncio.create_task(coroutine)
     instance.logger = logging.getLogger(__name__)
     instance._supported_features = SUPPORTED_FEATURES
     instance._client = MagicMock(spec=Connection)
@@ -184,7 +190,7 @@ async def test_recommendation_row_query(provider: MagicMock, row_id: str) -> Non
     """Rating and playback rows select appropriate item types and filters."""
     _, item_type, sort_by = RECOMMENDATION_ROWS[row_id]
     provider._api.get_items.return_value = [media_item("item", item_type)]
-    items = await uncached_method("get_recommendation_items")(provider, row_id)
+    items = await provider.get_recommendation_items(row_id)
     assert items[0].item_id == "item"
     query = provider._api.get_items.call_args.args
     assert query[0] == item_type
@@ -198,7 +204,39 @@ async def test_recommendation_row_query(provider: MagicMock, row_id: str) -> Non
 async def test_unknown_recommendation_row(provider: MagicMock) -> None:
     """Unknown row identifiers are errors, not silently empty results."""
     with pytest.raises(MediaNotFoundError):
-        await uncached_method("get_recommendation_items")(provider, "unknown")
+        await provider.get_recommendation_items("unknown")
+
+
+@pytest.mark.parametrize("row_id", [*RECOMMENDATION_ROWS, "genres"])
+@pytest.mark.parametrize("is_empty", [False, True])
+async def test_recommendation_cache_round_trip(
+    provider: MagicMock, row_id: str, is_empty: bool
+) -> None:
+    """Real cache wrappers reconstruct serialized records without losing model types."""
+    expected_type: type[Album | Track | BrowseFolder]
+    if row_id == "genres":
+        del provider._get_genres
+        records = [] if is_empty else [{"Id": "rock", "Name": "Rock"}]
+        expected_type = BrowseFolder
+    else:
+        _, item_type, _ = RECOMMENDATION_ROWS[row_id]
+        records = [] if is_empty else [media_item("item", item_type)]
+        expected_type = Album if item_type == "MusicAlbum" else Track
+    provider._api.get_items.return_value = records
+    provider.mass.cache.get_with_freshness.side_effect = [
+        (None, False, False),
+        (json.loads(json.dumps(records)), True, True),
+    ]
+
+    first = await provider.get_recommendation_items(row_id)
+    cached = await provider.get_recommendation_items(row_id)
+
+    assert isinstance(first, UniqueList)
+    assert isinstance(cached, UniqueList)
+    assert [item.to_dict() for item in first] == [item.to_dict() for item in cached]
+    assert all(isinstance(item, expected_type) for item in cached)
+    provider._api.get_items.assert_awaited_once()
+    assert provider.mass.cache.get_with_freshness.await_count == 2
 
 
 async def test_genre_browse_routes(provider: MagicMock) -> None:
