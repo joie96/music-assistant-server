@@ -5,6 +5,24 @@ music providers. It never adds discoveries to the library automatically. Empty
 folders are omitted. Recommendations refresh every 24 hours; the new discovery
 API requests use Music Assistant's cache for three hours and are rate limited.
 
+During setup, select the Music Assistant user who should receive this instance's
+recommendations, in addition to the ListenBrainz username and token. Add a separate
+instance for each user. The username, masked token and MA user dropdown are also
+editable on the general provider configuration page. Only enabled MA users are
+offered, by display name or username; their stable user IDs are stored internally.
+Setup submissions are consumed into the normal configuration before the provider
+loads, so subsequent reads use only the editable configuration. Reconfigure uses
+those current values as its initial form values.
+Instances without a valid assignment expose neither recommendations nor virtual
+playlists; recreate existing instances and assign their users explicitly.
+
+Recommendation rows and contents are only returned to the assigned authenticated
+MA user. Virtual playlist lookups reject other authenticated users, but remain
+available to internal server-side callers for playback. This isolates the normal
+recommendation feed, not every possible API access: the core's shared in-flight
+playlist requests do not separate callers by user. Scrobbling is configured
+separately through the scrobbler's user filter.
+
 The startup build is queued through the same scheduled task, so it records its
 start time and replaces any pending automatic timer. Subsequent automatic runs
 are scheduled 24 hours after that start, rather than on a separate startup timer.

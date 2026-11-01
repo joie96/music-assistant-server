@@ -26,7 +26,10 @@ from music_assistant.providers.listenbrainz_recommendations import (
     ListenBrainzRecommendationsProvider,
 )
 from music_assistant.providers.listenbrainz_recommendations.api_client import ListenBrainzAPIClient
-from music_assistant.providers.listenbrainz_recommendations.setup_flow import run_setup
+from music_assistant.providers.listenbrainz_recommendations.setup_flow import (
+    apply_account_setup_values,
+    run_setup,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -120,20 +123,144 @@ async def test_unknown_virtual_playlist_raises() -> None:
         await ListenBrainzRecommendationsProvider.get_playlist_tracks(provider, "unknown")
 
 
+@pytest.mark.parametrize("user_id", ["user-1", "user-2", None])
+async def test_recommendations_are_scoped_to_assigned_user(user_id: str | None) -> None:
+    """Only the assigned MA user receives recommendation rows and their contents."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.get_config_value.return_value = "user-1"
+    provider._is_visible_to_current_user = MethodType(
+        ListenBrainzRecommendationsProvider._is_visible_to_current_user, provider
+    )
+    folder = RecommendationFolder(
+        item_id="user_recommendations",
+        provider="listenbrainz_recommendations--first",
+        name="Recommendations",
+        items=UniqueList(
+            [Track(item_id="track", provider="library", name="Track", provider_mappings=set())]
+        ),
+    )
+    provider._recommendation_folders = [folder]
+    user = MagicMock(user_id=user_id) if user_id is not None else None
+    with patch(
+        "music_assistant.providers.listenbrainz_recommendations.get_current_user",
+        return_value=user,
+    ):
+        rows = await ListenBrainzRecommendationsProvider.get_recommendations(provider)
+        items = await ListenBrainzRecommendationsProvider.get_recommendation_items(
+            provider, folder.item_id
+        )
+    assert bool(rows) is (user_id == "user-1")
+    assert bool(items) is (user_id == "user-1")
+
+
+@pytest.mark.parametrize("assigned_user_id", [None, "", " ", 123])
+async def test_unassigned_provider_is_hidden(assigned_user_id: object) -> None:
+    """Missing or malformed assignments never expose recommendations or playlists."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.get_config_value.return_value = assigned_user_id
+    provider._is_visible_to_current_user = MethodType(
+        ListenBrainzRecommendationsProvider._is_visible_to_current_user, provider
+    )
+    assert await ListenBrainzRecommendationsProvider.get_recommendations(provider) == []
+    assert await ListenBrainzRecommendationsProvider.get_recommendation_items(provider, "row") == []
+    with pytest.raises(MediaNotFoundError):
+        await ListenBrainzRecommendationsProvider.get_playlist(provider, "playlist")
+    with pytest.raises(MediaNotFoundError):
+        await ListenBrainzRecommendationsProvider.get_playlist_tracks(provider, "playlist")
+
+
+@pytest.mark.parametrize("user_id", ["user-1", "user-2", None])
+async def test_virtual_playlists_are_scoped_to_assigned_user(user_id: str | None) -> None:
+    """Reject another user while retaining internal server-side playlist playback."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.get_config_value.return_value = "user-1"
+    provider._is_visible_to_current_user = MethodType(
+        ListenBrainzRecommendationsProvider._is_visible_to_current_user, provider
+    )
+    playlist = Playlist(
+        item_id="playlist",
+        provider="listenbrainz_recommendations--first",
+        name="Playlist",
+        provider_mappings=set(),
+    )
+    tracks = [Track(item_id="track", provider="library", name="Track", provider_mappings=set())]
+    provider._resolved_virtual_playlists = {playlist.item_id: (playlist, tracks)}
+    user = MagicMock(user_id=user_id) if user_id is not None else None
+    with patch(
+        "music_assistant.providers.listenbrainz_recommendations.get_current_user",
+        return_value=user,
+    ):
+        if user_id == "user-2":
+            with pytest.raises(MediaNotFoundError):
+                await ListenBrainzRecommendationsProvider.get_playlist(provider, playlist.item_id)
+            with pytest.raises(MediaNotFoundError):
+                await ListenBrainzRecommendationsProvider.get_playlist_tracks(
+                    provider, playlist.item_id
+                )
+        else:
+            assert (
+                await ListenBrainzRecommendationsProvider.get_playlist(provider, playlist.item_id)
+                is playlist
+            )
+            assert (
+                await ListenBrainzRecommendationsProvider.get_playlist_tracks(
+                    provider, playlist.item_id
+                )
+                is tracks
+            )
+
+
+async def test_general_config_contains_account_fields_and_user_dropdown() -> None:
+    """Expose account fields with enabled MA users and no plaintext token default."""
+    provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
+    provider.mass = MagicMock()
+    provider.mass.webserver.auth.list_users = AsyncMock(return_value=[
+        MagicMock(user_id="user-1", display_name="Listener", username="listener", enabled=True),
+        MagicMock(user_id="user-2", display_name="", username="second", enabled=True),
+        MagicMock(user_id="disabled", display_name="Disabled", enabled=False),
+    ])
+
+    entries = await ListenBrainzRecommendationsProvider.get_config_entries(provider)
+
+    assert [entry.key for entry in entries[:3]] == [
+        "username", "auth_token", "recommendation_user_id"
+    ]
+    assert all(entry.required for entry in entries[:3])
+    assert entries[1].type == ConfigEntryType.SECURE_STRING
+    assert entries[1].default_value is None
+    assert entries[1].value is None
+    assert [(option.value, option.title) for option in entries[2].options] == [
+        ("user-1", "Listener"), ("user-2", "second")
+    ]
+
+
 async def test_setup_collects_credentials() -> None:
     """Collect required credentials through the setup flow, with an obscured token."""
     session = MagicMock()
     session.context.setup_data = {}
-    session.form = AsyncMock(return_value={"username": "listener", "auth_token": "test-token"})
+    session.context.values = {}
+    session.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[
+            MagicMock(user_id="user-1", display_name="Listener", username="listener", enabled=True),
+            MagicMock(user_id="disabled", display_name="Disabled", enabled=False),
+        ]
+    )
+    submitted = {
+        "username": "listener",
+        "auth_token": "test-token",
+        "recommendation_user_id": "user-1",
+    }
+    session.form = AsyncMock(return_value=submitted)
     session.finish = AsyncMock()
 
     await run_setup(session)
 
-    session.finish.assert_awaited_once_with({"username": "listener", "auth_token": "test-token"})
+    session.finish.assert_awaited_once_with(submitted)
     entries = session.form.call_args.args[0]
-    assert [entry.key for entry in entries] == ["username", "auth_token"]
+    assert [entry.key for entry in entries] == ["username", "auth_token", "recommendation_user_id"]
     assert all(entry.required for entry in entries)
     assert entries[1].type == ConfigEntryType.SECURE_STRING
+    assert [option.value for option in entries[2].options] == ["user-1"]
     assert session.form.call_args.kwargs["last_step"] is True
 
 
@@ -141,7 +268,17 @@ async def test_setup_retains_values_after_failure() -> None:
     """Keep submitted credentials and show setup errors when retrying."""
     session = MagicMock()
     session.context.setup_data = {"username": "existing-listener", "auth_token": "old-token"}
-    submitted = {"username": "listener", "auth_token": "test-token"}
+    session.context.values = {}
+    session.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[
+            MagicMock(user_id="user-1", display_name="Listener", enabled=True),
+        ]
+    )
+    submitted = {
+        "username": "listener",
+        "auth_token": "test-token",
+        "recommendation_user_id": "user-1",
+    }
     session.form = AsyncMock(return_value=submitted)
     error = SetupFlowError("Setup failed")
     session.finish = AsyncMock(side_effect=[error, None])
@@ -157,12 +294,87 @@ async def test_setup_retains_values_after_failure() -> None:
     assert session.form.call_args.args[0][1].value == "test-token"
 
 
-async def test_api_client_reads_token_from_setup_data() -> None:
-    """Use the decrypted setup token when authenticating ListenBrainz requests."""
+@pytest.mark.parametrize("invalid_user_id", [None, "other", [], 123])
+async def test_setup_rejects_invalid_user_assignment(invalid_user_id: object) -> None:
+    """Do not finish setup until an enabled MA user has been selected."""
+    session = MagicMock()
+    session.context.setup_data = {}
+    session.context.values = {}
+    session.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[
+            MagicMock(user_id="user-1", display_name="Listener", enabled=True),
+        ]
+    )
+    credentials = {"username": "listener", "auth_token": "test-token"}
+    session.form = AsyncMock(
+        side_effect=[
+            {**credentials, "recommendation_user_id": invalid_user_id},
+            {**credentials, "recommendation_user_id": "user-1"},
+        ]
+    )
+    session.finish = AsyncMock()
+
+    await run_setup(session)
+
+    assert session.form.await_count == 2
+    assert "recommendation_user_id" in session.form.call_args.kwargs["errors"]
+    session.finish.assert_awaited_once_with({**credentials, "recommendation_user_id": "user-1"})
+
+
+def test_setup_values_are_consumed_into_normal_config() -> None:
+    """Store setup values once, encrypt the token, and leave no second account state."""
+    mass = MagicMock()
+    config = MagicMock(instance_id="listenbrainz_recommendations--test")
+    values = {
+        "username": "listener", "auth_token": "test-token", "recommendation_user_id": "user-1"
+    }
+    config.setup_data = dict(values)
+    mass.config.get_provider_setup_value.side_effect = lambda _instance, key: values[key]
+
+    apply_account_setup_values(mass, config)
+
+    for key, value in values.items():
+        mass.config.set_raw_provider_config_value.assert_any_call(
+            config.instance_id, key, value, encrypted=key == "auth_token"
+        )
+        mass.config.remove.assert_any_call(f"providers/{config.instance_id}/setup_data/{key}")
+    assert config.setup_data == {}
+    mass.config.save.assert_called_once_with(immediate=True)
+    mass.config.reset_mock()
+
+    apply_account_setup_values(mass, config)
+
+    mass.config.set_raw_provider_config_value.assert_not_called()
+    mass.config.save.assert_not_called()
+
+
+async def test_reconfigure_prefills_current_general_config() -> None:
+    """Reconfigure from current editable values rather than stale setup credentials."""
+    session = MagicMock()
+    session.context.setup_data = {}
+    session.context.values = {
+        "username": "current-listener", "auth_token": "current-token",
+        "recommendation_user_id": "user-1"
+    }
+    session.mass.webserver.auth.list_users = AsyncMock(return_value=[
+        MagicMock(user_id="user-1", display_name="Listener", enabled=True),
+    ])
+    session.form = AsyncMock(return_value=dict(session.context.values))
+    session.finish = AsyncMock()
+
+    await run_setup(session)
+
+    entries = session.form.call_args.args[0]
+    assert {entry.key: entry.value for entry in entries} == session.context.values
+    session.finish.assert_awaited_once_with(session.context.values)
+
+
+async def test_api_client_reads_token_from_config() -> None:
+    """Use the decrypted current config token when authenticating ListenBrainz requests."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.config = MagicMock()
     provider.config.get_value.return_value = "https://api.listenbrainz.org"
-    provider.get_setup_value.return_value = "test-token"
+    provider.get_config_value.return_value = "test-token"
     provider.mass = MagicMock()
     response = provider.mass.http_session.get.return_value.__aenter__.return_value
     response.status = 200
@@ -172,7 +384,7 @@ async def test_api_client_reads_token_from_setup_data() -> None:
     result = await client._request("/1/test", {})
 
     assert result == {"payload": {}}
-    provider.get_setup_value.assert_called_once_with("auth_token")
+    provider.get_config_value.assert_called_once_with("auth_token")
     assert provider.mass.http_session.get.call_args.kwargs["headers"] == {
         "Authorization": "Token test-token"
     }
@@ -398,7 +610,7 @@ async def test_similar_users_jam_uses_highest_ranked_user_with_latest_jam(
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.instance_id = "listenbrainz-instance"
     provider.domain = "listenbrainz_recommendations"
-    provider.get_setup_value.return_value = "joie95"
+    provider.get_config_value.return_value = "joie95"
     provider._resolve_generated_playlist = MethodType(
         ListenBrainzRecommendationsProvider._resolve_generated_playlist, provider
     )
@@ -488,7 +700,7 @@ async def test_similar_users_jam_without_available_jams_is_empty(has_users: bool
     """An absent Jam is a valid empty result, not an API failure."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.instance_id = "listenbrainz-instance"
-    provider.get_setup_value.return_value = "listener"
+    provider.get_config_value.return_value = "listener"
     provider.api_client = MagicMock()
     provider.api_client.get_similar_users = AsyncMock(
         return_value=([{"user_name": "closest", "similarity": 0.9}] if has_users else [])
@@ -508,7 +720,7 @@ async def test_similar_users_api_error_aborts_instead_of_publishing_empty_data()
     """Keep transport errors distinct from users that simply have no Jam."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.instance_id = "listenbrainz-instance"
-    provider.get_setup_value.return_value = "listener"
+    provider.get_config_value.return_value = "listener"
     provider.api_client = MagicMock()
     provider.api_client.get_similar_users = AsyncMock(side_effect=MusicAssistantError("API failed"))
 
@@ -555,7 +767,7 @@ async def test_existing_recommendations_keep_lb_radio() -> None:
     """Rename the folder without replacing LB-Radio with generated weekly playlists."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.instance_id = "listenbrainz-instance"
-    provider.get_setup_value.return_value = "listener"
+    provider.get_config_value.return_value = "listener"
     provider._get_lb_radio_mode.return_value = "easy"
     provider.api_client = MagicMock()
     provider.api_client.get_explore_lb_radio = AsyncMock(
@@ -586,7 +798,7 @@ async def test_existing_user_folders_keep_sources(builder: str, folder_id: str) 
     """Keep monthly statistics and the last 100 listens without new date filters."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.instance_id = "listenbrainz-instance"
-    provider.get_setup_value.return_value = "listener"
+    provider.get_config_value.return_value = "listener"
     provider.api_client = MagicMock()
     provider.api_client.get_user_top_artists = AsyncMock(return_value=[])
     provider.api_client.get_user_top_tracks = AsyncMock(return_value=[])
@@ -615,7 +827,7 @@ async def test_exploration_folder_exposes_playable_playlists() -> None:
         ListenBrainzRecommendationsProvider._resolve_generated_playlist, provider
     )
     provider.instance_id = "listenbrainz-instance"
-    provider.get_setup_value.return_value = "listener"
+    provider.get_config_value.return_value = "listener"
     provider.api_client = MagicMock()
     playlist_mbid = "7c05e920-b9be-4b05-a583-a97ad78eae00"
     provider.api_client.get_weekly_exploration = AsyncMock(
@@ -1049,7 +1261,7 @@ async def test_search_errors_abort_the_build(method: str) -> None:
 async def test_genre_artist_errors_abort_the_build(error: Exception) -> None:
     """Do not publish the earlier genres when a later genre fails."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
-    provider.get_setup_value.return_value = "listener"
+    provider.get_config_value.return_value = "listener"
     provider._get_lb_radio_pop_range.return_value = (75, 100)
     provider.api_client = MagicMock()
     provider.api_client.get_user_genre_activity = AsyncMock(return_value=[{"genre": "rock"}])

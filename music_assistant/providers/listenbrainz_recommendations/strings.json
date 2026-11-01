@@ -7,6 +7,10 @@
     "auth_token": {
       "label": "ListenBrainz User Token",
       "description": "ListenBrainz API token used for authenticated endpoints such as LB-Radio."
+    },
+    "recommendation_user_id": {
+      "label": "Recommendations for Music Assistant user",
+      "description": "Only this Music Assistant user receives recommendations from this ListenBrainz instance. Add a separate instance for each user."
     }
   }
 }

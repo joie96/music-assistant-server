@@ -494,7 +494,7 @@ class ListenBrainzAPIClient:
     async def _request(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         """Execute a GET request, raising when data is unavailable or the request fails."""
         url = f"{self.base_url}{path}"
-        auth_token = self.provider.get_setup_value(CONF_AUTH_TOKEN)
+        auth_token = self.provider.get_config_value(CONF_AUTH_TOKEN)
         headers = (
             {"Authorization": f"Token {auth_token}"}
             if isinstance(auth_token, str) and auth_token.strip()

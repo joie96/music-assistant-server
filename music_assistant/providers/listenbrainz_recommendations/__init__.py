@@ -29,6 +29,7 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
+from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.security import is_safe_path
 from music_assistant.models.media_capabilities import MediaCatalogMixin
@@ -41,6 +42,7 @@ from music_assistant.providers.listenbrainz_recommendations.constants import (
     CONF_LB_RADIO_MODE,
     CONF_LB_RADIO_POP_BEGIN,
     CONF_LB_RADIO_POP_END,
+    CONF_RECOMMENDATION_USER_ID,
     CONF_USERNAME,
     DEFAULT_API_BASE_URL,
     DISCOVERY_CANDIDATES_LIMIT,
@@ -60,6 +62,10 @@ from music_assistant.providers.listenbrainz_recommendations.constants import (
     TOP_TRACKS_LIMIT,
 )
 from music_assistant.providers.listenbrainz_recommendations.cover_art import build_split_cover_png
+from music_assistant.providers.listenbrainz_recommendations.setup_flow import (
+    apply_account_setup_values,
+    get_account_config_entries,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -74,6 +80,7 @@ async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ListenBrainzRecommendationsProvider:
     """Initialize provider(instance) with given configuration."""
+    apply_account_setup_values(mass, config)
     return ListenBrainzRecommendationsProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
@@ -83,6 +90,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return configuration entries for this provider."""
         return (
+            *await get_account_config_entries(self.mass),
             ConfigEntry(
                 key=CONF_API_BASE_URL,
                 type=ConfigEntryType.STRING,
@@ -156,6 +164,8 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's available recommendation rows, without items."""
+        if not self._is_visible_to_current_user():
+            return []
         return [
             RecommendationFolder(
                 item_id=folder.item_id,
@@ -177,6 +187,8 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
         :param item_id: Identifier of the recommendation folder.
         """
+        if not self._is_visible_to_current_user():
+            return UniqueList()
         for folder in self._recommendation_folders:
             if folder.item_id == item_id:
                 return folder.items
@@ -184,6 +196,8 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Return prebuilt playlist object for virtual playlists."""
+        if not self._is_visible_to_current_user(allow_internal=True):
+            raise MediaNotFoundError(f"Unknown ListenBrainz playlist: {prov_playlist_id}")
         payload = self._resolved_virtual_playlists.get(prov_playlist_id)
         if payload is None:
             raise MediaNotFoundError(f"Unknown ListenBrainz playlist: {prov_playlist_id}")
@@ -192,6 +206,8 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Return pre-resolved tracks for virtual playlists."""
+        if not self._is_visible_to_current_user(allow_internal=True):
+            raise MediaNotFoundError(f"Unknown ListenBrainz playlist: {prov_playlist_id}")
         if page > 0:
             return []
         payload = self._resolved_virtual_playlists.get(prov_playlist_id)
@@ -232,6 +248,16 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
             if any(self._normalize_text(entry.name) == artist for entry in album.artists):
                 return album
         return None
+
+    def _is_visible_to_current_user(self, *, allow_internal: bool = False) -> bool:
+        """Check the assigned MA user, optionally allowing server-side playlist playback."""
+        user_id = self.get_config_value(CONF_RECOMMENDATION_USER_ID)
+        if not isinstance(user_id, str) or not user_id.strip():
+            return False
+        user = get_current_user()
+        if user is None:
+            return allow_internal
+        return user.user_id == user_id
 
     def _get_lb_radio_pop_range(self) -> tuple[int, int]:
         """Return LB-Radio popularity bounds from provider configuration."""
@@ -475,7 +501,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
             name="Weekly Exploration",
         )
         playlists: dict[str, tuple[Playlist, list[Track]]] = {}
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             self.logger.debug("Skipping weekly Exploration: no username configured")
             return folder, playlists
@@ -503,7 +529,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         folder = RecommendationFolder(
             item_id="similarusers_jam_weekly", provider=self.instance_id, name="Similar Users Jam"
         )
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             self.logger.debug("Skipping similar-users Jam: no username configured")
             return folder, {}
@@ -582,7 +608,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         self,
     ) -> list[RecommendationFolder]:
         """Build a top-level artists folder for each genre."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return []
 
@@ -735,7 +761,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         self,
     ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
         """Build one playlist per genre and pre-resolve its tracks."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return (
                 RecommendationFolder(
@@ -909,7 +935,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         self,
     ) -> tuple[RecommendationFolder, dict[str, tuple[Playlist, list[Track]]]]:
         """Build one playlist per top artist and pre-resolve its tracks."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return (
                 RecommendationFolder(
@@ -1109,7 +1135,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         self,
     ) -> RecommendationFolder:
         """Build the top artists recommendation folder."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
                 item_id="user_top_artists_monthly",
@@ -1156,7 +1182,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
     async def _build_folder_recommendations(self) -> RecommendationFolder:
         """Build recommendations from LB-Radio recs prompt."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
                 item_id="user_recommendations",
@@ -1221,7 +1247,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
     async def _build_folder_top_tracks(self) -> RecommendationFolder:
         """Build the top tracks recommendation folder."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
                 item_id="user_top_tracks_monthly",
@@ -1277,7 +1303,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
 
     async def _build_folder_recent_listens(self) -> RecommendationFolder:
         """Build artists from the user's most recent listens."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return RecommendationFolder(
                 item_id="user_recent_artists",
@@ -1380,7 +1406,7 @@ class ListenBrainzRecommendationsProvider(MediaCatalogMixin, MetadataProvider):
         self,
     ) -> list[RecommendationFolder]:
         """Build a top-level similar-artists folder for each seed artist."""
-        username = self.get_setup_value(CONF_USERNAME)
+        username = self.get_config_value(CONF_USERNAME)
         if not isinstance(username, str) or not username.strip():
             return []
 

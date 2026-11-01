@@ -4,6 +4,7 @@ from music_assistant_models.enums import ProviderFeature
 
 CONF_USERNAME = "username"
 CONF_AUTH_TOKEN = "auth_token"
+CONF_RECOMMENDATION_USER_ID = "recommendation_user_id"
 CONF_API_BASE_URL = "api_base_url"
 CONF_LB_RADIO_POP_BEGIN = "lb_radio_pop_begin"
 CONF_LB_RADIO_POP_END = "lb_radio_pop_end"
