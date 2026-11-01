@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.background_task import TaskSchedule
+from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.enums import ConfigEntryType, MediaType
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import (
@@ -214,23 +215,28 @@ async def test_general_config_contains_account_fields_and_user_dropdown() -> Non
     """Expose account fields with enabled MA users and no plaintext token default."""
     provider = MagicMock(spec=ListenBrainzRecommendationsProvider)
     provider.mass = MagicMock()
-    provider.mass.webserver.auth.list_users = AsyncMock(return_value=[
-        MagicMock(user_id="user-1", display_name="Listener", username="listener", enabled=True),
-        MagicMock(user_id="user-2", display_name="", username="second", enabled=True),
-        MagicMock(user_id="disabled", display_name="Disabled", enabled=False),
-    ])
+    provider.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[
+            MagicMock(user_id="user-1", display_name="Listener", username="listener", enabled=True),
+            MagicMock(user_id="user-2", display_name="", username="second", enabled=True),
+            MagicMock(user_id="disabled", display_name="Disabled", enabled=False),
+        ]
+    )
 
     entries = await ListenBrainzRecommendationsProvider.get_config_entries(provider)
 
     assert [entry.key for entry in entries[:3]] == [
-        "username", "auth_token", "recommendation_user_id"
+        "username",
+        "auth_token",
+        "recommendation_user_id",
     ]
     assert all(entry.required for entry in entries[:3])
     assert entries[1].type == ConfigEntryType.SECURE_STRING
     assert entries[1].default_value is None
     assert entries[1].value is None
     assert [(option.value, option.title) for option in entries[2].options] == [
-        ("user-1", "Listener"), ("user-2", "second")
+        ("user-1", "Listener"),
+        ("user-2", "second"),
     ]
 
 
@@ -321,15 +327,34 @@ async def test_setup_rejects_invalid_user_assignment(invalid_user_id: object) ->
     session.finish.assert_awaited_once_with({**credentials, "recommendation_user_id": "user-1"})
 
 
-def test_setup_values_are_consumed_into_normal_config() -> None:
+@pytest.mark.parametrize("shared_setup_data", [True, False])
+def test_setup_values_are_consumed_into_normal_config(shared_setup_data: bool) -> None:
     """Store setup values once, encrypt the token, and leave no second account state."""
     mass = MagicMock()
-    config = MagicMock(instance_id="listenbrainz_recommendations--test")
     values = {
-        "username": "listener", "auth_token": "test-token", "recommendation_user_id": "user-1"
+        "username": "listener",
+        "auth_token": "test-token",
+        "recommendation_user_id": "user-1",
     }
-    config.setup_data = dict(values)
-    mass.config.get_provider_setup_value.side_effect = lambda _instance, key: values[key]
+    config = ProviderConfig.parse(
+        [],
+        {
+            "type": "metadata",
+            "domain": "listenbrainz_recommendations",
+            "instance_id": "listenbrainz_recommendations--test",
+            "values": {},
+            "setup_data": dict(values),
+        },
+    )
+    raw_config = config.to_raw()
+    if not shared_setup_data:
+        raw_config["setup_data"] = dict(config.setup_data)
+    mass.config.get_provider_setup_value.side_effect = (
+        lambda _instance, key: raw_config["setup_data"][key]
+    )
+    mass.config.remove.side_effect = (
+        lambda path: raw_config["setup_data"].pop(path.rsplit("/", 1)[-1], None)
+    )
 
     apply_account_setup_values(mass, config)
 
@@ -339,6 +364,7 @@ def test_setup_values_are_consumed_into_normal_config() -> None:
         )
         mass.config.remove.assert_any_call(f"providers/{config.instance_id}/setup_data/{key}")
     assert config.setup_data == {}
+    assert raw_config["setup_data"] == {}
     mass.config.save.assert_called_once_with(immediate=True)
     mass.config.reset_mock()
 
@@ -353,12 +379,15 @@ async def test_reconfigure_prefills_current_general_config() -> None:
     session = MagicMock()
     session.context.setup_data = {}
     session.context.values = {
-        "username": "current-listener", "auth_token": "current-token",
-        "recommendation_user_id": "user-1"
+        "username": "current-listener",
+        "auth_token": "current-token",
+        "recommendation_user_id": "user-1",
     }
-    session.mass.webserver.auth.list_users = AsyncMock(return_value=[
-        MagicMock(user_id="user-1", display_name="Listener", enabled=True),
-    ])
+    session.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[
+            MagicMock(user_id="user-1", display_name="Listener", enabled=True),
+        ]
+    )
     session.form = AsyncMock(return_value=dict(session.context.values))
     session.finish = AsyncMock()
 

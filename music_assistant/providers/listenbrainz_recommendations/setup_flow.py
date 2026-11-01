@@ -94,5 +94,5 @@ def apply_account_setup_values(mass: MusicAssistant, config: ProviderConfig) -> 
         )
     for key in pending:
         mass.config.remove(f"{CONF_PROVIDERS}/{config.instance_id}/setup_data/{key}")
-        config.setup_data.pop(key)
+        config.setup_data.pop(key, None)
     mass.config.save(immediate=True)
