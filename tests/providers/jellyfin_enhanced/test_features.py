@@ -50,7 +50,7 @@ def provider() -> MagicMock:
     instance._api = MagicMock(spec=JellyfinClient)
     instance._api.can_edit_playlist.return_value = True
     instance._get_artist_items = AsyncMock(return_value=[])
-    instance._get_playlist_items = AsyncMock(return_value=[])
+    instance._get_playlist_page = AsyncMock(return_value=[])
     instance._get_genres = AsyncMock(return_value=[])
     return instance
 
@@ -180,14 +180,59 @@ async def test_empty_page_stops_pagination() -> None:
 async def test_artist_toplists(provider: MagicMock, method: str) -> None:
     """Top tracks and albums share the community-rating ordering contract."""
     item_type = "Audio" if method == "get_artist_toptracks" else "MusicAlbum"
-    provider._get_artist_items.return_value = [
+    records = [
         media_item("missing", item_type),
         media_item("zero", item_type, CommunityRating=0),
         media_item("best", item_type, CommunityRating=9),
     ]
+    provider._get_artist_items.return_value = records
+    provider._api.get_items.return_value = records
     items = await getattr(JellyfinEnhancedProvider, method).__wrapped__(provider, "artist")
     assert [item.item_id for item in items] == ["best", "zero", "missing"]
-    assert provider._get_artist_items.call_args.args[:2] == ("artist", item_type)
+    provider._get_artist_items.assert_not_awaited()
+    query = provider._api.get_items.call_args
+    assert query.args[0] == item_type
+    assert query.args[2] == {
+        "artistIds": "artist",
+        "sortBy": "CommunityRating,SortName",
+        "sortOrder": "Descending,Ascending",
+    }
+    assert query.kwargs == {"limit": 100}
+
+
+@pytest.mark.parametrize("method", ["get_artist_toptracks", "get_artist_topalbums"])
+@pytest.mark.parametrize("count", [0, 7, 100])
+async def test_artist_toplists_limit_sorted_http_query(
+    provider: MagicMock, method: str, count: int
+) -> None:
+    """The real client requests at most 100 ranked items without scanning further pages."""
+    connection = MagicMock()
+    connection._user_id = "user"
+    item_type = "Audio" if method == "get_artist_toptracks" else "MusicAlbum"
+    records = [
+        media_item(str(index), item_type, CommunityRating=100 - index) for index in range(count)
+    ]
+    connection._session.get_json = AsyncMock(
+        return_value={"Items": records, "TotalRecordCount": 1000 if count == 100 else count}
+    )
+    provider._api = JellyfinClient(connection)
+
+    items = await uncached_method(method)(provider, "artist")
+
+    assert [item.item_id for item in items] == [record["Id"] for record in records]
+    connection._session.get_json.assert_awaited_once()
+    request = connection._session.get_json.call_args
+    assert request.args[0] == "/Items"
+    params = request.args[1]
+    assert params["artistIds"] == "artist"
+    assert params["userId"] == "user"
+    assert params["includeItemTypes"] == item_type
+    assert params["sortBy"] == "CommunityRating,SortName"
+    assert params["sortOrder"] == "Descending,Ascending"
+    assert params["limit"] == "100"
+    assert params["startIndex"] == "0"
+    assert "minCommunityRating" not in params
+    provider._get_artist_items.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -307,15 +352,32 @@ async def test_genre_mix_escapes_names(provider: MagicMock) -> None:
 
 async def test_playlist_removal_uses_entry_ids(provider: MagicMock) -> None:
     """Only selected occurrences are removed when a playlist repeats a track."""
-    provider._get_playlist_items.return_value = [
+    provider._get_playlist_page.return_value = [
         {"Id": "same-track", "PlaylistItemId": "first-entry"},
         {"Id": "same-track", "PlaylistItemId": "second-entry"},
     ]
     await provider.remove_playlist_tracks("playlist", (2, 2))
+    provider._get_playlist_page.assert_awaited_once_with("playlist", 0)
     provider._api.request.assert_awaited_once_with(
         "DELETE", "/Playlists/playlist/Items", {"entryIds": "second-entry"}
     )
     provider.mass.cache.delete.assert_awaited_once_with(None, provider="jellyfin_enhanced-test")
+
+
+async def test_playlist_removal_fetches_only_selected_pages(provider: MagicMock) -> None:
+    """Sparse selections keep absolute positions without loading intervening pages."""
+    provider._get_playlist_page.side_effect = [
+        [{"PlaylistItemId": "first-entry"}],
+        [{"PlaylistItemId": "last-entry"}],
+    ]
+    await provider.remove_playlist_tracks("playlist", (501, 1, 501))
+    assert [call.args for call in provider._get_playlist_page.await_args_list] == [
+        ("playlist", 0),
+        ("playlist", 5),
+    ]
+    provider._api.request.assert_awaited_once_with(
+        "DELETE", "/Playlists/playlist/Items", {"entryIds": "first-entry,last-entry"}
+    )
 
 
 async def test_readonly_playlist_rejects_mutations(provider: MagicMock) -> None:
@@ -331,11 +393,16 @@ async def test_readonly_playlist_rejects_mutations(provider: MagicMock) -> None:
 
 async def test_invalid_playlist_position(provider: MagicMock) -> None:
     """Out-of-range positions cannot accidentally target a different entry."""
-    provider._get_playlist_items.return_value = [{"PlaylistItemId": "entry"}]
-    for position in (0, -1, 2):
+    provider._get_playlist_page.side_effect = lambda _playlist, page: (
+        [{"PlaylistItemId": "entry"}] if page == 0 else []
+    )
+    for position in (0, -1, 2, 101):
         with pytest.raises(InvalidDataError):
             await provider.remove_playlist_tracks("playlist", (position,))
+    with pytest.raises(InvalidDataError):
+        await provider.remove_playlist_tracks("playlist", (1, 101))
     provider._api.request.assert_not_awaited()
+    provider.mass.cache.delete.assert_not_awaited()
 
 
 async def test_playlist_addition_preserves_duplicates(provider: MagicMock) -> None:
@@ -348,11 +415,45 @@ async def test_playlist_addition_preserves_duplicates(provider: MagicMock) -> No
 
 async def test_playlist_page_positions(provider: MagicMock) -> None:
     """Positions after the first hundred entries stay one-based and absolute."""
-    provider._get_playlist_items.return_value = [media_item(str(index)) for index in range(103)]
+    provider._get_playlist_page.return_value = [media_item(str(index)) for index in range(100, 103)]
     items = await provider.get_playlist_tracks("playlist", 1)
+    assert [item.item_id for item in items] == ["100", "101", "102"]
     assert [item.position for item in items] == [101, 102, 103]
+    provider._get_playlist_page.assert_awaited_once_with("playlist", 1)
+    provider._get_playlist_page.reset_mock()
     with pytest.raises(InvalidDataError):
         await provider.get_playlist_tracks("playlist", -1)
+    provider._get_playlist_page.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("page", "count"), [(0, 100), (1, 3), (50, 0)])
+async def test_playlist_page_uses_bounded_http_query(
+    provider: MagicMock, page: int, count: int
+) -> None:
+    """Each display page makes one request even when the playlist has many more entries."""
+    connection = MagicMock()
+    connection._user_id = "user"
+    records = [
+        media_item(str(page * 100 + index), PlaylistItemId=f"entry-{index}")
+        for index in range(count)
+    ]
+    connection._session.get_json = AsyncMock(
+        return_value={"Items": records, "TotalRecordCount": 5000}
+    )
+    provider._api = JellyfinClient(connection)
+    del provider._get_playlist_page
+
+    items = await provider.get_playlist_tracks("playlist", page)
+
+    assert [item.item_id for item in items] == [record["Id"] for record in records]
+    assert [item.position for item in items] == list(range(page * 100 + 1, page * 100 + count + 1))
+    connection._session.get_json.assert_awaited_once()
+    request = connection._session.get_json.call_args
+    assert request.args[0] == "/Playlists/playlist/Items"
+    assert request.args[1]["startIndex"] == str(page * 100)
+    assert request.args[1]["limit"] == "100"
+    assert request.args[1]["userId"] == "user"
+    assert "sortBy" not in request.args[1]
 
 
 async def test_playlist_creation(provider: MagicMock) -> None:

@@ -11,8 +11,9 @@ these files; shared Music Assistant API changes may still require compatibility 
 
 Artist top tracks and top albums are ranked by `CommunityRating`, not listening
 popularity. Rated items sort before unrated items, including a rating of zero.
-Equal ratings sort by name and item ID. Rankings cover all matching artist items,
-with paginated queries rather than a fixed library-size limit.
+Jellyfin selects at most 100 items per top list using server-side rating sorting.
+Returned items with equal ratings sort by name and item ID. Full artist album
+listings and library synchronization remain unlimited.
 
 Recommendations offer recently added albums, highly rated albums and tracks,
 most-played tracks, recently played tracks, and music genres. These are derived
@@ -23,7 +24,9 @@ Favorites change only Jellyfin's user-specific favorite markers. Audio playlists
 can be created and edited when Jellyfin explicitly grants the user write access.
 Servers without the playlist permission endpoint remain read-only. Removing a
 playlist occurrence uses its `PlaylistItemId`, preserving other occurrences of
-the same track. Mutations are not automatically retried.
+the same track. Playlist browsing fetches and caches individual 100-entry pages;
+removal fetches only pages containing selected positions. Mutations are not
+automatically retried.
 
 Existing plain and synchronized lyrics are loaded only for full track details.
 Jellyfin's tick timestamps are converted to Music Assistant's existing LRC field.

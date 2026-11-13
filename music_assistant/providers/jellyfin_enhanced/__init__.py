@@ -356,8 +356,8 @@ class JellyfinEnhancedProvider(MusicProvider):
         if page < 0:
             raise InvalidDataError("Playlist page must not be negative")
         result: list[Track] = []
-        playlist_items = await self._get_playlist_items(prov_playlist_id)
-        for index, jellyfin_track in enumerate(playlist_items[page * 100 : (page + 1) * 100], 1):
+        playlist_items = await self._get_playlist_page(prov_playlist_id, page)
+        for index, jellyfin_track in enumerate(playlist_items, 1):
             pos = (page * 100) + index
             try:
                 if track := parse_track(
@@ -414,12 +414,18 @@ class JellyfinEnhancedProvider(MusicProvider):
         if not positions_to_remove:
             return
         await self._assert_playlist_editable(prov_playlist_id)
-        items = await self._get_playlist_items(prov_playlist_id)
-        if any(position < 1 or position > len(items) for position in positions_to_remove):
+        if any(position < 1 for position in positions_to_remove):
             raise InvalidDataError("Playlist position is out of range")
-        entry_ids = [
-            items[position - 1]["PlaylistItemId"] for position in sorted(set(positions_to_remove))
-        ]
+        pages = {
+            page: await self._get_playlist_page(prov_playlist_id, page)
+            for page in sorted({(position - 1) // 100 for position in positions_to_remove})
+        }
+        entry_ids: list[str] = []
+        for position in sorted(set(positions_to_remove)):
+            page, index = divmod(position - 1, 100)
+            if index >= len(pages[page]):
+                raise InvalidDataError("Playlist position is out of range")
+            entry_ids.append(pages[page][index]["PlaylistItemId"])
         await self._api.request(
             "DELETE", f"/Playlists/{prov_playlist_id}/Items", {"entryIds": ",".join(entry_ids)}
         )
@@ -438,10 +444,19 @@ class JellyfinEnhancedProvider(MusicProvider):
 
     @use_cache(3600)
     async def get_artist_topalbums(self, prov_artist_id: str) -> list[Album]:
-        """Get an artist's albums ranked by Jellyfin community rating."""
+        """Get up to 100 artist albums ranked server-side by Jellyfin community rating."""
         if prov_artist_id == UNKNOWN_ARTIST:
             return []
-        albums = await self._get_artist_items(prov_artist_id, "MusicAlbum", ALBUM_FIELDS)
+        albums = await self._api.get_items(
+            "MusicAlbum",
+            ALBUM_FIELDS,
+            {
+                "artistIds": prov_artist_id,
+                "sortBy": "CommunityRating,SortName",
+                "sortOrder": "Descending,Ascending",
+            },
+            limit=100,
+        )
         return [
             parse_album(self.logger, self.instance_id, self._client, cast("JellyAlbum", album))
             for album in sorted(albums, key=rating_sort_key)
@@ -449,10 +464,19 @@ class JellyfinEnhancedProvider(MusicProvider):
 
     @use_cache(3600)
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
-        """Get an artist's tracks ranked by Jellyfin community rating."""
+        """Get up to 100 artist tracks ranked server-side by Jellyfin community rating."""
         if prov_artist_id == UNKNOWN_ARTIST:
             return []
-        tracks = await self._get_artist_items(prov_artist_id, "Audio", TRACK_FIELDS)
+        tracks = await self._api.get_items(
+            "Audio",
+            TRACK_FIELDS,
+            {
+                "artistIds": prov_artist_id,
+                "sortBy": "CommunityRating,SortName",
+                "sortOrder": "Descending,Ascending",
+            },
+            limit=100,
+        )
         return [
             parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", track))
             for track in sorted(tracks, key=rating_sort_key)
@@ -688,15 +712,22 @@ class JellyfinEnhancedProvider(MusicProvider):
     async def _get_artist_items(
         self, artist_id: str, item_type: str, fields: list[ItemFields]
     ) -> list[dict[str, Any]]:
-        """Share raw rated artist listings between album and top-list requests."""
+        """Cache complete artist listings without applying top-list limits."""
         return await self._api.get_artist_items(artist_id, item_type, fields)
 
     @use_cache(900)
-    async def _get_playlist_items(self, playlist_id: str) -> list[dict[str, Any]]:
-        """Preserve playlist order and entry IDs across every page."""
-        return await self._api.get_items(
-            "Audio", TRACK_FIELDS, {}, limit=None, path=f"/Playlists/{playlist_id}/Items"
+    async def _get_playlist_page(self, playlist_id: str, page: int) -> list[dict[str, Any]]:
+        """Get one 100-entry playlist page with its original order and entry IDs."""
+        response = await self._api.get_json(
+            f"/Playlists/{playlist_id}/Items",
+            {
+                "startIndex": str(page * 100),
+                "limit": "100",
+                "enableUserData": "true",
+                "fields": ",".join(field.value for field in TRACK_FIELDS),
+            },
         )
+        return cast("list[dict[str, Any]]", response["Items"])
 
     async def _assert_playlist_editable(self, playlist_id: str) -> None:
         """Reject writes to shared or legacy playlists without explicit write permission."""
