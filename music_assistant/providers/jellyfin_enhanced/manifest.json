@@ -1,0 +1,12 @@
+{
+  "type": "music",
+  "domain": "jellyfin_enhanced",
+  "stage": "experimental",
+  "name": "Jellyfin Enhanced",
+  "description": "Stream music from Jellyfin with recommendations, playlist editing and lyrics.",
+  "codeowners": ["@joie96"],
+  "credits": ["[aiojellyfin](https://github.com/Jc2k/aiojellyfin)"],
+  "requirements": ["aiojellyfin==0.14.1"],
+  "documentation": "https://github.com/joie96/music-assistant-server/tree/jellyfin_enhancements/music_assistant/providers/jellyfin_enhanced",
+  "multi_instance": true
+}

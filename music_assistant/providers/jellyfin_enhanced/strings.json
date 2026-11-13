@@ -1,0 +1,37 @@
+{
+  "config_entries": {
+    "url": {
+      "label": "Server",
+      "description": "The url of the Jellyfin server to connect to."
+    },
+    "username": {
+      "label": "[%key:common::config_entries::username::label%]",
+      "description": "The username to authenticate to the remote server. For example 'media'."
+    },
+    "password": {
+      "label": "[%key:common::config_entries::password::label%]",
+      "description": "[%key:common::config_entries::password::description%]"
+    },
+    "verify_ssl": {
+      "label": "[%key:common::config_entries::verify_ssl::label%]",
+      "description": "[%key:common::config_entries::verify_ssl::description%]"
+    }
+  },
+  "media": {
+    "folder": {
+      "genres": {"name": "Genres"},
+      "mix": {"name": "Instant mix"}
+    },
+    "recommendations": {
+      "recently_added": {"name": "Recently added albums"},
+      "highest_rated_albums": {"name": "Highest rated albums"},
+      "highest_rated_tracks": {"name": "Highest rated tracks"},
+      "most_played": {"name": "Most played tracks"},
+      "recently_played": {"name": "Recently played tracks"},
+      "genres": {"name": "Genres"}
+    }
+  },
+  "manifest": {
+    "description": "Stream music from Jellyfin with recommendations, playlist editing and lyrics."
+  }
+}
