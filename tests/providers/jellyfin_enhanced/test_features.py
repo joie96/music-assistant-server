@@ -106,8 +106,34 @@ async def test_artwork_does_not_send_credentials_to_foreign_hosts(provider: Magi
 
 def uncached_method(method_name: str) -> Callable[..., Any]:
     """Access cached provider methods without a running cache controller."""
+    if method_name == "get_artist_toptracks":
+        method_name = "_get_artist_toptracks"
     method = getattr(JellyfinEnhancedProvider, method_name)
     return cast("Callable[..., Any]", method.__wrapped__)
+
+
+def test_client_follows_provider_logger(provider: MagicMock) -> None:
+    """Client requests and retry logs follow runtime provider logger replacements."""
+    client = JellyfinClient(provider._client, provider)
+    assert client.logger is provider.logger
+    provider.logger = logging.getLogger("jellyfin_enhanced.configured")
+    assert client.logger is provider.logger
+
+
+async def test_toptracks_logs_provider_cache_hits(
+    provider: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The public entry logs cached listings without issuing another Jellyfin request."""
+    provider.mass.cache.get_with_freshness.return_value = ([], True, True)
+    caplog.set_level(logging.DEBUG, logger=provider.logger.name)
+
+    assert await provider.get_artist_toptracks("artist") == []
+    assert await provider.get_artist_toptracks("artist") == []
+
+    provider._api.get_items.assert_not_awaited()
+    assert caplog.text.count("Jellyfin top tracks start artist=artist") == 2
+    assert caplog.text.count("Jellyfin top tracks finished artist=artist") == 2
+    assert "Jellyfin top tracks fetching" not in caplog.text
 
 
 def test_rating_sort_key() -> None:
@@ -187,7 +213,7 @@ async def test_artist_toplists(provider: MagicMock, method: str) -> None:
     ]
     provider._get_artist_items.return_value = records
     provider._api.get_items.return_value = records
-    items = await getattr(JellyfinEnhancedProvider, method).__wrapped__(provider, "artist")
+    items = await uncached_method(method)(provider, "artist")
     assert [item.item_id for item in items] == ["best", "zero", "missing"]
     provider._get_artist_items.assert_not_awaited()
     query = provider._api.get_items.call_args

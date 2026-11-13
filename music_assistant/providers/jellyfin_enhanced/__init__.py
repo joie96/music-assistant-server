@@ -6,6 +6,7 @@ import hashlib
 import socket
 from asyncio import TaskGroup
 from collections.abc import AsyncGenerator, Sequence
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -168,7 +169,8 @@ class JellyfinEnhancedProvider(MusicProvider):
         except Exception as err:
             raise LoginFailed(f"Authentication failed: {err}") from err
 
-        self._api = JellyfinClient(self._client)
+        self._api = JellyfinClient(self._client, self)
+        self.logger.debug("Jellyfin Enhanced API client initialized for %s", self.instance_id)
 
     @property
     def is_streaming_provider(self) -> bool:
@@ -462,25 +464,22 @@ class JellyfinEnhancedProvider(MusicProvider):
             for album in sorted(albums, key=rating_sort_key)
         ]
 
-    @use_cache(3600)
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get up to 100 artist tracks ranked server-side by Jellyfin community rating."""
-        if prov_artist_id == UNKNOWN_ARTIST:
-            return []
-        tracks = await self._api.get_items(
-            "Audio",
-            TRACK_FIELDS,
-            {
-                "artistIds": prov_artist_id,
-                "sortBy": "CommunityRating,SortName",
-                "sortOrder": "Descending,Ascending",
-            },
-            limit=100,
-        )
-        return [
-            parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", track))
-            for track in sorted(tracks, key=rating_sort_key)
-        ]
+        started = perf_counter()
+        self.logger.debug("Jellyfin top tracks start artist=%s", prov_artist_id)
+        try:
+            tracks = await self._get_artist_toptracks(prov_artist_id)
+            self.logger.debug(
+                "Jellyfin top tracks ready artist=%s returned=%s", prov_artist_id, len(tracks)
+            )
+            return tracks
+        finally:
+            self.logger.debug(
+                "Jellyfin top tracks finished artist=%s elapsed=%.3fs (includes provider cache)",
+                prov_artist_id,
+                perf_counter() - started,
+            )
 
     @use_cache(3600)
     async def get_similar_artists(self, prov_artist_id: str, limit: int = 25) -> list[Artist]:
@@ -802,6 +801,37 @@ class JellyfinEnhancedProvider(MusicProvider):
         for library in libraries:
             if library.get(ITEM_KEY_COLLECTION_TYPE) == COLLECTION_TYPE_PLAYLISTS:
                 result.append(library)
+        return result
+
+    @use_cache(3600)
+    async def _get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
+        """Return cached artist top tracks, fetching and parsing them when needed."""
+        if prov_artist_id == UNKNOWN_ARTIST:
+            return []
+        self.logger.debug(
+            "Jellyfin top tracks fetching artist=%s (provider cache miss/bypass)", prov_artist_id
+        )
+        tracks = await self._api.get_items(
+            "Audio",
+            TRACK_FIELDS,
+            {
+                "artistIds": prov_artist_id,
+                "sortBy": "CommunityRating,SortName",
+                "sortOrder": "Descending,Ascending",
+            },
+            limit=100,
+        )
+        started = perf_counter()
+        result = [
+            parse_track(self.logger, self.instance_id, self._client, cast("JellyTrack", track))
+            for track in sorted(tracks, key=rating_sort_key)
+        ]
+        self.logger.debug(
+            "Jellyfin top tracks parsed artist=%s tracks=%s elapsed=%.3fs",
+            prov_artist_id,
+            len(result),
+            perf_counter() - started,
+        )
         return result
 
 

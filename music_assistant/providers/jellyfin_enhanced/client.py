@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Never, cast
 
 from aiohttp import ClientConnectionError, ClientResponseError
@@ -25,19 +26,35 @@ if TYPE_CHECKING:
     from aiojellyfin import Connection
     from aiojellyfin.const import ItemFields
 
+    from . import JellyfinEnhancedProvider
+
 
 class JellyfinClient:
     """Reuse the authenticated aiojellyfin session without decoding away extra fields."""
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(
+        self, connection: Connection, provider: JellyfinEnhancedProvider | None = None
+    ) -> None:
         """Wrap an authenticated connection; the provider retains session ownership."""
         self.connection = connection
-        self.logger = logging.getLogger(__name__)
+        self._provider = provider
         self.throttler = ThrottlerManager(rate_limit=10, period=1)
+
+    @property
+    def logger(self) -> logging.Logger:
+        """Return the provider's current logger, including runtime log-level changes."""
+        return self._provider.logger if self._provider is not None else logging.getLogger(__name__)
 
     @throttle_with_retries
     async def get_json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         """Fetch raw JSON with the connected user's access restrictions."""
+        started = perf_counter()
+        self.logger.debug(
+            "Jellyfin HTTP GET start path=%s artist=%s offset=%s (throttle slot acquired)",
+            path,
+            params.get("artistIds"),
+            params.get("startIndex"),
+        )
         try:
             return await self.connection._session.get_json(
                 path, {**params, "userId": self.connection._user_id}
@@ -45,6 +62,7 @@ class JellyfinClient:
         except NotFound as err:
             raise MediaNotFoundError("Jellyfin resource not found") from err
         except ClientResponseError as err:
+            self.logger.debug("Jellyfin HTTP GET failed path=%s status=%s", path, err.status)
             if err.status == 429:
                 retry_after = err.headers.get("Retry-After") if err.headers else None
                 raise RateLimited(
@@ -52,7 +70,19 @@ class JellyfinClient:
                 ) from err
             self._raise_http_error(err)
         except (ClientConnectionError, TimeoutError) as err:
+            self.logger.debug(
+                "Jellyfin HTTP GET failed path=%s error_type=%s", path, type(err).__name__
+            )
             raise ProviderUnavailableError("Unable to reach Jellyfin") from err
+        finally:
+            self.logger.debug(
+                "Jellyfin HTTP GET attempt finished path=%s artist=%s offset=%s elapsed=%.3fs "
+                "(excludes outer throttle/retry waits)",
+                path,
+                params.get("artistIds"),
+                params.get("startIndex"),
+                perf_counter() - started,
+            )
 
     async def request(self, method: str, path: str, params: dict[str, str]) -> dict[str, Any]:
         """Send a throttled mutation without retrying potentially successful writes."""
@@ -139,6 +169,14 @@ class JellyfinClient:
         """Fetch a bounded listing, or paginate the full listing when limit is None."""
         items: list[dict[str, Any]] = []
         while True:
+            started = perf_counter()
+            self.logger.debug(
+                "Jellyfin listing page start type=%s artist=%s offset=%s limit=%s",
+                item_type,
+                params.get("artistIds"),
+                len(items),
+                limit,
+            )
             response = await self.get_json(
                 path,
                 {
@@ -157,6 +195,16 @@ class JellyfinClient:
                 },
             )
             page = response["Items"]
+            self.logger.debug(
+                "Jellyfin listing page ready type=%s artist=%s offset=%s returned=%s "
+                "total=%s elapsed=%.3fs (includes throttle/retry waits)",
+                item_type,
+                params.get("artistIds"),
+                len(items),
+                len(page),
+                response["TotalRecordCount"],
+                perf_counter() - started,
+            )
             items.extend(page)
             if (
                 not page
