@@ -42,6 +42,10 @@ async def provider(tmp_path: Path) -> AsyncGenerator[YoutubeMusicEnhancedProvide
     instance = YoutubeMusicEnhancedProvider(mass, manifest, config, SUPPORTED_FEATURES)
     instance.language = "en"
     instance._downloads = set()
+    instance._audio_requests = {}
+    instance._active_audio_requests = set()
+    instance._active_prefetch_requests = set()
+    instance._download_condition = asyncio.Condition()
     instance._prefetch_tasks = {}
     instance._is_unloading = False
     yield instance
@@ -645,3 +649,299 @@ async def test_unload_waits_for_prefetch_writer(provider: YoutubeMusicEnhancedPr
     assert completed.is_set()
     assert not provider._downloads
     assert not provider._prefetch_tasks
+
+
+async def test_three_downloads_run_and_fourth_waits(
+    provider: YoutubeMusicEnhancedProvider, tmp_path: Path
+) -> None:
+    """Three files download concurrently while a cached playback remains immediate."""
+    video_ids = ["abcdefghijk", "bcdefghijkl", "cdefghijklm", "defghijklmn"]
+    started: list[str] = []
+    three_started = asyncio.Event()
+    release = asyncio.Event()
+    cached = CachedStreamInfo(tmp_path / "audio", {"audio_ext": "webm"})
+    provider._file_cache = MagicMock()
+    provider._file_cache.get_hit.side_effect = lambda video_id: (
+        cached if video_id == "efghijklmno" else None
+    )
+    stream_format = {"format_id": "251", "url": "https://example.com/audio"}
+
+    async def download(video_id: str, _format: dict[str, Any]) -> CachedStreamInfo:
+        started.append(video_id)
+        if len(started) == 3:
+            three_started.set()
+        await release.wait()
+        return cached
+
+    with (
+        patch.object(provider, "_get_stream_format", AsyncMock(return_value=stream_format)),
+        patch.object(provider, "_download_and_cache", side_effect=download),
+        patch.object(provider, "_schedule_prefetch"),
+    ):
+        requests = [asyncio.create_task(provider._get_audio(video_id)) for video_id in video_ids]
+        try:
+            await asyncio.wait_for(three_started.wait(), timeout=5)
+            assert set(started) == set(video_ids[:3])
+            assert len(provider._active_audio_requests) == 3
+            details = await asyncio.wait_for(
+                provider.get_stream_details("efghijklmno", MediaType.TRACK), timeout=1
+            )
+            assert details.stream_type == StreamType.LOCAL_FILE
+            assert set(started) == set(video_ids[:3])
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*requests), timeout=5)
+    assert len(started) == 4
+    assert set(started) == set(video_ids)
+    assert not provider._active_audio_requests
+    assert not provider._audio_requests
+
+
+@pytest.mark.parametrize("phase", ["availability", "download"])
+async def test_shared_audio_survives_one_cancelled_client(
+    provider: YoutubeMusicEnhancedProvider, tmp_path: Path, phase: str
+) -> None:
+    """An overlapping restart shares both availability waits and in-progress downloads."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cached = CachedStreamInfo(tmp_path / "audio", {"audio_ext": "webm"})
+    provider._file_cache = MagicMock()
+    provider._file_cache.get_hit.return_value = None
+
+    async def resolve(_video_id: str) -> dict[str, Any]:
+        if phase == "availability":
+            started.set()
+            await release.wait()
+        return {"format_id": "251", "url": "https://example.com/audio"}
+
+    async def download(_video_id: str, _format: dict[str, Any]) -> CachedStreamInfo:
+        if phase == "download":
+            started.set()
+            await release.wait()
+        return cached
+
+    with (
+        patch.object(provider, "_get_stream_format", side_effect=resolve) as extract,
+        patch.object(provider, "_download_and_cache", side_effect=download) as writer,
+    ):
+        first = asyncio.create_task(provider._get_audio("abcdefghijk"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        second = asyncio.create_task(provider._get_audio("abcdefghijk"))
+        try:
+            await asyncio.sleep(0)
+            assert provider._audio_requests["abcdefghijk"].waiters == 2
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(first, timeout=1)
+            assert not second.done()
+        finally:
+            release.set()
+            await asyncio.gather(first, return_exceptions=True)
+            result = await asyncio.wait_for(second, timeout=5)
+    assert result[1] == cached
+    extract.assert_awaited_once_with("abcdefghijk")
+    writer.assert_awaited_once()
+    assert not provider._audio_requests
+
+
+async def test_playback_is_admitted_before_waiting_prefetch(
+    provider: YoutubeMusicEnhancedProvider,
+) -> None:
+    """Only one prefetch runs and a queued playback gets the next free slot first."""
+    video_ids = ["abcdefghijk", "bcdefghijkl", "cdefghijklm", "defghijklmn", "efghijklmno"]
+    started = {video_id: asyncio.Event() for video_id in video_ids}
+    release = {video_id: asyncio.Event() for video_id in video_ids}
+    order: list[str] = []
+    provider._file_cache = MagicMock()
+    provider._file_cache.get_hit.return_value = None
+
+    async def resolve(video_id: str) -> dict[str, Any]:
+        order.append(video_id)
+        started[video_id].set()
+        await release[video_id].wait()
+        return {"format_id": "251", "url": "https://example.com/audio", "is_live": True}
+
+    with patch.object(provider, "_get_stream_format", side_effect=resolve):
+        requests = [asyncio.create_task(provider._get_audio(video_ids[0], is_prefetch=True))]
+        await asyncio.wait_for(started[video_ids[0]].wait(), timeout=5)
+        requests.append(asyncio.create_task(provider._get_audio(video_ids[1], is_prefetch=True)))
+        requests.extend(
+            asyncio.create_task(provider._get_audio(video_id)) for video_id in video_ids[2:]
+        )
+        try:
+            await asyncio.wait_for(started[video_ids[3]].wait(), timeout=5)
+            assert not started[video_ids[1]].is_set()
+            assert not started[video_ids[4]].is_set()
+            assert len(provider._active_prefetch_requests) == 1
+            release[video_ids[0]].set()
+            await asyncio.wait_for(started[video_ids[4]].wait(), timeout=5)
+            assert not started[video_ids[1]].is_set()
+            release[video_ids[2]].set()
+            await asyncio.wait_for(started[video_ids[1]].wait(), timeout=5)
+        finally:
+            for event in release.values():
+                event.set()
+            await asyncio.wait_for(asyncio.gather(*requests), timeout=5)
+    assert order[0] == video_ids[0]
+    assert set(order[1:3]) == set(video_ids[2:4])
+    assert order[3:] == [video_ids[4], video_ids[1]]
+    assert not provider._active_prefetch_requests
+
+
+async def test_failed_shared_request_does_not_poison_retries(
+    provider: YoutubeMusicEnhancedProvider,
+) -> None:
+    """A completed failure is removed so a later playback can resolve again."""
+    stream_format = {"format_id": "251", "url": "https://example.com/audio"}
+    with patch.object(
+        provider,
+        "_get_stream_format",
+        AsyncMock(side_effect=[UnplayableMediaError("Unavailable"), stream_format]),
+    ) as resolve:
+        with pytest.raises(UnplayableMediaError, match="Unavailable"):
+            await provider._get_audio("abcdefghijk")
+        assert not provider._audio_requests
+        assert (await provider._get_audio("abcdefghijk"))[0] == stream_format
+    assert resolve.await_count == 2
+    assert not provider._active_audio_requests
+
+
+async def test_playback_promotes_shared_prefetch(
+    provider: YoutubeMusicEnhancedProvider,
+) -> None:
+    """Playing a prefetched video reuses its operation and frees the background allowance."""
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resolve(video_id: str) -> dict[str, Any]:
+        (first_started if video_id == "abcdefghijk" else second_started).set()
+        await release.wait()
+        return {"format_id": "251", "url": "https://example.com/audio"}
+
+    with patch.object(provider, "_get_stream_format", side_effect=resolve) as extract:
+        first = asyncio.create_task(provider._get_audio("abcdefghijk", is_prefetch=True))
+        await asyncio.wait_for(first_started.wait(), timeout=5)
+        second = asyncio.create_task(provider._get_audio("bcdefghijkl", is_prefetch=True))
+        playback = asyncio.create_task(provider._get_audio("abcdefghijk"))
+        try:
+            await asyncio.wait_for(second_started.wait(), timeout=5)
+            assert provider._active_audio_requests == {"abcdefghijk", "bcdefghijkl"}
+            assert provider._active_prefetch_requests == {"bcdefghijkl"}
+            assert provider._audio_requests["abcdefghijk"].waiters == 2
+        finally:
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(first, second, playback), timeout=5)
+    assert results[0] == results[2]
+    assert extract.await_count == 2
+    assert not provider._audio_requests
+
+
+async def test_last_cancelled_client_stops_availability_wait(
+    provider: YoutubeMusicEnhancedProvider,
+) -> None:
+    """An availability wait without consumers is cancelled and releases its slot."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def resolve(_video_id: str) -> dict[str, Any]:
+        started.set()
+        try:
+            await release.wait()
+            return {}
+        finally:
+            stopped.set()
+
+    with patch.object(provider, "_get_stream_format", side_effect=resolve):
+        request = asyncio.create_task(provider._get_audio("abcdefghijk"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        request.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=1)
+            assert stopped.is_set()
+            assert not provider._audio_requests
+            assert not provider._active_audio_requests
+        finally:
+            release.set()
+            await asyncio.gather(request, return_exceptions=True)
+
+
+async def test_cancelled_extraction_holds_slot_until_thread_finishes(
+    provider: YoutubeMusicEnhancedProvider,
+) -> None:
+    """Cancelling an await cannot release capacity while yt-dlp still runs in its thread."""
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def extract(_url: str, *, download: bool) -> dict[str, Any]:
+        assert download is False
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(timeout=5)
+            return {"formats": [{"format_id": "251", "url": "https://example.com/audio"}]}
+        finally:
+            completed.set()
+
+    provider._yt_dlp_module = MagicMock(utils=yt_dlp.utils)
+    provider._yt_dlp_module.YoutubeDL.return_value.__enter__.return_value.extract_info.side_effect = extract
+    request = asyncio.create_task(provider._get_audio("abcdefghijk"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        request.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not request.done()
+        assert provider._active_audio_requests == {"abcdefghijk"}
+        assert not completed.is_set()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), timeout=5)
+    assert request.cancelled()
+    assert completed.is_set()
+    assert not provider._audio_requests
+    assert not provider._active_audio_requests
+
+
+async def test_unload_during_cancelled_audio_request_waits_for_writer(
+    provider: YoutubeMusicEnhancedProvider,
+) -> None:
+    """Unload must not cancel a shared operation again while it drains its writer."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    provider._file_cache = MagicMock()
+    provider._file_cache.get_hit.return_value = None
+
+    async def download(_video_id: str, _format: dict[str, Any]) -> None:
+        started.set()
+        await release.wait()
+        completed.set()
+
+    with (
+        patch.object(provider, "_get_stream_format", AsyncMock(return_value={"format_id": "251"})),
+        patch.object(provider, "_download_and_cache", side_effect=download),
+        patch("music_assistant.models.music_provider.MusicProvider.unload", AsyncMock()),
+    ):
+        request = asyncio.create_task(provider._get_audio("abcdefghijk"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        request.cancel()
+        unloading = asyncio.create_task(provider.unload())
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not unloading.done()
+            assert not completed.is_set()
+            assert provider._audio_requests["abcdefghijk"].task.cancelling() == 1
+        finally:
+            release.set()
+            await asyncio.wait_for(unloading, timeout=5)
+            await asyncio.gather(request, return_exceptions=True)
+    assert completed.is_set()
+    assert not provider._downloads
+    assert not provider._audio_requests
+    assert not provider._active_audio_requests

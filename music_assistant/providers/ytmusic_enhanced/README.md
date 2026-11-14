@@ -67,10 +67,26 @@ It then falls back to yt-dlp's `m4a/bestaudio/best` selector. Failed extractions
 are retried up to three total attempts, waiting one and then two seconds.
 
 The provider honors yt-dlp's `available_at` timestamp, waiting at most 45 seconds.
-Disk I/O and yt-dlp run outside the event loop. Parallel downloads for the same
-instance are serialized and reuse completed files; unload and cancellation wait
-for outstanding writers. yt-dlp remains dynamically installed as in the original
-provider, and no PO-token plugin is installed.
+Each instance admits at most three audio operations concurrently, including
+extraction, availability waits and downloads. At most one operation is speculative
+prefetch; waiting playback requests take priority. Playback can use all three
+slots. A playback joining a prefetch promotes that same operation rather than
+starting another extraction or download.
+
+Overlapping requests for the same video share extraction, the availability wait
+and the download. Cancelling one consumer does not abort the others. When the last
+consumer leaves, a queued operation or availability wait is cancelled; already
+started extraction threads and cache writers finish before cancellation or unload
+completes. A new
+request arriving during that cleanup waits for it before retrying.
+
+Disk I/O and yt-dlp run outside the event loop. Downloads run without holding the
+cache lock, so existing cache hits remain accessible. Publication and LRU eviction
+are serialized to preserve the retained-size limit; temporary files from up to
+three simultaneous downloads require additional disk space. Music Assistant's
+three playback-source slots remain separate from this network-operation limit.
+yt-dlp remains dynamically installed as in the original provider, and no PO-token
+plugin is installed.
 
 ## Logging
 

@@ -11,6 +11,7 @@ import time
 from collections import Counter
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -111,6 +112,7 @@ PREFERRED_AUDIO_FORMAT_IDS = ("141", "251", "140", "171", "250", "249", "139")
 EXTRACT_ATTEMPTS = 3
 EXTRACT_RETRY_DELAY = 1.0
 PREFETCH_AHEAD = 3
+MAX_PARALLEL_DOWNLOADS = 3
 
 SUPPORTED_FEATURES = {
     ProviderFeature.BROWSE,
@@ -125,6 +127,16 @@ SUPPORTED_FEATURES = {
 
 
 # ruff: noqa: PLW2901
+
+
+@dataclass
+class _AudioRequest:
+    """Own a shared extraction/download and its playback or prefetch consumers."""
+
+    task: asyncio.Task[tuple[dict[str, Any], CachedStreamInfo | None]]
+    is_foreground: bool
+    waiters: int = 0
+    is_waiting: bool = True
 
 
 class _YtDlpLogger:
@@ -196,6 +208,10 @@ class YoutubeMusicEnhancedProvider(RecommendationPayloadMixin, MusicProvider):
     async def handle_async_init(self) -> None:
         """Set up the YTMusic provider."""
         self._downloads: set[asyncio.Task[CachedStreamInfo | None]] = set()
+        self._audio_requests: dict[str, _AudioRequest] = {}
+        self._active_audio_requests: set[str] = set()
+        self._active_prefetch_requests: set[str] = set()
+        self._download_condition = asyncio.Condition()
         self._prefetch_tasks: dict[str, asyncio.Task[None]] = {}
         self._is_unloading = False
         await self._install_packages()
@@ -245,9 +261,13 @@ class YoutubeMusicEnhancedProvider(RecommendationPayloadMixin, MusicProvider):
             len(prefetch_tasks),
             len(self._downloads),
         )
-        for task in prefetch_tasks:
-            task.cancel()
-        await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+        audio_tasks = tuple(request.task for request in self._audio_requests.values())
+        for prefetch_task in prefetch_tasks:
+            prefetch_task.cancel()
+        for audio_task in audio_tasks:
+            if not audio_task.cancelling():
+                audio_task.cancel()
+        await asyncio.gather(*prefetch_tasks, *audio_tasks, return_exceptions=True)
         if self._downloads:
             await asyncio.gather(*self._downloads, return_exceptions=True)
         await super().unload(is_removed)
@@ -592,20 +612,10 @@ class YoutubeMusicEnhancedProvider(RecommendationPayloadMixin, MusicProvider):
                 self._schedule_prefetch(video_id)
                 return self._cached_stream_details(item_id, media_type, cached)
             self.logger.debug("Audio cache miss for %s", video_id)
-        stream_format = await self._get_stream_format(item_id=video_id)
-        if self._file_cache and not stream_format.get("is_live"):
-            try:
-                cached = await self._cache_stream(video_id, stream_format)
-                if cached:
-                    self._schedule_prefetch(video_id)
-                    return self._cached_stream_details(item_id, media_type, cached)
-            except (OSError, ValueError, UnplayableMediaError) as err:
-                self.logger.warning(
-                    "Audio cache failed for %s; streaming instead (%s): %s",
-                    video_id,
-                    type(err).__name__,
-                    sanitize_text(str(err)),
-                )
+        stream_format, cached = await self._get_audio(video_id)
+        if cached:
+            self._schedule_prefetch(video_id)
+            return self._cached_stream_details(item_id, media_type, cached)
         url = stream_format["url"]
         expiration = DEFAULT_STREAM_URL_EXPIRATION
         if parsed := parse_qs(urlparse(url).query):
@@ -1048,10 +1058,8 @@ class YoutubeMusicEnhancedProvider(RecommendationPayloadMixin, MusicProvider):
                 if await asyncio.to_thread(self._file_cache.get_hit, video_id):
                     self.logger.debug("Prefetch cache hit for %s", video_id)
                     continue
-                stream_format = await self._get_stream_format(video_id)
-                if not stream_format.get("is_live"):
-                    await self._cache_stream(video_id, stream_format)
-                else:
+                stream_format, _cached = await self._get_audio(video_id, is_prefetch=True)
+                if stream_format.get("is_live"):
                     self.logger.debug("Skipping live stream %s during prefetch", video_id)
             except Exception as err:
                 self.logger.debug(
@@ -1060,6 +1068,109 @@ class YoutubeMusicEnhancedProvider(RecommendationPayloadMixin, MusicProvider):
                     type(err).__name__,
                     sanitize_text(str(err)),
                 )
+
+    async def _get_audio(
+        self, video_id: str, *, is_prefetch: bool = False
+    ) -> tuple[dict[str, Any], CachedStreamInfo | None]:
+        """Share the entire resolution, availability wait and download by video ID."""
+        if self._is_unloading:
+            raise UnplayableMediaError("YouTube Music provider is unloading")
+        request = self._audio_requests.get(video_id)
+        while request is not None and request.task.cancelling():
+            await asyncio.shield(asyncio.gather(request.task, return_exceptions=True))
+            request = self._audio_requests.get(video_id)
+            if self._is_unloading:
+                raise UnplayableMediaError("YouTube Music provider is unloading")
+        if request is None:
+            task = asyncio.create_task(self._run_audio_request(video_id))
+            request = _AudioRequest(task, is_foreground=not is_prefetch)
+            self._audio_requests[video_id] = request
+            task.add_done_callback(
+                lambda completed: self._forget_audio_request(video_id, completed)
+            )
+        else:
+            self.logger.debug("Joining pending audio request for %s", video_id)
+            if not is_prefetch:
+                request.is_foreground = True
+        request.waiters += 1
+        try:
+            async with self._download_condition:
+                if request.is_foreground:
+                    self._active_prefetch_requests.discard(video_id)
+                self._download_condition.notify_all()
+            return await asyncio.shield(request.task)
+        finally:
+            request.waiters -= 1
+            if request.waiters == 0 and not request.task.done():
+                if not request.task.cancelling():
+                    request.task.cancel()
+                await asyncio.gather(request.task, return_exceptions=True)
+            async with self._download_condition:
+                self._download_condition.notify_all()
+
+    def _forget_audio_request(
+        self, video_id: str, task: asyncio.Task[tuple[dict[str, Any], CachedStreamInfo | None]]
+    ) -> None:
+        request = self._audio_requests.get(video_id)
+        if request is not None and request.task is task:
+            del self._audio_requests[video_id]
+
+    async def _run_audio_request(
+        self, video_id: str
+    ) -> tuple[dict[str, Any], CachedStreamInfo | None]:
+        """Limit network operations to three and admit playback before prefetch."""
+        request = self._audio_requests[video_id]
+
+        def has_capacity() -> bool:
+            if len(self._active_audio_requests) >= MAX_PARALLEL_DOWNLOADS:
+                return False
+            if request.is_foreground:
+                return True
+            return not self._active_prefetch_requests and not any(
+                pending.is_foreground and pending.is_waiting
+                for pending in self._audio_requests.values()
+            )
+
+        try:
+            async with self._download_condition:
+                await self._download_condition.wait_for(has_capacity)
+                request.is_waiting = False
+                self._active_audio_requests.add(video_id)
+                if not request.is_foreground:
+                    self._active_prefetch_requests.add(video_id)
+                self.logger.debug(
+                    "Starting %s audio request for %s (%s/%s slots active)",
+                    "playback" if request.is_foreground else "prefetch",
+                    video_id,
+                    len(self._active_audio_requests),
+                    MAX_PARALLEL_DOWNLOADS,
+                )
+            if self._file_cache:
+                cached = await asyncio.to_thread(self._file_cache.get_hit, video_id)
+                if cached:
+                    return {}, cached
+            stream_format = await self._get_stream_format(video_id)
+            cached = None
+            if self._file_cache and not stream_format.get("is_live"):
+                try:
+                    cached = await self._cache_stream(video_id, stream_format)
+                except (OSError, ValueError, UnplayableMediaError) as err:
+                    if request.is_foreground:
+                        self.logger.warning(
+                            "Audio cache failed for %s; streaming instead (%s): %s",
+                            video_id,
+                            type(err).__name__,
+                            sanitize_text(str(err)),
+                        )
+                    else:
+                        raise
+            return stream_format, cached
+        finally:
+            async with self._download_condition:
+                request.is_waiting = False
+                self._active_audio_requests.discard(video_id)
+                self._active_prefetch_requests.discard(video_id)
+                self._download_condition.notify_all()
 
     async def _cache_stream(
         self, video_id: str, stream_format: dict[str, Any]
@@ -1230,7 +1341,12 @@ class YoutubeMusicEnhancedProvider(RecommendationPayloadMixin, MusicProvider):
                     attempt + 1,
                     EXTRACT_ATTEMPTS,
                 )
-                stream_format = await asyncio.to_thread(_extract_best_stream_url_format)
+                extraction = asyncio.create_task(asyncio.to_thread(_extract_best_stream_url_format))
+                try:
+                    stream_format = await asyncio.shield(extraction)
+                except asyncio.CancelledError:
+                    await asyncio.gather(extraction, return_exceptions=True)
+                    raise
                 break
             except Exception as err:
                 if attempt == EXTRACT_ATTEMPTS - 1:

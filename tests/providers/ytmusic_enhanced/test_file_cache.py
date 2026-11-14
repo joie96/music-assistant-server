@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock
@@ -41,6 +42,52 @@ def test_parallel_requests_only_download_once(tmp_path: Path) -> None:
         )
     assert results[0] == results[1]
     download.assert_called_once()
+
+
+def test_different_downloads_do_not_block_existing_cache_hits(tmp_path: Path) -> None:
+    """Three network workers may run while a completed cache entry remains readable."""
+    cache = FileCache(tmp_path)
+    cached = cache.get_or_download("abcdefghijk", download_audio)
+    started = threading.Barrier(4)
+    release = threading.Event()
+
+    def download(directory: Path) -> CachedStreamInfo:
+        started.wait(timeout=5)
+        assert release.wait(timeout=5)
+        return download_audio(directory)
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        pending = [
+            workers.submit(cache.get_or_download, video_id, download)
+            for video_id in ("bcdefghijkl", "cdefghijklm", "defghijklmn")
+        ]
+        try:
+            started.wait(timeout=5)
+            assert workers.submit(cache.get_hit, "abcdefghijk").result(timeout=1) == cached
+        finally:
+            release.set()
+        assert all(task.result(timeout=5) is not None for task in pending)
+    assert not list(tmp_path.glob(".download-*"))
+
+
+def test_parallel_publication_preserves_size_limit(tmp_path: Path) -> None:
+    """Concurrent completed downloads cannot race past the retained-audio limit."""
+    cache = FileCache(tmp_path, max_size_bytes=10)
+    started = threading.Barrier(3)
+
+    def download(directory: Path) -> CachedStreamInfo:
+        started.wait(timeout=5)
+        return download_audio(directory)
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        list(
+            workers.map(
+                lambda video_id: cache.get_or_download(video_id, download),
+                ("abcdefghijk", "bcdefghijkl", "cdefghijklm"),
+            )
+        )
+    assert sum(audio.stat().st_size for audio in tmp_path.glob("*/audio")) == 10
+    assert not list(tmp_path.glob(".download-*"))
 
 
 def test_cache_evicts_least_recently_used(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

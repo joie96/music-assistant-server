@@ -1,4 +1,4 @@
-"""Persistent audio cache; blocking operations are serialized within each instance."""
+"""Persistent audio cache with parallel downloads and serialized publication."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import threading
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ class FileCache:
         self.max_size_bytes = max_size_bytes
         self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._lock = threading.RLock()
+        self._downloads: dict[str, Future[CachedStreamInfo | None]] = {}
 
     def ensure_ready(self) -> None:
         """Create the cache root and enforce the configured limit."""
@@ -83,40 +85,67 @@ class FileCache:
         with self._lock:
             if hit := self.get_hit(video_id):
                 return hit
-            entry = self._entry(video_id)
-            if entry.is_symlink():
-                raise ValueError("Cache entries must not be symbolic links")
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix=".download-", dir=self.cache_dir) as work:
-                work_dir = Path(work)
-                downloaded = download(work_dir)
-                audio = downloaded.audio_path.resolve()
-                if not audio.is_relative_to(work_dir.resolve()) or not audio.is_file():
-                    raise ValueError("Download escaped its temporary directory")
-                size = audio.stat().st_size
-                if not size:
-                    raise ValueError("Download produced an empty audio file")
-                expected_size = downloaded.metadata.get("filesize")
-                if expected_size is not None and size != expected_size:
-                    raise ValueError("Download size does not match the selected audio format")
-                if self.max_size_bytes and size > self.max_size_bytes:
-                    self._logger.debug(
-                        "Discarding oversized audio for %s: %s bytes exceed the %s byte limit",
-                        video_id,
-                        size,
-                        self.max_size_bytes,
-                    )
-                    return None
-                metadata = {**downloaded.metadata, "size": size}
-                staged = work_dir / "complete"
-                staged.mkdir()
-                audio.replace(staged / "audio")
-                (staged / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            pending = self._downloads.get(video_id)
+            owns_download = pending is None
+            if pending is None:
+                pending = Future()
+                self._downloads[video_id] = pending
+        if not owns_download:
+            return pending.result()
+        try:
+            result = self._download(video_id, download)
+            pending.set_result(result)
+            return result
+        except BaseException as err:
+            pending.set_exception(err)
+            raise
+        finally:
+            with self._lock:
+                del self._downloads[video_id]
+
+    def _download(
+        self, video_id: str, download: Callable[[Path], CachedStreamInfo]
+    ) -> CachedStreamInfo | None:
+        entry = self._entry(video_id)
+        if entry.is_symlink():
+            raise ValueError("Cache entries must not be symbolic links")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".download-", dir=self.cache_dir) as work:
+            work_dir = Path(work)
+            downloaded = download(work_dir)
+            audio = downloaded.audio_path.resolve()
+            if not audio.is_relative_to(work_dir.resolve()) or not audio.is_file():
+                raise ValueError("Download escaped its temporary directory")
+            size = audio.stat().st_size
+            if not size:
+                raise ValueError("Download produced an empty audio file")
+            expected_size = downloaded.metadata.get("filesize")
+            if expected_size is not None and size != expected_size:
+                raise ValueError("Download size does not match the selected audio format")
+            if self.max_size_bytes and size > self.max_size_bytes:
+                self._logger.debug(
+                    "Discarding oversized audio for %s: %s bytes exceed the %s byte limit",
+                    video_id,
+                    size,
+                    self.max_size_bytes,
+                )
+                return None
+            metadata = {**downloaded.metadata, "size": size}
+            staged = work_dir / "complete"
+            staged.mkdir()
+            audio.replace(staged / "audio")
+            (staged / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with self._lock:
+                if hit := self.get_hit(video_id):
+                    return hit
+                entry = self._entry(video_id)
+                if entry.is_symlink():
+                    raise ValueError("Cache entries must not be symbolic links")
                 if entry.exists():
                     shutil.rmtree(entry)
                 self._evict(incoming_size=size)
                 staged.replace(entry)
-            return CachedStreamInfo(entry / "audio", metadata)
+        return CachedStreamInfo(entry / "audio", metadata)
 
     def _entry(self, video_id: str) -> Path:
         if not VIDEO_ID.fullmatch(video_id):
