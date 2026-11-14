@@ -7,7 +7,7 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, Never, cast
 
 from aiohttp import ClientConnectionError, ClientResponseError
-from aiojellyfin import NotFound
+from aiojellyfin.session import NotFound
 from music_assistant_models.errors import (
     LoginFailed,
     MediaNotFoundError,

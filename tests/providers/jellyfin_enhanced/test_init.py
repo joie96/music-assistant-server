@@ -5,13 +5,14 @@ from typing import TYPE_CHECKING, Any
 from unittest import mock
 
 import pytest
-from aiojellyfin import Connection, NotFound
+from aiojellyfin.session import NotFound
 from aiojellyfin.testing import FixtureBuilder
 
 from music_assistant.mass import MusicAssistant
 from tests.common import get_fixtures_dir, wait_for_sync_completion
 
 if TYPE_CHECKING:
+    from aiojellyfin import Connection
     from aiojellyfin.session import SessionConfiguration
     from music_assistant_models.config_entries import ProviderConfig
 

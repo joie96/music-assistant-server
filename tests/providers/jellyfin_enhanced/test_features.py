@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import ClientResponseError, ClientSession
-from aiojellyfin import Connection, ItemFields, NotFound
-from aiojellyfin.session import SessionConfiguration
+from aiojellyfin import Connection, ItemFields
+from aiojellyfin.session import NotFound, SessionConfiguration
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import (
     InvalidDataError,
@@ -562,6 +562,28 @@ async def test_missing_lyrics_and_legacy_permissions() -> None:
     client = JellyfinClient(connection)
     assert await client.get_lyrics("track") is None
     assert await client.can_edit_playlist("playlist") is False
+
+
+async def test_client_maps_session_not_found() -> None:
+    """The SDK's HTTP 404 remains a missing-resource error for required endpoints."""
+    connection = MagicMock()
+    connection._session.get_json = AsyncMock(side_effect=NotFound("Resource not found"))
+    with pytest.raises(MediaNotFoundError):
+        await JellyfinClient(connection).get_json("/Items/track", {})
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [(401, LoginFailed), (403, ProviderPermissionDenied), (500, ProviderUnavailableError)],
+)
+async def test_lyrics_propagates_http_errors(status: int, error_type: type[Exception]) -> None:
+    """Only missing lyrics are optional; authentication and server failures propagate."""
+    connection = MagicMock()
+    connection._session.get_json = AsyncMock(
+        side_effect=ClientResponseError(MagicMock(), (), status=status)
+    )
+    with pytest.raises(error_type):
+        await JellyfinClient(connection).get_lyrics("track")
 
 
 async def test_legacy_favorite_route() -> None:
