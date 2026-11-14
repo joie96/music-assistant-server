@@ -1,0 +1,20 @@
+{
+  "type": "music",
+  "domain": "ytmusic_enhanced",
+  "stage": "experimental",
+  "name": "YouTube Music Enhanced",
+  "description": "Browse public YouTube Music metadata and play audio through yt-dlp with a configurable file cache.",
+  "codeowners": ["@joie96"],
+  "credits": [
+    "[Music Assistant YouTube Music provider](https://github.com/music-assistant/server/tree/dev/music_assistant/providers/ytmusic)",
+    "[ytmusicapi](https://github.com/sigma67/ytmusicapi)",
+    "[yt-dlp](https://github.com/yt-dlp/yt-dlp)",
+    "[YouTube audio cache design](https://github.com/joie96/music-assistant-yt-dlp)"
+  ],
+  "requirements": [
+    "ytmusicapi==1.12.3",
+    "duration-parser==1.0.1",
+    "deno==2.9.6"
+  ],
+  "multi_instance": true
+}

@@ -1,0 +1,19 @@
+{
+  "config_entries": {
+    "cache_enabled": {
+      "label": "Enable audio file cache",
+      "description": "Download complete audio files with yt-dlp and reuse them for subsequent playback."
+    },
+    "cache_dir": {
+      "label": "Audio cache directory",
+      "description": "Writable directory on the Music Assistant server. Each provider instance stores its files in a separate subdirectory. Container installations require a mounted writable directory."
+    },
+    "cache_max_size_mb": {
+      "label": "Maximum audio cache size (MB)",
+      "description": "Maximum retained audio size per provider instance in MiB (default: 1024). Set 0 for unlimited storage. Least recently used files are removed first; larger files are streamed without caching. Temporary downloads and metadata are not included."
+    }
+  },
+  "manifest": {
+    "description": "Browse public YouTube Music metadata and play audio through yt-dlp with a configurable file cache."
+  }
+}
