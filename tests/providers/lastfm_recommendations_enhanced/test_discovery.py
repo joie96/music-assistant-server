@@ -1,7 +1,7 @@
 """Discovery builders use bounded sources, batched resolution and source attribution."""
 
 import logging
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from music_assistant_models.enums import ExternalID, LinkType, MediaType, ProviderFeature
@@ -9,11 +9,16 @@ from music_assistant_models.errors import RateLimited, ResourceTemporarilyUnavai
 from music_assistant_models.media_items import Artist, ItemMapping, Track, UniqueList
 from music_assistant_models.statistics import TopItemResult
 
-from music_assistant.providers.lastfm_recommendations_enhanced.api_client import LastFMItem
+from music_assistant.helpers.throttle_retry import ThrottlerManager
+from music_assistant.providers.lastfm_recommendations_enhanced.api_client import (
+    LastFMAPIClient,
+    LastFMItem,
+)
 from music_assistant.providers.lastfm_recommendations_enhanced.recommendations import (
     DISCOVERY_FOLDERS,
     SOURCE_SEARCH_BUDGET,
     LastFMDiscovery,
+    PersonalSeed,
 )
 
 
@@ -296,6 +301,55 @@ async def test_track_seed_uses_verified_artist_and_title(discovery: LastFMDiscov
     discovery.provider.api.get_items.assert_awaited_once_with(
         "track.getSimilar", {"artist": "Artist", "track": "Song"}, limit=20
     )
+
+
+async def test_missing_third_track_seed_preserves_previous_candidates(
+    discovery: LastFMDiscovery,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real Last.fm missing-track response must not discard another seed's valid matches."""
+    monkeypatch.setattr(LastFMAPIClient, "throttler", ThrottlerManager(rate_limit=100))
+    monkeypatch.setattr(
+        discovery,
+        "get_seeds",
+        AsyncMock(
+            return_value=[PersonalSeed("Artist", name) for name in ("First", "Second", "Missing")]
+        ),
+    )
+    session = MagicMock()
+    response = session.get.return_value.__aenter__.return_value
+    response.status = 200
+    response.headers = {}
+    response.raise_for_status = Mock()
+    response.json = AsyncMock(
+        side_effect=[
+            {"similartracks": {"track": []}},
+            {"similartracks": {"track": [{"name": "Candidate", "artist": "Related"}]}},
+            {"error": 6, "message": "Track not found"},
+        ]
+    )
+    discovery.provider.api = LastFMAPIClient(session, "test-key", discovery.provider.logger)
+    artist = Artist(item_id="a", provider="library", name="Related", provider_mappings=set())
+    track = Track(
+        item_id="t",
+        provider="library",
+        name="Candidate",
+        artists=UniqueList([artist]),
+        provider_mappings=set(),
+    )
+    discovery.provider.mass.music.get_controller.return_value.get_library_items_by_query.return_value = [
+        track
+    ]
+    folder = next(
+        folder for folder in DISCOVERY_FOLDERS if folder.item_id == "user_recommendations"
+    )
+    with caplog.at_level(logging.DEBUG):
+        assert [item.uri for item in await discovery.build_items(folder)] == [track.uri]
+    assert session.get.call_count == 3
+    assert "seed=3/3 received=0" in caplog.text
+    assert "discovery completed" in caplog.text
+    assert "test-key" not in caplog.text
 
 
 async def test_rediscovery_excludes_current_rotation_without_lastfm_requests(

@@ -34,6 +34,10 @@ ohne das neuere `options`-Argument.
   und danach alle 24 Stunden im Hintergrund aufgebaut. Abrufe liefern den letzten
   vollstaendigen Stand ohne neue Abfragen; bis zum ersten Aufbau ist die Liste leer.
   Bei einem fehlgeschlagenen Refresh bleibt der vorherige Stand erhalten.
+- Meldet Last.fm einen Katalogeintrag ausdruecklich als nicht gefunden, wird er
+  als leere Kandidatenliste behandelt und hoechstens eine Stunde gecacht.
+  Andere Anfragefehler bleiben Fehler; die Diagnose nennt Methode und sicheren
+  Fehlercode, nicht den API-Key oder die rohe Last.fm-Fehlermeldung.
 - Maximal 50 Kandidaten je Abfrage, keine Katalogdurchlaeufe. Persoenliche
   Vorschlaege verwenden hoechstens drei Ausgangspunkte; das Genreprofil wertet
   maximal zehn Kuenstler mit je fuenf bereinigten Tags aus. Die Aufloesung ist auf

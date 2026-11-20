@@ -297,9 +297,7 @@ async def test_api_error_debug_log_does_not_expose_credentials(
         pytest.raises((AuthenticationFailed, ResourceTemporarilyUnavailable, InvalidDataError)),
     ):
         await LastFMAPIClient(http_session, "custom-test-key").validate_api_key()
-    assert (
-        "rate limited cooldown=" if error_code == 29 else "validation failed reason="
-    ) in caplog.text
+    assert "Last.fm API error method=chart.getTopArtists" in caplog.text
     assert "custom-test-key" not in caplog.text
 
 

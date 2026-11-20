@@ -48,6 +48,7 @@ ITEM_METHODS: dict[str, tuple[str, str, int]] = {
 CACHE_NAMESPACE = "lastfm_recommendations_enhanced"
 CACHE_SLOTS = 128
 MAX_CACHE_ENTRY_BYTES = 256 * 1024
+MISSING_ITEM_CACHE_TTL = 3600
 
 
 @dataclass(frozen=True)
@@ -229,7 +230,10 @@ class LastFMAPIClient:
                 perf_counter() - started,
             )
 
-        self._validate_response(data, method, retry_after)
+        validated_data = self._validate_response(data, method, retry_after)
+        if "error" in data:
+            ttl = min(ttl, MISSING_ITEM_CACHE_TTL)
+        data = validated_data
         if use_cache and self._cache is not None and ttl > 0:
             entry = {"request": fingerprint, "data": data}
             if len(orjson.dumps(entry)) <= MAX_CACHE_ENTRY_BYTES:
@@ -239,13 +243,30 @@ class LastFMAPIClient:
                 self.logger.debug("Last.fm cache skipped method=%s reason=size_limit", method)
         return data
 
-    def _validate_response(self, data: Any, method: str, retry_after: int) -> None:
-        """Reject API errors and malformed envelopes before they can enter the cache."""
+    def _validate_response(self, data: Any, method: str, retry_after: int) -> dict[str, Any]:
+        """Validate API envelopes and represent explicitly missing catalogue items as empty lists."""
         if not isinstance(data, dict):
-            self.logger.debug("Last.fm API key validation failed reason=invalid_response")
+            self.logger.debug("Last.fm response rejected method=%s reason=invalid_response", method)
             raise InvalidDataError("Last.fm returned an invalid response")
         if "error" in data:
             error_code = str(data["error"])
+            safe_error_code = (
+                error_code
+                if len(error_code) <= 3 and error_code.isascii() and error_code.isdecimal()
+                else "unknown"
+            )
+            self.logger.debug("Last.fm API error method=%s error_code=%s", method, safe_error_code)
+            resource_type = method.split(".", 1)[0]
+            message = data.get("message")
+            if (
+                error_code in {"6", "7"}
+                and resource_type in {"artist", "track", "album", "tag"}
+                and isinstance(message, str)
+                and message.strip().casefold() == f"{resource_type} not found"
+            ):
+                self.logger.debug("Last.fm catalogue item missing method=%s", method)
+                root, item_key, _ttl = ITEM_METHODS[method]
+                return {root: {item_key: []}}
             if error_code == "29":
                 self._raise_rate_limited(retry_after)
             if error_code in {"4", "10", "26"}:
@@ -260,14 +281,16 @@ class LastFMAPIClient:
                     error_code,
                 )
                 raise ResourceTemporarilyUnavailable("Last.fm is temporarily unavailable")
-            self.logger.debug("Last.fm API key validation failed reason=unknown_api_error")
-            raise InvalidDataError("Last.fm could not validate the API key")
+            raise InvalidDataError(
+                f"Last.fm request failed for {method} (error code {safe_error_code})"
+            )
         if not isinstance(data.get(ITEM_METHODS[method][0]), dict):
-            self.logger.debug("Last.fm API key validation failed reason=invalid_chart_response")
-            raise InvalidDataError("Last.fm returned an invalid chart response")
+            self.logger.debug("Last.fm response rejected method=%s reason=invalid_envelope", method)
+            raise InvalidDataError("Last.fm returned an invalid response envelope")
         root, item_key, _ttl = ITEM_METHODS[method]
         if not isinstance(data[root].get(item_key, []), list | dict):
             raise InvalidDataError("Last.fm returned an invalid item list")
+        return data
 
     @staticmethod
     def _catalogue_url(value: object) -> str:

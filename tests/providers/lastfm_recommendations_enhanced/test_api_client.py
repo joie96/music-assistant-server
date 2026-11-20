@@ -1,6 +1,7 @@
 """Last.fm request limits, server-imposed cooldowns and cache policy."""
 
 import asyncio
+import logging
 import runpy
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced.api_client import
     CACHE_SLOTS,
     ITEM_METHODS,
     MAX_CACHE_ENTRY_BYTES,
+    MISSING_ITEM_CACHE_TTL,
     LastFMAPIClient,
 )
 
@@ -142,6 +144,103 @@ def cached_client(monkeypatch: pytest.MonkeyPatch) -> tuple[LastFMAPIClient, Mag
     cache.get = AsyncMock(return_value=None)
     cache.set = AsyncMock()
     return LastFMAPIClient(session, "private-key", cache=cache), session, cache
+
+
+@pytest.mark.parametrize("error_code", [6, "6", "private-key", "1234567890"])
+async def test_discovery_errors_do_not_blame_or_expose_the_api_key(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+    caplog: pytest.LogCaptureFixture,
+    error_code: int | str,
+) -> None:
+    """Report the failing method and safe code, not a key-validation failure or raw message."""
+    client, session, cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "error": error_code,
+        "message": "private-key",
+    }
+    with caplog.at_level(logging.DEBUG), pytest.raises(InvalidDataError) as error:
+        await client.get_items("track.getSimilar", {"artist": "Artist", "track": "Track"})
+    expected_code = "6" if error_code in (6, "6") else "unknown"
+    assert f"error code {expected_code}" in str(error.value)
+    assert "track.getSimilar" in str(error.value)
+    assert "error_code=" + expected_code in caplog.text
+    assert "validate the API key" not in str(error.value)
+    assert "private-key" not in str(error.value) + caplog.text
+    assert "1234567890" not in str(error.value) + caplog.text
+    cache.set.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        method
+        for method in ITEM_METHODS
+        if method.startswith(("artist.", "track.", "album.", "tag."))
+    ],
+)
+@pytest.mark.parametrize("error_code", [6, "7"])
+async def test_explicitly_missing_catalogue_items_are_cached_as_empty_lists(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], method: str, error_code: int | str
+) -> None:
+    """Skip only explicitly missing resources and briefly cache their normalized empty responses."""
+    client, session, cache = cached_client
+    resource_type = method.split(".", 1)[0]
+    parameters = {
+        "artist": {"artist": "Artist"},
+        "track": {"artist": "Artist", "track": "Track"},
+        "album": {"artist": "Artist", "album": "Album"},
+        "tag": {"tag": "Tag"},
+    }[resource_type]
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "error": error_code,
+        "message": f" {resource_type.capitalize()} not found ",
+    }
+    assert await client.get_items(method, parameters) == []
+    root, item_key, _ttl = ITEM_METHODS[method]
+    entry = cache.set.call_args.args[1]
+    assert entry["data"] == {root: {item_key: []}}
+    assert cache.set.call_args.kwargs["expiration"] == MISSING_ITEM_CACHE_TTL
+    cache.get.return_value = entry
+    assert await client.get_items(method, parameters) == []
+    session.get.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("method", "message"),
+    [
+        ("track.getSimilar", "Your request is missing a required parameter"),
+        ("track.getSimilar", "Artist not found"),
+        ("chart.getTopTracks", "Track not found"),
+    ],
+)
+async def test_parameter_errors_are_not_silently_treated_as_missing_items(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], method: str, message: str
+) -> None:
+    """Do not hide bad parameters, mismatched resource errors or failed chart requests."""
+    client, session, cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "error": 6,
+        "message": message,
+    }
+    with pytest.raises(InvalidDataError, match="error code 6"):
+        await client.get_items(method, {"artist": "Artist", "track": "Track"})
+    cache.set.assert_not_awaited()
+
+
+@pytest.mark.parametrize("control", ["no-store", "max-age=120"])
+async def test_missing_item_cache_respects_origin_cache_policy(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], control: str
+) -> None:
+    """An empty catalogue result must not override cache prohibitions or extend origin TTLs."""
+    client, session, cache = cached_client
+    response = session.get.return_value.__aenter__.return_value
+    response.headers = {"Cache-Control": control}
+    response.json.return_value = {"error": 6, "message": "Track not found"}
+    assert await client.get_items("track.getSimilar", {"artist": "Artist", "track": "Track"}) == []
+    if control == "no-store":
+        cache.set.assert_not_awaited()
+    else:
+        assert cache.set.call_args.kwargs["expiration"] == 120
 
 
 async def test_cache_hit_skips_network_and_validation_always_checks_key(
