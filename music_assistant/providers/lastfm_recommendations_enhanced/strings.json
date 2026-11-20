@@ -1,0 +1,115 @@
+{
+  "config_entries": {
+    "api_key": {
+      "label": "Last.fm API Key",
+      "description": "Required. Enter your own Last.fm API key. No bundled key, username or account login is used."
+    },
+    "recommendation_user_id": {
+      "label": "Music Assistant user for recommendations",
+      "description": "Use this user's listening history, favorites and available music sources. Prepared recommendations are only shown to this user."
+    }
+  },
+  "media": {
+    "recommendations": {
+      "user_genre_playlists_monthly": {
+        "name": "Your genre playlists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_artist_playlists_monthly": {
+        "name": "Your artist playlists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_popular_artist_albums": {
+        "name": "Albums by worldwide popular artists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "de_popular_artist_albums": {
+        "name": "Albums by popular artists in Germany",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_genre_playlists": {
+        "name": "Explore genre playlists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_artist_radio_playlists": {
+        "name": "Artist radios",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_related_genre_playlists": {
+        "name": "Related genre playlists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_mood_playlists": {
+        "name": "Mood playlists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_decade_playlists": {
+        "name": "Decade playlists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_recommended_album": {
+        "name": "An album for you",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_genre_albums": {
+        "name": "{0}: explore albums",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_genre_artists": {
+        "name": "{0}: explore artists",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_genre_artists": {
+        "name": "{0}: artists from your favorite genre",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_top_tracks": {
+        "name": "Worldwide track charts",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "de_top_tracks": {
+        "name": "Track charts for Germany",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "global_top_artists": {
+        "name": "Worldwide artist charts",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "de_top_artists": {
+        "name": "Artist charts for Germany",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_recommendations": {
+        "name": "Track recommendations",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_artist_recommendations": {
+        "name": "Artist recommendations",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_album_recommendations": {
+        "name": "Album recommendations",
+        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+      },
+      "user_rediscovery_tracks": {
+        "name": "Not heard in a while",
+        "subtitle": "Previous favorites outside your last 30 days of listening"
+      },
+      "user_top_artists_monthly": {
+        "name": "Your most played artists",
+        "subtitle": "Your most played artists in the last 30 days"
+      },
+      "user_top_tracks_monthly": {
+        "name": "Your most played tracks",
+        "subtitle": "Your most played tracks in the last 30 days"
+      },
+      "user_top_albums_monthly": {
+        "name": "Your most played albums",
+        "subtitle": "Your most played albums in the last 30 days"
+      }
+    }
+  },
+  "manifest": {
+    "description": "Music Assistant-based personal recommendations and Last.fm discovery using your own API key."
+  }
+}

@@ -1,0 +1,259 @@
+"""Last.fm request limits, server-imposed cooldowns and cache policy."""
+
+from unittest.mock import AsyncMock, MagicMock, Mock
+
+import pytest
+from aiohttp import ClientResponseError
+from music_assistant_models.errors import InvalidDataError, RateLimited
+
+from music_assistant.helpers.throttle_retry import ThrottlerManager
+from music_assistant.providers.lastfm_recommendations_enhanced.api_client import (
+    CACHE_SLOTS,
+    ITEM_METHODS,
+    MAX_CACHE_ENTRY_BYTES,
+    LastFMAPIClient,
+)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("100", 100.0),
+        (35, 35.0),
+        (0, 0.0),
+        (None, None),
+        ("bad", None),
+        (-1, None),
+        (True, None),
+        ("NaN", None),
+        ("Infinity", None),
+    ],
+)
+async def test_artist_tag_weights_preserve_values_and_order(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+    value: object,
+    expected: float | None,
+) -> None:
+    """Keep tag popularity and source order, with invalid weights available for rank fallback."""
+    client, session, _cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "toptags": {"tag": [{"name": "Shoegaze", "count": value}, {"name": "Dream Pop"}]}
+    }
+    tags = await client.get_items("artist.getTopTags", {"artist": "Streaming Artist"})
+    assert [tag.name for tag in tags] == ["Shoegaze", "Dream Pop"]
+    assert tags[0].tag_weight == expected
+    assert tags[1].tag_weight is None
+
+
+async def test_similar_artists_do_not_inherit_the_seed_identity(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """The same similar artist must aggregate across distinct personal source artists."""
+    client, session, _cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "similarartists": {"artist": [{"name": "Similar"}]}
+    }
+    assert (await client.get_items("artist.getSimilar", {"artist": "Seed"}))[0].artist == ""
+
+
+async def test_album_information_normalizes_nested_track_lists(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """Preserve album order and supply its artist when a track does not repeat it."""
+    client, session, _cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "album": {"tracks": {"track": [{"name": "Opening"}, {"name": "Closing"}]}}
+    }
+    tracks = await client.get_items("album.getInfo", {"artist": "Artist", "album": "Album"})
+    assert [track.name for track in tracks] == ["Opening", "Closing"]
+    assert all(track.artist == "Artist" for track in tracks)
+
+
+@pytest.fixture
+def cached_client(monkeypatch: pytest.MonkeyPatch) -> tuple[LastFMAPIClient, MagicMock, Mock]:
+    """Return a real client with isolated throttle, HTTP and shared-cache boundaries."""
+    monkeypatch.setattr(LastFMAPIClient, "throttler", ThrottlerManager(rate_limit=100))
+    session = MagicMock()
+    response = session.get.return_value.__aenter__.return_value
+    response.status = 200
+    response.headers = {}
+    response.raise_for_status = Mock()
+    response.json = AsyncMock(return_value={"artists": {"artist": [{"name": "Example"}]}})
+    cache = Mock()
+    cache.get = AsyncMock(return_value=None)
+    cache.set = AsyncMock()
+    return LastFMAPIClient(session, "private-key", cache=cache), session, cache
+
+
+async def test_cache_hit_skips_network_and_validation_always_checks_key(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """Reuse a public response but never let that response authenticate another API key."""
+    client, session, cache = cached_client
+    first = await client.get_items("chart.getTopArtists")
+    cache.get.return_value = cache.set.call_args.args[1]
+    assert await client.get_items("chart.getTopArtists") == first
+    assert session.get.call_count == 1
+    await client.validate_api_key()
+    assert session.get.call_count == 2
+    assert cache.set.await_count == 1
+    assert "private-key" not in str(cache.set.call_args)
+
+
+@pytest.mark.parametrize("control", ["no-store", "no-cache", "private", "max-age=0"])
+async def test_cache_prohibitions_are_honored(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], control: str
+) -> None:
+    """Do not persist a response when the origin forbids reuse."""
+    client, session, cache = cached_client
+    session.get.return_value.__aenter__.return_value.headers = {"Cache-Control": control}
+    await client.get_items("chart.getTopArtists")
+    cache.set.assert_not_awaited()
+
+
+async def test_cache_age_shortens_ttl_and_entries_have_fixed_capacity(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """Bound the lifetime and total possible cache payload, including expired slots."""
+    client, session, cache = cached_client
+    session.get.return_value.__aenter__.return_value.headers = {
+        "Cache-Control": "max-age=120",
+        "Age": "20",
+    }
+    await client.get_items("chart.getTopArtists")
+    assert cache.set.call_args.kwargs["expiration"] == 100
+    assert CACHE_SLOTS * MAX_CACHE_ENTRY_BYTES < 100_000_000
+    response = session.get.return_value.__aenter__.return_value
+    response.json.return_value = {"artists": {"artist": [{"name": "x" * MAX_CACHE_ENTRY_BYTES}]}}
+    cache.set.reset_mock()
+    await client.get_items("chart.getTopArtists")
+    cache.set.assert_not_awaited()
+
+
+async def test_global_tags_use_documented_envelope_and_shared_cache(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """Global Explore tags preserve source rank and never require personal data."""
+    client, session, cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "tags": {"tag": [{"name": "rock", "taggings": "1000"}, {"name": "jazz"}]}
+    }
+    tags = await client.get_items("chart.getTopTags", limit=50)
+    assert [tag.name for tag in tags] == ["rock", "jazz"]
+    cache.get.return_value = cache.set.call_args.args[1]
+    assert await client.get_items("chart.getTopTags", limit=50) == tags
+    session.get.assert_called_once()
+    assert cache.set.call_args.kwargs["expiration"] == 21600
+    with pytest.raises(InvalidDataError):
+        await client.get_items("chart.getTopTags", {"country": "Germany"})
+    session.get.assert_called_once()
+
+
+async def test_cached_slot_collision_never_returns_other_query(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """A fixed-slot collision causes a miss rather than cross-query data reuse."""
+    client, session, cache = cached_client
+    cache.get.return_value = {"request": "different-query", "data": {"artists": {"artist": []}}}
+    assert await client.get_items("chart.getTopArtists")
+    session.get.assert_called_once()
+
+
+async def test_unsupported_method_and_credential_overrides_are_rejected(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """Never turn the client into a write API or allow request credentials to be overridden."""
+    client, session, _cache = cached_client
+    with pytest.raises(InvalidDataError):
+        await client.get_items("track.scrobble")
+    with pytest.raises(InvalidDataError):
+        await client.get_items("chart.getTopArtists", {"api_key": "another-key"})
+    session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("method", list(ITEM_METHODS))
+async def test_supported_response_envelopes_and_candidate_limit(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], method: str
+) -> None:
+    """Normalize every supported endpoint and never fetch another page."""
+    client, session, _cache = cached_client
+    root, item_key, _ttl = ITEM_METHODS[method]
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        root: {
+            item_key: [{"name": str(index), "artist": {"name": "Artist"}} for index in range(60)]
+        }
+    }
+    items = await client.get_items(method, limit=500)
+    assert len(items) == 50
+    assert items[0].artist == "Artist"
+    if method == "artist.getTopTags":
+        assert "limit" not in session.get.call_args.kwargs["params"]
+    else:
+        assert session.get.call_args.kwargs["params"]["limit"] == 50
+    assert "page" not in session.get.call_args.kwargs["params"]
+    session.get.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.test/music/Artist",
+        "https://private@last.fm/music/Artist",
+        "javascript:alert(1)",
+        "http://[invalid",
+    ],
+)
+async def test_unsafe_source_links_are_not_exposed(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], url: str
+) -> None:
+    """Reject non-Last.fm, credential-bearing and malformed attribution URLs."""
+    client, session, _cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "artists": {"artist": [{"name": "Artist", "url": url}]}
+    }
+    assert (await client.get_items("chart.getTopArtists"))[0].url == ""
+
+
+async def test_valid_catalogue_links_are_upgraded_and_stripped_of_query_parameters(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+) -> None:
+    """Do not propagate credentials or tracking parameters from source links."""
+    client, session, _cache = cached_client
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        "artists": {
+            "artist": [{"name": "Artist", "url": "http://last.fm/music/Artist?key=private#track"}]
+        }
+    }
+    assert (await client.get_items("chart.getTopArtists"))[
+        0
+    ].url == "https://www.last.fm/music/Artist"
+
+
+@pytest.mark.parametrize("status", [200, 429])
+@pytest.mark.parametrize("retry_after", ["120", None])
+async def test_rate_limit_blocks_other_instances(
+    monkeypatch: pytest.MonkeyPatch, status: int, retry_after: str | None
+) -> None:
+    """Honor HTTP/JSON rate limits across instances without sleeping or sending another request."""
+    throttler = ThrottlerManager(rate_limit=100, foreground_waits_out_cooldown=False)
+    monkeypatch.setattr(LastFMAPIClient, "throttler", throttler)
+    session = MagicMock()
+    response = session.get.return_value.__aenter__.return_value
+    response.status = status
+    response.headers = {"Retry-After": retry_after} if retry_after else {}
+    response.raise_for_status = Mock()
+    response.json = AsyncMock(return_value={"error": 29, "message": "private-key"})
+    if status == 429:
+        response.raise_for_status.side_effect = ClientResponseError(Mock(), (), status=429)
+    first = LastFMAPIClient(session, "private-key")
+    second_session = MagicMock()
+    second = LastFMAPIClient(second_session, "other-private-key")
+    with pytest.raises(RateLimited) as error:
+        await first.validate_api_key()
+    expected = int(retry_after) if retry_after else 60
+    assert error.value.backoff_time >= expected
+    assert throttler.cooldown_remaining > expected - 1
+    with pytest.raises(RateLimited):
+        await second.validate_api_key()
+    second_session.get.assert_not_called()
+    assert "private-key" not in str(error.value)

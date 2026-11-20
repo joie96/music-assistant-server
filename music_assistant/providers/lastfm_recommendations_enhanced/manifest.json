@@ -1,0 +1,9 @@
+{
+  "type": "metadata",
+  "domain": "lastfm_recommendations_enhanced",
+  "name": "Last.fm Recommendations Enhanced",
+  "description": "Music Assistant-based personal recommendations and Last.fm discovery using your own API key.",
+  "codeowners": ["@joie96"],
+  "stage": "experimental",
+  "multi_instance": true
+}
