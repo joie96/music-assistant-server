@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
-from math import isfinite
+from math import ceil, isfinite
 from time import perf_counter, time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -65,7 +65,7 @@ class LastFMAPIClient:
     """Read-only client without bundled credentials or Last.fm account authentication."""
 
     BASE_URL = "https://ws.audioscrobbler.com/2.0/"
-    throttler = ThrottlerManager(rate_limit=5, period=1, foreground_waits_out_cooldown=False)
+    throttler = ThrottlerManager(rate_limit=5, period=1)
 
     def __init__(
         self,
@@ -187,9 +187,10 @@ class LastFMAPIClient:
         retry_after = 0
         ttl = ITEM_METHODS[method][2]
         try:
-            async with (
-                self.throttler.acquire(),
-                self._http_session.get(
+            self._check_cooldown()
+            async with self.throttler.acquire():
+                self._check_cooldown()
+                async with self._http_session.get(
                     self.BASE_URL,
                     params={
                         **parameters,
@@ -197,17 +198,16 @@ class LastFMAPIClient:
                         "api_key": self._api_key,
                         "format": "json",
                     },
-                ) as response,
-            ):
-                retry_after = parse_retry_after(response.headers.get("Retry-After"))
-                ttl = self._cache_ttl(response.headers, ttl)
-                self.logger.debug(
-                    "Last.fm HTTP GET response method=%s status=%s",
-                    method,
-                    response.status,
-                )
-                response.raise_for_status()
-                data = await response.json()
+                ) as response:
+                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                    ttl = self._cache_ttl(response.headers, ttl)
+                    self.logger.debug(
+                        "Last.fm HTTP GET response method=%s status=%s",
+                        method,
+                        response.status,
+                    )
+                    response.raise_for_status()
+                    data = await response.json()
         except ClientResponseError as err:
             self.logger.debug("Last.fm HTTP GET failed method=%s status=%s", method, err.status)
             if err.status == 429:
@@ -318,3 +318,8 @@ class LastFMAPIClient:
         self.throttler.set_cooldown(cooldown)
         self.logger.debug("Last.fm rate limited cooldown=%ds", cooldown)
         raise RateLimited("Last.fm rate limit reached", backoff_time=cooldown) from None
+
+    def _check_cooldown(self) -> None:
+        """Reject an outbound call while the shared server-imposed cooldown remains active."""
+        if remaining := self.throttler.cooldown_remaining:
+            raise RateLimited("Last.fm rate limit cooldown is active", backoff_time=ceil(remaining))

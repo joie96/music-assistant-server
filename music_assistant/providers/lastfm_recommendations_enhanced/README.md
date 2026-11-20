@@ -21,6 +21,9 @@ Der Nutzerkontext verwendet die bereits in MA `2.11.0b7` vorhandenen
 Kontextvariablen. Der dort noch fehlende Core-Helper `user_auth_context` wird
 nicht vorausgesetzt. Ein bereits aktiver anfragender oder impersonierter Nutzer
 wird nach dem Aufbau wiederhergestellt, auch bei Fehlern und Abbruch.
+Auch die Throttler-Konfiguration verwendet nur in dieser Version verfuegbare
+Konstruktorargumente. Ein aktiver Last.fm-Cooldown wird vor und nach der
+Slot-Vergabe geprueft: keine weitere Anfrage und keine verlaengerte Wartefrist.
 
 ## Limits und Hinweise
 

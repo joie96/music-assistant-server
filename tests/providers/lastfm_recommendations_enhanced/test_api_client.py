@@ -1,18 +1,77 @@
 """Last.fm request limits, server-imposed cooldowns and cache policy."""
 
+import asyncio
+import runpy
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from aiohttp import ClientResponseError
 from music_assistant_models.errors import InvalidDataError, RateLimited
 
+from music_assistant.helpers import throttle_retry
 from music_assistant.helpers.throttle_retry import ThrottlerManager
+from music_assistant.providers.lastfm_recommendations_enhanced import api_client as client_module
 from music_assistant.providers.lastfm_recommendations_enhanced.api_client import (
     CACHE_SLOTS,
     ITEM_METHODS,
     MAX_CACHE_ENTRY_BYTES,
     LastFMAPIClient,
 )
+
+
+def test_client_import_supports_legacy_throttler_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construct the client throttler with only arguments supported in MA 2.11.0b7."""
+
+    def legacy_constructor(rate_limit: int, period: float = 1) -> ThrottlerManager:
+        return ThrottlerManager(rate_limit=rate_limit, period=period)
+
+    monkeypatch.setattr(throttle_retry, "ThrottlerManager", legacy_constructor)
+    assert client_module.__file__ is not None
+    namespace = runpy.run_path(client_module.__file__)
+    throttler = namespace["LastFMAPIClient"].throttler
+    assert throttler.throttler.rate_limit == 5
+    assert throttler.throttler.period == 1
+
+
+@pytest.mark.parametrize("seconds", [0.5, 10, 60, 120])
+async def test_active_cooldown_neither_waits_nor_requests(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+    monkeypatch: pytest.MonkeyPatch,
+    seconds: float,
+) -> None:
+    """Fail fast for short and long shared cooldowns without extending their deadlines."""
+    client, session, _cache = cached_client
+    client.throttler.set_cooldown(seconds)
+    deadline = client.throttler._cooldown_until
+    sleep = AsyncMock(side_effect=AssertionError("Cooldown must not sleep"))
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    with pytest.raises(RateLimited) as error:
+        await client.validate_api_key()
+    assert error.value.backoff_time >= max(1, int(seconds))
+    assert client.throttler._cooldown_until == deadline
+    session.get.assert_not_called()
+    sleep.assert_not_awaited()
+
+
+async def test_cooldown_armed_during_slot_acquisition_prevents_request(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recheck the shared cooldown after an awaited gate, before opening the HTTP response."""
+    client, session, _cache = cached_client
+
+    @asynccontextmanager
+    async def acquire_slot() -> AsyncIterator[float]:
+        client.throttler.set_cooldown(10)
+        yield 0.0
+
+    monkeypatch.setattr(client.throttler, "acquire", acquire_slot)
+    with pytest.raises(RateLimited):
+        await client.validate_api_key()
+    session.get.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -235,7 +294,7 @@ async def test_rate_limit_blocks_other_instances(
     monkeypatch: pytest.MonkeyPatch, status: int, retry_after: str | None
 ) -> None:
     """Honor HTTP/JSON rate limits across instances without sleeping or sending another request."""
-    throttler = ThrottlerManager(rate_limit=100, foreground_waits_out_cooldown=False)
+    throttler = ThrottlerManager(rate_limit=100)
     monkeypatch.setattr(LastFMAPIClient, "throttler", throttler)
     session = MagicMock()
     response = session.get.return_value.__aenter__.return_value
