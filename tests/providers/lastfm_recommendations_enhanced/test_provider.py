@@ -1,6 +1,7 @@
 """Tests for the Last.fm Enhanced scaffold and mandatory custom credentials."""
 
 import logging
+import runpy
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -13,7 +14,9 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.media_items import Album, Artist, ProviderMapping, Track
 
+from music_assistant.controllers.webserver.helpers import auth_middleware
 from music_assistant.helpers.throttle_retry import ThrottlerManager
+from music_assistant.providers import lastfm_recommendations_enhanced as provider_module
 from music_assistant.providers.lastfm_recommendations_enhanced import (
     SUPPORTED_FEATURES,
     LastFMRecommendationsEnhancedProvider,
@@ -102,6 +105,17 @@ async def test_custom_key_is_required_and_sent_to_lastfm(
         "format": "json",
         "limit": 1,
     }
+
+
+def test_provider_import_does_not_require_newer_core_user_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Import the provider with the same missing helper as Music Assistant 2.11.0b7."""
+    monkeypatch.delattr(auth_middleware, "user_auth_context", raising=False)
+    assert provider_module.__file__ is not None
+    namespace = runpy.run_path(provider_module.__file__)
+    assert callable(namespace["_recommendation_user_context"])
+    assert namespace["SUPPORTED_FEATURES"] == SUPPORTED_FEATURES
 
 
 @pytest.mark.parametrize("api_key", [None, "", "   "])

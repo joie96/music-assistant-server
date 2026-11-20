@@ -27,6 +27,7 @@ from music_assistant_models.media_items import (
 from music_assistant_models.statistics import TopItemResult
 from PIL import Image
 
+from music_assistant.controllers.webserver.helpers import auth_middleware
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     user_auth_context,
@@ -36,6 +37,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced import (
     SUPPORTED_FEATURES,
     TOP_ITEMS_FOLDERS,
     LastFMRecommendationsEnhancedProvider,
+    _recommendation_user_context,
 )
 from music_assistant.providers.lastfm_recommendations_enhanced.api_client import LastFMItem
 from music_assistant.providers.lastfm_recommendations_enhanced.catalog import (
@@ -115,6 +117,66 @@ async def test_folder_listing_is_lightweight_and_translatable(
     assert all(folder.item_id.startswith(("user_", "global_", "de_")) for folder in folders)
     provider.mass.statistics.get_top_items.assert_not_awaited()
     provider.mass.http_session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+def test_recommendation_user_context_restores_nested_user_and_impersonation(
+    failure: type[BaseException] | None,
+) -> None:
+    """Never retain the selected user or discard an existing caller impersonation."""
+    requester = Mock(user_id="requester")
+    impersonated = Mock(user_id="impersonated-requester")
+    selected = Mock(user_id="selected")
+    nested = Mock(user_id="nested")
+    requester_token = auth_middleware.current_user.set(requester)
+    impersonation_token = auth_middleware.impersonated_user.set(impersonated)
+
+    def run_in_context() -> None:
+        with _recommendation_user_context(selected):
+            assert get_current_user() is selected
+            assert auth_middleware.impersonated_user.get() is None
+            with _recommendation_user_context(nested):
+                assert get_current_user() is nested
+            assert get_current_user() is selected
+            if failure is not None:
+                raise failure()
+
+    try:
+        if failure is None:
+            run_in_context()
+        else:
+            with pytest.raises(failure):
+                run_in_context()
+        assert auth_middleware.current_user.get() is requester
+        assert auth_middleware.impersonated_user.get() is impersonated
+        assert get_current_user() is impersonated
+    finally:
+        auth_middleware.impersonated_user.reset(impersonation_token)
+        auth_middleware.current_user.reset(requester_token)
+
+
+async def test_recommendation_user_context_is_isolated_between_parallel_tasks() -> None:
+    """Concurrent user-specific builds must not overwrite one another's context."""
+    both_entered = asyncio.Event()
+    entered: list[str] = []
+    original_user = get_current_user()
+
+    async def run_as(user_id: str) -> str:
+        selected = Mock(user_id=user_id)
+        with _recommendation_user_context(selected):
+            entered.append(user_id)
+            if len(entered) == 2:
+                both_entered.set()
+            await both_entered.wait()
+            assert get_current_user() is selected
+        assert get_current_user() is original_user
+        return user_id
+
+    assert await asyncio.gather(run_as("first-user"), run_as("second-user")) == [
+        "first-user",
+        "second-user",
+    ]
+    assert get_current_user() is original_user
 
 
 @pytest.mark.parametrize(

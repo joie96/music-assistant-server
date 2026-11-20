@@ -17,6 +17,11 @@ Bibliothek, Favoriten und Hoerverlauf werden nicht veraendert.
   Kuenstler, keine MA-Genrezuordnungen. Auch nicht synchronisierte Streaming-
   Kuenstler koennen beitragen, wenn MA ihre Credits im Hoerverlauf gespeichert hat.
 
+Der Nutzerkontext verwendet die bereits in MA `2.11.0b7` vorhandenen
+Kontextvariablen. Der dort noch fehlende Core-Helper `user_auth_context` wird
+nicht vorausgesetzt. Ein bereits aktiver anfragender oder impersonierter Nutzer
+wird nach dem Aufbau wiederhergestellt, auch bei Fehlern und Abbruch.
+
 ## Limits und Hinweise
 
 - Folder und Playlist-Tracks werden nach dem Start mit 20 Sekunden Verzoegerung

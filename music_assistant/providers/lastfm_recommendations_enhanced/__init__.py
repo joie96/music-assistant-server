@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from functools import partial
@@ -40,8 +41,9 @@ from music_assistant_models.media_items import (
 from music_assistant_models.media_items.metadata import MediaItemImage, MediaItemLink
 
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
+    current_user,
     get_current_user,
-    user_auth_context,
+    impersonated_user,
 )
 from music_assistant.helpers.images import get_image_thumb
 from music_assistant.helpers.security import is_safe_path
@@ -74,6 +76,9 @@ from music_assistant.providers.lastfm_recommendations_enhanced.recommendations i
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from music_assistant_models.auth import User
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.media_items import (
         BrowseFolder,
@@ -372,7 +377,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
             started = perf_counter()
             self.logger.debug("Building Last.fm recommendations user_id=%s", user_id)
             try:
-                with user_auth_context(user):
+                with _recommendation_user_context(user):
                     collections = LastFMCollections(LastFMDiscovery(self))
                     genre_profile = await collections.get_genre_profile()
                     genre_profile = replace(
@@ -536,3 +541,15 @@ async def get_recommendation_user_entry(mass: MusicAssistant) -> ConfigEntry:
             if user.enabled
         ],
     )
+
+
+@contextmanager
+def _recommendation_user_context(user: User | None) -> Iterator[None]:
+    """Scope recommendation work to its MA user and restore any requesting-user context."""
+    user_token = current_user.set(user)
+    impersonation_token = impersonated_user.set(None)
+    try:
+        yield
+    finally:
+        impersonated_user.reset(impersonation_token)
+        current_user.reset(user_token)
