@@ -29,6 +29,7 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     MusicAssistantError,
     ProviderUnavailableError,
+    RateLimited,
     ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import (
@@ -72,7 +73,9 @@ from music_assistant.providers.lastfm_recommendations_enhanced.cover_art import 
 )
 from music_assistant.providers.lastfm_recommendations_enhanced.recommendations import (
     DISCOVERY_FOLDERS,
+    RESOLUTION_RETRY_DELAY,
     LastFMDiscovery,
+    ResolutionState,
 )
 
 if TYPE_CHECKING:
@@ -162,6 +165,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         """Cancel startup and stop scheduled work before releasing prepared recommendations."""
         self._is_unloading = True
         self.mass.cancel_timer(f"{REFRESH_TASK_ID}_initial_{self.instance_id}")
+        self.mass.cancel_timer(f"{REFRESH_TASK_ID}_retry_{self.instance_id}")
         stopped = await self.mass.tasks.unregister_scheduled_task_and_wait(
             f"{REFRESH_TASK_ID}_{self.instance_id}", clear_persisted_state=is_removed
         )
@@ -293,14 +297,19 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         return folders
 
     async def _build_recommendation_items(
-        self, item_id: str, *, genre_profile: GenreProfile | None = None
+        self,
+        item_id: str,
+        *,
+        genre_profile: GenreProfile | None = None,
+        discovery: LastFMDiscovery | None = None,
     ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
         """
         Build one statistics or discovery folder within the selected user's context.
 
         :param item_id: The folder identifier returned by get_recommendations.
         """
-        collections = LastFMCollections(LastFMDiscovery(self), genre_profile=genre_profile)
+        discovery = discovery if discovery is not None else LastFMDiscovery(self)
+        collections = LastFMCollections(discovery, genre_profile=genre_profile)
         if item_id == "user_album_recommendations":
             return UniqueList(await collections.get_personal_albums())
         if item_id in PLAYLIST_FAMILIES.values():
@@ -313,7 +322,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
             return UniqueList(await collections.get_folder_items(item_id))
         for folder in DISCOVERY_FOLDERS:
             if folder.item_id == item_id:
-                return UniqueList(await LastFMDiscovery(self).build_items(folder))
+                return UniqueList(await discovery.build_items(folder))
         for folder_id, media_type, _name in TOP_ITEMS_FOLDERS:
             if item_id != folder_id:
                 continue
@@ -364,6 +373,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         async with self._refresh_lock:
             if self._is_unloading:
                 return
+            self.mass.cancel_timer(f"{REFRESH_TASK_ID}_retry_{self.instance_id}")
             user_id = self.get_setup_value(CONF_RECOMMENDATION_USER_ID)
             if not isinstance(user_id, str) or not user_id.strip():
                 raise AuthenticationFailed("Select a Music Assistant user for recommendations")
@@ -371,10 +381,11 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
             if user is None or not user.enabled:
                 raise AuthenticationFailed("The selected Music Assistant user is not available")
             started = perf_counter()
+            resolution_state = ResolutionState()
             self.logger.debug("Building Last.fm recommendations user_id=%s", user_id)
             try:
                 with _recommendation_user_context(user):
-                    collections = LastFMCollections(LastFMDiscovery(self))
+                    collections = LastFMCollections(LastFMDiscovery(self, state=resolution_state))
                     genre_profile = await collections.get_genre_profile()
                     genre_profile = replace(
                         genre_profile, explore_genres=await collections.get_explore_genres()
@@ -383,12 +394,18 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                     playlists: dict[str, tuple[Playlist, list[Track]]] = {}
                     for folder in folders:
                         folder.items = await self._build_recommendation_items(
-                            folder.item_id, genre_profile=genre_profile
+                            folder.item_id,
+                            genre_profile=genre_profile,
+                            discovery=LastFMDiscovery(self, state=resolution_state),
                         )
                         for item in folder.items:
                             if isinstance(item, Playlist) and item.item_id not in playlists:
                                 tracks = await LastFMCollections(
-                                    LastFMDiscovery(self), genre_profile=genre_profile
+                                    LastFMDiscovery(
+                                        self,
+                                        state=resolution_state,
+                                    ),
+                                    genre_profile=genre_profile,
                                 ).get_playlist_tracks(item.item_id)
                                 await self._set_playlist_cover(item, tracks, folder.item_id)
                                 playlists[item.item_id] = (item, tracks)
@@ -401,7 +418,16 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                     type(err).__name__,
                     perf_counter() - started,
                 )
+                if isinstance(err, RateLimited | ResourceTemporarilyUnavailable):
+                    self._schedule_refresh_retry(
+                        err.backoff_time if isinstance(err, RateLimited) else RESOLUTION_RETRY_DELAY
+                    )
                 raise
+            if resolution_state.retry_after:
+                self._schedule_refresh_retry(resolution_state.retry_after)
+            if resolution_state.has_incomplete_searches:
+                self.logger.warning("Last.fm refresh deferred: streaming resolution incomplete")
+                return
             if self._is_unloading:
                 return
             retained_covers = {
@@ -426,6 +452,18 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                 len(playlists),
                 perf_counter() - started,
             )
+
+    def _schedule_refresh_retry(self, delay: float) -> None:
+        """Schedule one delayed retry without bypassing an upstream wait or unloading."""
+        if self._is_unloading:
+            return
+        delay = max(RESOLUTION_RETRY_DELAY, delay)
+        self.mass.call_later(
+            delay,
+            partial(self.mass.tasks.run_task, f"{REFRESH_TASK_ID}_{self.instance_id}"),
+            task_id=f"{REFRESH_TASK_ID}_retry_{self.instance_id}",
+        )
+        self.logger.debug("Last.fm refresh retry scheduled delay=%.0fs", delay)
 
     async def _set_playlist_cover(
         self, playlist: Playlist, tracks: list[Track], folder_id: str

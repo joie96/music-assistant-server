@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.enums import ImageType, MediaType
+from music_assistant_models.enums import ImageType, MediaType, ProviderFeature
 from music_assistant_models.errors import (
     AuthenticationFailed,
     MediaNotFoundError,
@@ -74,6 +74,9 @@ def provider(tmp_path: Path) -> LastFMRecommendationsEnhancedProvider:
     mass.config.get.return_value = {CONF_RECOMMENDATION_USER_ID: "DEBUG"}
     mass.config.decrypt_string.side_effect = lambda value: value
     mass.statistics.get_top_items = AsyncMock(return_value=[])
+    mass.config.get_provider_configs = AsyncMock(return_value=[])
+    mass.cache.get = AsyncMock(return_value=None)
+    mass.cache.set = AsyncMock()
     mass.music.providers = []
     controller = mass.music.get_controller.return_value
     controller.db_table = "tracks"
@@ -344,17 +347,17 @@ async def test_recommendation_playlists_use_native_catalog_contract(
     provider.mass.http_session.get.assert_not_called()
 
 
-async def test_generated_playlist_returns_existing_ma_tracks_with_positions(
+async def test_generated_playlist_returns_streaming_tracks_with_positions(
     provider: LastFMRecommendationsEnhancedProvider,
 ) -> None:
-    """Preserve playable MA identities and leave the stored model untouched."""
+    """Preserve playable streaming identities and leave the search result untouched."""
     mapping = ProviderMapping(
         item_id="source-id", provider_domain="source", provider_instance="source--1"
     )
-    artist = Artist(item_id="2", provider="library", name="Artist", provider_mappings={mapping})
+    artist = Artist(item_id="2", provider="source--1", name="Artist", provider_mappings={mapping})
     track = Track(
         item_id="1",
-        provider="library",
+        provider="source--1",
         name="Song",
         artists=UniqueList([artist]),
         provider_mappings={mapping},
@@ -363,7 +366,10 @@ async def test_generated_playlist_returns_existing_ma_tracks_with_positions(
     provider.api.get_items = AsyncMock(return_value=[LastFMItem("Song", "Artist")])
     controller = provider.mass.music.get_controller.return_value
     controller.db_table = "tracks"
-    controller.get_library_items_by_query = AsyncMock(return_value=[track])
+    source = Mock(instance_id="source--1", available=True, is_streaming_provider=True)
+    source.supported_features = {ProviderFeature.SEARCH}
+    provider.mass.music.providers = [source]
+    controller.search = AsyncMock(return_value=[track])
     items = await provider._build_recommendation_items(
         "global_genre_playlists", genre_profile=GENRE_PROFILE
     )
@@ -378,6 +384,7 @@ async def test_generated_playlist_returns_existing_ma_tracks_with_positions(
     assert tracks[0].position == 1
     assert track.position is None
     assert not track.metadata.links
+    controller.get_library_items_by_query.assert_not_awaited()
     provider.api.get_items.assert_awaited_once_with("tag.getTopTracks", {"tag": "jazz"}, limit=50)
 
 
@@ -818,15 +825,57 @@ async def test_unload_cancels_startup_and_waits_for_refresh(
     """Prevent background builds from publishing after the provider has been unloaded."""
     provider.mass.tasks.unregister_scheduled_task_and_wait = AsyncMock(return_value=True)
     await provider.unload(is_removed=True)
-    provider.mass.cancel_timer.assert_called_once_with(
-        f"{REFRESH_TASK_ID}_initial_{provider.instance_id}"
-    )
+    provider.mass.cancel_timer.assert_any_call(f"{REFRESH_TASK_ID}_initial_{provider.instance_id}")
+    provider.mass.cancel_timer.assert_any_call(f"{REFRESH_TASK_ID}_retry_{provider.instance_id}")
     provider.mass.tasks.unregister_scheduled_task_and_wait.assert_awaited_once_with(
         f"{REFRESH_TASK_ID}_{provider.instance_id}", clear_persisted_state=True
     )
     assert provider._is_unloading
     await provider._refresh_recommendations()
     provider.mass.statistics.get_top_items.assert_not_awaited()
+
+
+async def test_incomplete_resolution_retries_later_without_publishing(
+    provider: LastFMRecommendationsEnhancedProvider,
+) -> None:
+    """Preserve the playable generation and debounce a delayed retry of an incomplete build."""
+    provider.mass.webserver.auth.get_user = AsyncMock(
+        return_value=Mock(user_id="DEBUG", enabled=True)
+    )
+    provider.api = Mock(get_items=AsyncMock(return_value=[]))
+    previous_folders = provider._recommendation_folders
+    previous_playlists = provider._resolved_virtual_playlists
+
+    async def build(
+        _folder_id: str, *, discovery: LastFMDiscovery, **_kwargs: object
+    ) -> UniqueList:
+        discovery.state.has_incomplete_searches = True
+        discovery.state.retry_after = 900
+        return UniqueList()
+
+    provider._build_recommendation_items = AsyncMock(side_effect=build)
+    await provider._refresh_recommendations()
+    assert provider._recommendation_folders is previous_folders
+    assert provider._resolved_virtual_playlists is previous_playlists
+    scheduled = provider.mass.call_later.call_args
+    assert scheduled.args[0] == 900
+    assert scheduled.kwargs["task_id"] == f"{REFRESH_TASK_ID}_retry_{provider.instance_id}"
+    scheduled.args[1]()
+    provider.mass.tasks.run_task.assert_called_once_with(
+        f"{REFRESH_TASK_ID}_{provider.instance_id}"
+    )
+
+
+def test_refresh_retry_respects_minimum_delay_and_unload(
+    provider: LastFMRecommendationsEnhancedProvider,
+) -> None:
+    """Never retry in a tight loop or arm a new timer after unload."""
+    provider._schedule_refresh_retry(1)
+    assert provider.mass.call_later.call_args.args[0] == 300
+    provider._is_unloading = True
+    provider.mass.call_later.reset_mock()
+    provider._schedule_refresh_retry(900)
+    provider.mass.call_later.assert_not_called()
 
 
 async def test_cancelled_refresh_does_not_publish_partial_results(

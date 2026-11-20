@@ -34,15 +34,27 @@ ohne das neuere `options`-Argument.
   und danach alle 24 Stunden im Hintergrund aufgebaut. Abrufe liefern den letzten
   vollstaendigen Stand ohne neue Abfragen; bis zum ersten Aufbau ist die Liste leer.
   Bei einem fehlgeschlagenen Refresh bleibt der vorherige Stand erhalten.
+  Unvollstaendige Aufloesungen und erreichte Fehlversuchsgrenzen werden nach
+  mindestens fuenf Minuten erneut versucht; laengere Rate-Limit-Wartezeiten
+  haben Vorrang. Es gibt nur einen entprellten Retry-Timer pro Instanz.
 - Meldet Last.fm einen Katalogeintrag ausdruecklich als nicht gefunden, wird er
   als leere Kandidatenliste behandelt und hoechstens eine Stunde gecacht.
   Andere Anfragefehler bleiben Fehler; die Diagnose nennt Methode und sicheren
   Fehlercode, nicht den API-Key oder die rohe Last.fm-Fehlermeldung.
 - Maximal 50 Kandidaten je Abfrage, keine Katalogdurchlaeufe. Persoenliche
   Vorschlaege verwenden hoechstens drei Ausgangspunkte; das Genreprofil wertet
-  maximal zehn Kuenstler mit je fuenf bereinigten Tags aus. Die Aufloesung ist auf
-  sechs Quellsuchen pro Folder- oder Playlist-Aufbau begrenzt. Nicht aufloesbare
-  Medien entfallen, Reihen koennen daher kuerzer oder leer sein.
+  maximal zehn Kuenstler mit je fuenf bereinigten Tags aus. Wie beim offiziellen
+  Similar-Resolver gilt pro Aufloesung ein Ziel von zehn Medien und ein Abbruch
+  nach zehn erfolglosen Versuchen. Jede Quellsuche fragt zwei Treffer an; maximal
+  fuenf Aufloesungsaufrufe laufen gleichzeitig. Es gibt kein Sechser-Suchbudget
+  und keine breite Kuenstlersuche. Vorhandene Treffer werden zuerst gelesen;
+  neue Suchen fuellen nur das noch fehlende Ziel auf. Streaming-Treffer,
+  abgeschlossene Suchabfragen und voruebergehend gesperrte Quellen werden
+  innerhalb desselben nutzergebundenen Refreshs wiederverwendet.
+  Bestaetigte Fehltreffer werden beim naechsten Durchlauf uebersprungen,
+  sodass weitere Kandidaten geprueft werden koennen. Dubletten verbrauchen
+  ebenfalls das Fehlversuchsbudget, werden aber nicht als Fehltreffer gecacht.
+  Nicht aufloesbare Medien entfallen; Reihen koennen kuerzer oder leer sein.
 - Alle Enhanced-Instanzen teilen ein lokales Limit von fuenf Last.fm-Requests
   pro Sekunde. Last.fm kann strengere Limits setzen. Bei Rate Limits gilt ein
   gemeinsamer Cooldown von mindestens 60 Sekunden bzw. einem laengeren `Retry-After`.
@@ -50,6 +62,11 @@ ohne das neuere `options`-Argument.
   Aehnlichkeit und Kuenstler-Tags sieben Tage, weitere Listen einen Tag.
   Last.fm-Cache-Vorgaben haben Vorrang; die Antwortnutzlast ist auf 32 MiB begrenzt.
   Vorbereitete persoenliche Ergebnisse bleiben an den ausgewaehlten MA-Nutzer gebunden.
+- Aufgeloeste Medien werden im MA-Cache 90 Tage gespeichert, bestaetigte
+  Fehltreffer einen Tag. Die Schluessel enthalten Nutzer und sichtbare Quellen;
+  gespeicherte Treffer werden erneut auf Verfuegbarkeit geprueft.
+  Ladende Provider, Rate Limits und sonstige unvollstaendige Aufloesungen
+  erzeugen keinen negativen Cache-Eintrag.
 - Rediscovery gleicht maximal 500 historische mit 500 aktuellen Tracks ab.
   Erreicht die aktuelle Rotation diese Grenze, bleibt die Reihe leer.
 - Playlists sind dynamisch, nicht editierbar und enthalten hoechstens 50 Tracks.
@@ -70,8 +87,13 @@ Streamingrechte; Audio wird ausschliesslich ueber die eingerichteten MA-Quellen 
 
 ## Folder
 
-`monthly` bezeichnet die letzten 30 Tage. Die drei Toplisten nutzen ausschliesslich
-diesen Zeitraum; die Ausgangspunkte fuer persoenliche Empfehlungen kombinieren
+`weekly` bzw. MA-`week` bezeichnet die letzten 7 Tage, `monthly` bzw. MA-`month`
+die letzten 30 Tage, jeweils rueckwaerts vom Zeitpunkt des Hintergrundaufbaus.
+Es sind keine Kalenderwochen oder Kalendermonate; aktuelle und vorherige
+Kalenderperioden werden deshalb nicht zusammengelegt. Bis zum naechsten
+taeglichen Refresh bleibt das vorbereitete Zeitfenster unveraendert.
+Die drei Toplisten nutzen ausschliesslich die letzten 30 Tage;
+die Ausgangspunkte fuer persoenliche Empfehlungen kombinieren
 dagegen mehrere Zeitraeume, auch bei Folder-IDs mit dem Suffix `monthly`.
 
 **Track-Seeds** kombinieren jeweils bis zu 50 MA-Top-Tracks aus `month`, `week`
@@ -84,6 +106,16 @@ Der Favoritenbonus ist ein Empfehlungsgewicht, keine zusaetzliche Wiedergabe.
 Auch Favoriten ohne Plays koennen beitragen. Nur verfuegbare Ausgangspunkte
 werden beruecksichtigt; fuer normale Empfehlungen bleiben die drei staerksten
 eindeutigen Seeds, fuer das Genreprofil bis zu zehn Kuenstler.
+Fuer Track-Seeds ohne vollstaendige Credits werden hoechstens drei konkrete
+MA-Medienidentitaeten ueber den Mediencontroller geladen, ohne automatische
+Metadatenupdates oder eine namensbasierte Bibliotheksvorabpruefung.
+
+Last.fm liefert in diesem Provider keine persoenliche Hoerhistorie: es wird kein
+Last.fm-Benutzername verwendet. Die verwendeten Charts-, Tag-, Top- und
+Aehnlichkeitsendpunkte bieten keinen frei waehlbaren 7-/30-Tage-Zeitraum.
+Insbesondere beschreibt Last.fm `geo.getTopTracks` als Charts der letzten Woche.
+Ohne abrufbare historische Zeitgrenzen lassen sich dort weder rollierende
+Fenster noch zwei benachbarte Kalenderperioden verlaesslich zusammensetzen.
 
 Track-Favoriten fliessen nur in `user_recommendations` ein. Kuenstler-Favoriten
 fliessen in Kuenstler-Seeds und darueber in persoenliche Kuenstler- und Album-
@@ -163,13 +195,25 @@ vorherige Covergeneration bleiben erhalten; aeltere eigene Dateien werden
 bereinigt. Ein fehlgeschlagener oder abgebrochener Build veroeffentlicht keine
 unvollstaendige neue Sammlung.
 
-**Ergebnisaufbereitung:** Last.fm-Kandidaten werden zuerst auf verfuegbare MA-
-Bibliotheksobjekte, dann auf passende sichtbare Streaming-Quellen aufgeloest;
-das ist keine Favoritengewichtung. Nicht aufloesbare Kandidaten entfallen.
+**Ergebnisaufbereitung:** Bei vorhandener MusicBrainz-ID wird zuerst die
+oeffentliche MBID-Aufloesung des MA-Mediencontrollers verwendet. Diese kann
+ein passendes Bibliotheksobjekt liefern oder ueber MusicBrainz einen
+Streaming-Anbieter aufloesen. Liefert sie keinen passenden Treffer, folgt
+die Namenssuche auf den sichtbaren Streaming-Quellen. Es gibt keine direkte
+Abhaengigkeit von einem anderen Provider und keine ausschliessliche
+Bibliotheksaufloesung. Titel mit und ohne vorangestelltem
+Kuenstler werden geprueft; exakte normalisierte Titel haben Vorrang vor
+unscharfen Treffern. Falsche Kuenstler, fehlende Credits und widerspruechliche
+MusicBrainz-IDs werden nicht akzeptiert. Das ist keine Favoritengewichtung.
+Nicht aufloesbare Kandidaten entfallen. Die Diagnose nennt Kandidaten,
+aufgeloeste Medien, Suchverbrauch, Fehlversuche und Zielgrenze,
+fehlende Kuenstler, nicht aufgeloeste Kandidaten und Dubletten. Der Monatsfilter
+protokolliert separat die Zahl entfernter Medien; Bibliothekszaehler entfallen.
 `Rotation ausschliessen` bedeutet: bereits in den bis zu 500 MA-Top-Items des
 jeweiligen Medientyps aus `month` enthaltene Identitaeten werden entfernt,
-nicht nur nach hinten sortiert. Rediscovery verwendet abweichend nur vorhandene
-lokale Track-Identitaeten und keine Streaming-Suche. Die Zahl konkreter Genre-
+nicht nur nach hinten sortiert. Rediscovery verwendet die verfuegbaren
+Track-Identitaeten aus der MA-Historie, auch von Streaming-Anbietern,
+ohne erneute Namensaufloesung oder Streaming-Suche. Die Zahl konkreter Genre-
 Reihen haengt von persoenlichen Tags bzw. globalen Explore-Tags ab; Mood- und
 Jahrzehnt-Auswahlen bleiben fest. Sichtbarkeit und verfuegbare Wiedergabequellen
 bleiben an den ausgewaehlten MA-Nutzer gebunden, auch fuer allgemeine Explore-Reihen.

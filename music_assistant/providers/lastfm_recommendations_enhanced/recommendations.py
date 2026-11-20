@@ -1,34 +1,67 @@
-"""Request-scoped discovery; only public Last.fm responses enter the shared MA cache."""
+"""User-scoped discovery and streaming resolution through the shared MA cache."""
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from music_assistant_models.enums import ExternalID, LinkType, MediaType, ProviderFeature
+from music_assistant_models.enums import (
+    ExternalID,
+    LinkType,
+    MediaType,
+    ProviderFeature,
+    ProviderStatus,
+    ProviderType,
+)
 from music_assistant_models.errors import (
+    MediaNotFoundError,
     MusicAssistantError,
     RateLimited,
     ResourceTemporarilyUnavailable,
 )
-from music_assistant_models.media_items import Album, Artist, Track, UniqueList
+from music_assistant_models.media_items import Album, Artist, ItemMapping, Track, UniqueList
 from music_assistant_models.media_items.metadata import MediaItemLink
 
 from music_assistant.helpers.compare import compare_strings
 from music_assistant.helpers.util import parse_title_and_version
 
 from .api_client import LastFMItem
+from .constants import CONF_RECOMMENDATION_USER_ID
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from . import LastFMRecommendationsEnhancedProvider
 
 RESULT_LIMIT = 50
 SEED_LIMIT = 3
-SOURCE_SEARCH_BUDGET = 6
-IDENTITY_LOOKUP_BUDGET = 6
+RESOLUTION_TARGET_LIMIT = 10
+RESOLUTION_MISS_LIMIT = 10
+SOURCE_SEARCH_RESULT_LIMIT = 2
+SEARCH_CONCURRENCY_LIMIT = 5
+_SEARCH_SEMAPHORE = asyncio.Semaphore(SEARCH_CONCURRENCY_LIMIT)
+CACHE_CATEGORY_RESOLUTION = 1
+RESOLUTION_CACHE_TTL = 90 * 24 * 60 * 60
+RESOLUTION_MISS_CACHE_TTL = 24 * 60 * 60
+RESOLUTION_RETRY_DELAY = 5 * 60
+
+
+@dataclass
+class ResolutionState:
+    """Share search results, unavailable sources and retry timing within one user refresh."""
+
+    source_items: dict[MediaType, UniqueList[Artist | Album | Track]] = field(default_factory=dict)
+    source_queries: set[tuple[MediaType, str, str]] = field(default_factory=set)
+    unavailable_sources: set[str] = field(default_factory=set)
+    has_blocked_mbid_lookup: bool = False
+    has_incomplete_searches: bool = False
+    retry_after: float = 0
 
 
 @dataclass(frozen=True)
@@ -98,28 +131,38 @@ DISCOVERY_FOLDERS = (
 class LastFMDiscovery:
     """Build per-request results without retaining a user's seeds or resolved media."""
 
-    def __init__(self, provider: LastFMRecommendationsEnhancedProvider) -> None:
+    def __init__(
+        self,
+        provider: LastFMRecommendationsEnhancedProvider,
+        *,
+        state: ResolutionState | None = None,
+    ) -> None:
         """Use the active provider's API, logger and user-scoped controller calls."""
         self.provider = provider
-        self._source_searches_remaining = SOURCE_SEARCH_BUDGET
-        self._identity_lookups_remaining = IDENTITY_LOOKUP_BUDGET
+        self._source_search_count = 0
+        self.state = state if state is not None else ResolutionState()
+        self._has_loading_sources = False
 
-    async def build_items(self, folder: DiscoveryFolder) -> UniqueList[Artist | Album | Track]:
+    async def build_items(
+        self, folder: DiscoveryFolder
+    ) -> UniqueList[Artist | Album | Track | ItemMapping]:
         """Build one row, preserving chart order or combining a fixed number of personal seeds."""
         started = perf_counter()
         logger = self.provider.logger
         logger.debug("Building Last.fm discovery folder=%s limit=%d", folder.item_id, RESULT_LIMIT)
+        result: UniqueList[Artist | Album | Track | ItemMapping] = UniqueList()
         try:
             if not folder.method:
-                result = await self._rediscovery()
+                result.extend(await self._rediscovery())
             else:
                 candidates = await self._candidates(folder)
                 logger.debug(
                     "Last.fm folder=%s candidates=%d phase=resolve", folder.item_id, len(candidates)
                 )
-                result = await self.resolve_items(candidates, folder.media_type)
+                resolved = await self.resolve_items(candidates, folder.media_type)
                 if folder.seed_type is not None:
-                    result = await self.exclude_rotation(result, folder.media_type)
+                    resolved = await self.exclude_rotation(resolved, folder.media_type)
+                result.extend(resolved)
         except MusicAssistantError as err:
             logger.debug(
                 "Last.fm discovery failed folder=%s error_type=%s elapsed=%.3fs",
@@ -152,14 +195,7 @@ class LastFMDiscovery:
                     history[row.item.uri] = row.item
                     weights[row.item.uri] = weights.get(row.item.uri, 0) + row.play_count * factor
         controller = self.provider.mass.music.get_controller(media_type)
-        known = (
-            await self.get_known_items(
-                [LastFMItem(item.name) for item in history.values()], media_type
-            )
-            if media_type == MediaType.TRACK
-            else []
-        )
-        by_uri = {item.uri: item for item in known}
+        by_uri: dict[str, Artist | Album | Track] = {}
         favorites = await controller.get_library_items_by_query(favorite=True, limit=50)
         for item in favorites:
             if item.available:
@@ -168,11 +204,25 @@ class LastFMDiscovery:
                 weights[item.uri] = weights.get(item.uri, 0) + 5
         result: list[PersonalSeed] = []
         seen: set[tuple[str, str]] = set()
+        metadata_lookups_remaining = SEED_LIMIT
         for uri in sorted(weights, key=lambda uri: weights[uri], reverse=True):
             item = by_uri.get(uri, history[uri])
+            if (
+                media_type == MediaType.TRACK
+                and not isinstance(item, Track)
+                and metadata_lookups_remaining
+            ):
+                metadata_lookups_remaining -= 1
+                try:
+                    item = await controller.get(
+                        item.item_id, item.provider, allow_update_metadata=False
+                    )
+                except MediaNotFoundError:
+                    self.provider.logger.debug("Last.fm seed skipped reason=track_not_found")
+                    continue
             if media_type == MediaType.ARTIST:
                 seed = PersonalSeed(item.name, weight=weights[uri], identity=uri)
-            elif isinstance(item, Track) and item.artists:
+            elif isinstance(item, Track) and item.available and item.artists:
                 seed = PersonalSeed(item.artists[0].name, item.name, weights[uri], identity=uri)
             else:
                 continue
@@ -182,6 +232,14 @@ class LastFMDiscovery:
                 seen.add(key)
             if len(result) == limit:
                 break
+        self.provider.logger.debug(
+            "Last.fm seeds media_type=%s periods=month:30d,week:7d,all_time "
+            "history=%d selected=%d metadata_lookups=%d",
+            media_type.value,
+            len(history),
+            len(result),
+            SEED_LIMIT - metadata_lookups_remaining,
+        )
         return result
 
     async def exclude_rotation(
@@ -192,42 +250,95 @@ class LastFMDiscovery:
             media_type=media_type, period="month", limit=500
         )
         recent_uris = {row.item.uri for row in recent}
-        return UniqueList(item for item in items if item.uri not in recent_uris)
-
-    async def get_known_items(
-        self, candidates: list[LastFMItem], media_type: MediaType
-    ) -> list[Artist | Album | Track]:
-        """Resolve names in one bounded controller query, never by walking external catalogues."""
-        names = sorted({item.name.lower() for item in candidates})
-        if not names:
-            return []
-        controller = self.provider.mass.music.get_controller(media_type)
-        params = {f"candidate_{index}": name for index, name in enumerate(names)}
-        placeholders = ", ".join(f":{key}" for key in params)
-        items = await controller.get_library_items_by_query(
-            extra_query_parts=[f"WHERE LOWER({controller.db_table}.name) IN ({placeholders})"],
-            extra_query_params=params,
-            limit=500,
+        result = UniqueList(item for item in items if item.uri not in recent_uris)
+        self.provider.logger.debug(
+            "Last.fm rotation media_type=%s period=month days=30 recent=%d input=%d removed=%d",
+            media_type.value,
+            len(recent),
+            len(items),
+            len(items) - len(result),
         )
-        return cast("list[Artist | Album | Track]", items)
+        return result
 
     async def resolve_items(
         self, candidates: list[LastFMItem], media_type: MediaType
     ) -> UniqueList[Artist | Album | Track]:
-        """Prefer the library, then resolve missing items on visible streaming music sources."""
-        known = await self.get_known_items(candidates, media_type)
+        """Resolve cached candidates first, then fill the target within the miss limit."""
+        self._has_loading_sources = any(
+            config.status == ProviderStatus.LOADING
+            for config in await self.provider.mass.config.get_provider_configs(
+                provider_type=ProviderType.MUSIC
+            )
+        )
         result: UniqueList[Artist | Album | Track] = UniqueList()
-        for candidate in candidates:
-            item = next((item for item in known if self._matches(candidate, item)), None)
-            if item is None:
-                item = await self._resolve_missing(candidate, media_type)
+        misses = 0
+        duplicates = 0
+        attempted = 0
+        cached_hits = 0
+        searches_before = self._source_search_count
+        found: dict[int, Artist | Album | Track] = {}
+        pending: list[int] = []
+        for index, candidate in enumerate(candidates):
+            item, missed = await self._get_cached_resolution(candidate, media_type)
             if item is not None:
-                result.append(self._with_attribution(item, candidate, media_type))
+                cached_hits += 1
+                if item.uri not in {value.uri for value in found.values()}:
+                    found[index] = item
+                else:
+                    duplicates += 1
+            elif not missed:
+                pending.append(index)
+        for index in sorted(
+            pending,
+            key=lambda index: (index >= RESOLUTION_TARGET_LIMIT, not candidates[index].mbid),
+        ):
+            if len(found) >= RESOLUTION_TARGET_LIMIT or misses >= RESOLUTION_MISS_LIMIT:
+                if len(found) < RESOLUTION_TARGET_LIMIT:
+                    self.state.retry_after = max(self.state.retry_after, RESOLUTION_RETRY_DELAY)
+                break
+            candidate = candidates[index]
+            attempted += 1
+            item = self._find_match(
+                candidate, self.state.source_items.get(media_type, ()), require_exact_title=True
+            )
+            if item is None:
+                try:
+                    item = await self._resolve_missing(candidate, media_type)
+                except ResourceTemporarilyUnavailable:
+                    self.state.has_incomplete_searches = True
+                    self.state.retry_after = max(self.state.retry_after, RESOLUTION_RETRY_DELAY)
+                    misses += 1
+                    continue
+            cache_key = self._resolution_cache_key(candidate, media_type)
+            await self.provider.mass.cache.set(
+                key=cache_key if item is not None else f"miss_{cache_key}",
+                data=item.to_dict() if item is not None else True,
+                category=CACHE_CATEGORY_RESOLUTION,
+                provider=self.provider.instance_id,
+                expiration=RESOLUTION_CACHE_TTL if item is not None else RESOLUTION_MISS_CACHE_TTL,
+            )
+            if item is None:
+                misses += 1
+            elif item.uri not in {value.uri for value in found.values()}:
+                found[index] = item
+            else:
+                misses += 1
+                duplicates += 1
+        for index in sorted(found)[:RESOLUTION_TARGET_LIMIT]:
+            result.append(self._with_attribution(found[index], candidates[index], media_type))
         self.provider.logger.debug(
-            "Last.fm resolution candidates=%d known=%d resolved=%d",
+            "Last.fm resolution candidates=%d cached=%d resolved=%d "
+            "searches=%d misses=%d limit=%d "
+            "missing_artist=%d deferred=%d duplicates=%d",
             len(candidates),
-            len(known),
+            cached_hits,
             len(result),
+            self._source_search_count - searches_before,
+            misses,
+            RESOLUTION_TARGET_LIMIT,
+            sum(not item.artist for item in candidates) if media_type != MediaType.ARTIST else 0,
+            len(pending) - attempted,
+            duplicates,
         )
         return result
 
@@ -271,37 +382,22 @@ class LastFMDiscovery:
     async def _resolve_missing(
         self, candidate: LastFMItem, media_type: MediaType
     ) -> Artist | Album | Track | None:
-        """Spend a fixed identity and source budget rather than resolving a complete catalogue."""
+        """Search each eligible streaming source until it returns a verified match."""
         controller = self.provider.mass.music.get_controller(media_type)
-        external_id_type = {
-            MediaType.ARTIST: ExternalID.MB_ARTIST,
-            MediaType.ALBUM: ExternalID.MB_ALBUM,
-            MediaType.TRACK: ExternalID.MB_RECORDING,
-        }[media_type]
-        if candidate.mbid and self._identity_lookups_remaining:
-            self._identity_lookups_remaining -= 1
-            library = await controller.get_library_item_by_external_ids(
-                {(external_id_type, candidate.mbid)}
-            )
-            if isinstance(library, Artist | Album | Track) and library.available:
-                return library
         if media_type != MediaType.ARTIST and not candidate.artist:
             return None
-        feature = {
-            MediaType.ARTIST: ProviderFeature.LIBRARY_ARTISTS,
-            MediaType.ALBUM: ProviderFeature.LIBRARY_ALBUMS,
-            MediaType.TRACK: ProviderFeature.LIBRARY_TRACKS,
-        }[media_type]
         providers = [
             source
             for source in self.provider.mass.music.providers
             if source.instance_id != self.provider.instance_id
             and source.available
             and source.is_streaming_provider
-            and feature in source.supported_features
             and ProviderFeature.SEARCH in source.supported_features
         ]
-        failed = False
+        linked_item, lookup_failed = await self._resolve_via_musicbrainz(candidate, media_type)
+        if linked_item is not None:
+            return linked_item
+        failed = not providers or self._has_loading_sources or lookup_failed
         title, _version = parse_title_and_version(candidate.name, strip_for_search=True)
         query = (
             f"{candidate.artist} - {title}"
@@ -309,44 +405,183 @@ class LastFMDiscovery:
             else title
         )
         for source in providers:
-            if not self._source_searches_remaining:
-                break
-            self._source_searches_remaining -= 1
-            try:
-                results = await controller.search(query, source.instance_id, limit=2)
-            except RateLimited:
-                raise
-            except MusicAssistantError as error:
+            query_key = (media_type, source.instance_id, query.casefold())
+            if source.instance_id in self.state.unavailable_sources:
                 failed = True
-                self.provider.logger.debug(
-                    "Last.fm source resolution failed media_type=%s error_type=%s",
-                    media_type.value,
-                    type(error).__name__,
+                continue
+            if query_key in self.state.source_queries:
+                continue
+            async with _SEARCH_SEMAPHORE:
+                if not source.available:
+                    failed = True
+                    continue
+                self._source_search_count += 1
+                try:
+                    results = await controller.search(
+                        query, source.instance_id, limit=SOURCE_SEARCH_RESULT_LIMIT
+                    )
+                except MusicAssistantError as error:
+                    failed = True
+                    self.state.unavailable_sources.add(source.instance_id)
+                    if isinstance(error, RateLimited):
+                        self.state.has_blocked_mbid_lookup = True
+                    self.state.retry_after = max(
+                        self.state.retry_after,
+                        error.backoff_time
+                        if isinstance(error, RateLimited)
+                        else RESOLUTION_RETRY_DELAY,
+                    )
+                    self.provider.logger.debug(
+                        "Last.fm source resolution failed media_type=%s error_type=%s",
+                        media_type.value,
+                        type(error).__name__,
+                    )
+                    continue
+                if not source.available:
+                    failed = True
+                    continue
+                self.state.source_queries.add(query_key)
+                reusable = self.state.source_items.setdefault(media_type, UniqueList())
+                reusable.extend(
+                    item
+                    for item in results
+                    if isinstance(item, Artist | Album | Track)
+                    and item.media_type == media_type
+                    and item.available
                 )
-                continue
-            if not source.available:
-                failed = True
-                continue
-            for item in results:
-                if isinstance(item, Artist | Album | Track) and self._matches(candidate, item):
-                    return await self._prefer_library(item, media_type)
+                self.provider.logger.debug(
+                    "Last.fm source search media_type=%s results=%d reusable=%d",
+                    media_type.value,
+                    len(results),
+                    len(reusable),
+                )
+                if item := self._find_match(
+                    candidate,
+                    (
+                        value
+                        for value in results
+                        if isinstance(value, Artist | Album | Track)
+                        and value.media_type == media_type
+                    ),
+                ):
+                    return item
         if failed:
             raise ResourceTemporarilyUnavailable(
                 "Music sources were unavailable during recommendation resolution"
             )
         return None
 
-    async def _prefer_library(
-        self, item: Artist | Album | Track, media_type: MediaType
-    ) -> Artist | Album | Track:
-        """Prefer an existing visible library identity revealed by the source's external IDs."""
-        if item.external_ids and self._identity_lookups_remaining:
-            self._identity_lookups_remaining -= 1
-            controller = self.provider.mass.music.get_controller(media_type)
-            library = await controller.get_library_item_by_external_ids(item.external_ids)
-            if isinstance(library, Artist | Album | Track) and library.available:
-                return library
-        return item
+    async def _resolve_via_musicbrainz(
+        self, candidate: LastFMItem, media_type: MediaType
+    ) -> tuple[Artist | Album | Track | None, bool]:
+        """Resolve a MusicBrainz identity through MA, marking unavailable lookups as incomplete."""
+        if not candidate.mbid:
+            return None, False
+        if self.state.has_blocked_mbid_lookup:
+            return None, True
+        external_id_type = {
+            MediaType.ARTIST: ExternalID.MB_ARTIST,
+            MediaType.ALBUM: ExternalID.MB_ALBUM,
+            MediaType.TRACK: ExternalID.MB_RECORDING,
+        }[media_type]
+        controller = self.provider.mass.music.get_controller(media_type)
+        try:
+            async with _SEARCH_SEMAPHORE:
+                linked_item = await controller.get_item_by_external_id(
+                    candidate.mbid, external_id_type
+                )
+        except MediaNotFoundError:
+            return None, False
+        except MusicAssistantError as error:
+            self.provider.logger.debug(
+                "Last.fm MusicBrainz resolution failed media_type=%s error_type=%s",
+                media_type.value,
+                type(error).__name__,
+            )
+            if isinstance(error, RateLimited):
+                self.state.has_blocked_mbid_lookup = True
+                self.state.unavailable_sources.update(
+                    source.instance_id
+                    for source in self.provider.mass.music.providers
+                    if source.is_streaming_provider
+                )
+                self.state.retry_after = max(self.state.retry_after, error.backoff_time)
+            return None, True
+        if (
+            isinstance(linked_item, Artist | Album | Track)
+            and linked_item.media_type == media_type
+            and self._matches(candidate, linked_item)
+        ):
+            return linked_item, False
+        return None, False
+
+    async def _get_cached_resolution(
+        self, candidate: LastFMItem, media_type: MediaType
+    ) -> tuple[Artist | Album | Track | None, bool]:
+        """Return a still-visible cached match or a confirmed, unexpired streaming miss."""
+        cache_key = self._resolution_cache_key(candidate, media_type)
+        base_class = {MediaType.ARTIST: Artist, MediaType.ALBUM: Album, MediaType.TRACK: Track}[
+            media_type
+        ]
+        cached = await self.provider.mass.cache.get(
+            key=cache_key,
+            category=CACHE_CATEGORY_RESOLUTION,
+            provider=self.provider.instance_id,
+            base_class=base_class,
+        )
+        if isinstance(cached, base_class) and self._matches(candidate, cached):
+            if any(
+                source.available
+                and source.is_streaming_provider
+                and (
+                    source.instance_id == cached.provider
+                    or (
+                        cached.provider == "library"
+                        and any(
+                            mapping.available and mapping.provider_instance == source.instance_id
+                            for mapping in cached.provider_mappings
+                        )
+                    )
+                )
+                for source in self.provider.mass.music.providers
+            ):
+                return cached, False
+        missed = await self.provider.mass.cache.get(
+            key=f"miss_{cache_key}",
+            category=CACHE_CATEGORY_RESOLUTION,
+            provider=self.provider.instance_id,
+        )
+        return None, bool(missed) and not self._has_loading_sources
+
+    def _resolution_cache_key(self, candidate: LastFMItem, media_type: MediaType) -> str:
+        """Scope one media identity to the selected user's ordered visible music sources."""
+        identity = (
+            self.provider.get_setup_value(CONF_RECOMMENDATION_USER_ID),
+            [
+                (source.instance_id, source.available)
+                for source in self.provider.mass.music.providers
+                if source.is_streaming_provider
+            ],
+            media_type.value,
+            candidate.mbid or (candidate.artist.casefold(), candidate.name.casefold()),
+        )
+        return "resolution_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    @classmethod
+    def _find_match(
+        cls,
+        candidate: LastFMItem,
+        items: Iterable[Artist | Album | Track],
+        *,
+        require_exact_title: bool = False,
+    ) -> Artist | Album | Track | None:
+        """Prefer exact normalized titles over compatible fuzzy matches."""
+        title, _version = parse_title_and_version(candidate.name, strip_for_search=True)
+        matches = [item for item in items if cls._matches(candidate, item)]
+        return next(
+            (item for item in matches if compare_strings(title, item.name)),
+            matches[0] if matches and not require_exact_title else None,
+        )
 
     @staticmethod
     def _matches(candidate: LastFMItem, item: Artist | Album | Track) -> bool:
@@ -354,7 +589,10 @@ class LastFMDiscovery:
         if not item.available:
             return False
         title, _version = parse_title_and_version(candidate.name, strip_for_search=True)
-        if not compare_strings(title, item.name, strict=False):
+        credited_title = f"{candidate.artist} - {title}" if candidate.artist else title
+        if not compare_strings(title, item.name, strict=False) and not compare_strings(
+            credited_title, item.name, strict=False
+        ):
             return False
         if isinstance(item, Track | Album) and (
             not candidate.artist
@@ -395,7 +633,7 @@ class LastFMDiscovery:
         }
         return resolved
 
-    async def _rediscovery(self) -> UniqueList[Artist | Album | Track]:
+    async def _rediscovery(self) -> UniqueList[ItemMapping]:
         """Subtract the complete current rotation, or fail closed when its bound is reached."""
         statistics = self.provider.mass.statistics
         recent = await statistics.get_top_items(
@@ -417,8 +655,4 @@ class LastFMDiscovery:
             len(previous),
             len(candidates),
         )
-        items = await self.get_known_items(
-            [LastFMItem(item.name) for item in candidates], MediaType.TRACK
-        )
-        by_uri = {item.uri: item for item in items if item.available}
-        return UniqueList(by_uri[item.uri] for item in candidates if item.uri in by_uri)
+        return UniqueList(candidates)
