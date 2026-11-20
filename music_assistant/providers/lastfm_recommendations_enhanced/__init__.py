@@ -117,10 +117,6 @@ async def setup(
 class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin):
     """Personal and general recommendations without a Last.fm account."""
 
-    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
-        """Offer the MA user whose listening data and sources build the recommendations."""
-        return (await get_recommendation_user_entry(self.mass),)
-
     async def handle_async_init(self) -> None:
         """Validate the configured API key before exposing the provider."""
         self.logger.debug("Last.fm Enhanced initialization start instance=%s", self.instance_id)
@@ -128,7 +124,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         if not isinstance(api_key, str) or not api_key.strip():
             self.logger.debug("Last.fm Enhanced initialization failed reason=missing_api_key")
             raise AuthenticationFailed("A personal Last.fm API key is required")
-        user_id = self.get_config_value(CONF_RECOMMENDATION_USER_ID)
+        user_id = self.get_setup_value(CONF_RECOMMENDATION_USER_ID)
         if not isinstance(user_id, str) or not user_id.strip():
             raise AuthenticationFailed("Select a Music Assistant user for recommendations")
         user = await self.mass.webserver.auth.get_user(user_id)
@@ -231,7 +227,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         """Restrict prepared results to their MA user, allowing internal playlist playback."""
         if self._is_unloading:
             return False
-        user_id = self.get_config_value(CONF_RECOMMENDATION_USER_ID)
+        user_id = self.get_setup_value(CONF_RECOMMENDATION_USER_ID)
         if not isinstance(user_id, str) or user_id != self._recommendation_user_id:
             return False
         user = get_current_user()
@@ -368,7 +364,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         async with self._refresh_lock:
             if self._is_unloading:
                 return
-            user_id = self.get_config_value(CONF_RECOMMENDATION_USER_ID)
+            user_id = self.get_setup_value(CONF_RECOMMENDATION_USER_ID)
             if not isinstance(user_id, str) or not user_id.strip():
                 raise AuthenticationFailed("Select a Music Assistant user for recommendations")
             user = await self.mass.webserver.auth.get_user(user_id)

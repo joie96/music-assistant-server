@@ -22,7 +22,9 @@ if TYPE_CHECKING:
 async def run_setup(session: SetupSession) -> None:
     """Collect the Last.fm key and the MA user whose listening data builds recommendations."""
     user_entry = await get_recommendation_user_entry(session.mass)
-    user_entry = replace(user_entry, value=session.context.values.get(CONF_RECOMMENDATION_USER_ID))
+    user_entry = replace(
+        user_entry, value=session.context.setup_data.get(CONF_RECOMMENDATION_USER_ID)
+    )
     valid_user_ids = {option.value for option in user_entry.options or []}
     errors: dict[str, str | SetupFlowError] | None = None
     while True:
@@ -45,8 +47,7 @@ async def run_setup(session: SetupSession) -> None:
             continue
         try:
             await session.finish(
-                {CONF_API_KEY: values.get(CONF_API_KEY)},
-                options={CONF_RECOMMENDATION_USER_ID: user_id},
+                {CONF_API_KEY: values.get(CONF_API_KEY), CONF_RECOMMENDATION_USER_ID: user_id}
             )
             return
         except SetupFlowError as err:

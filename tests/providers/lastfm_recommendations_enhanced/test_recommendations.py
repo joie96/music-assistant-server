@@ -38,6 +38,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced import (
     TOP_ITEMS_FOLDERS,
     LastFMRecommendationsEnhancedProvider,
     _recommendation_user_context,
+    get_recommendation_user_entry,
 )
 from music_assistant.providers.lastfm_recommendations_enhanced.api_client import LastFMItem
 from music_assistant.providers.lastfm_recommendations_enhanced.catalog import (
@@ -70,6 +71,8 @@ def provider(tmp_path: Path) -> LastFMRecommendationsEnhancedProvider:
     """Return a real provider with an isolated, mocked statistics controller."""
     mass = Mock()
     mass.cache_path = str(tmp_path)
+    mass.config.get.return_value = {CONF_RECOMMENDATION_USER_ID: "DEBUG"}
+    mass.config.decrypt_string.side_effect = lambda value: value
     mass.statistics.get_top_items = AsyncMock(return_value=[])
     mass.music.providers = []
     controller = mass.music.get_controller.return_value
@@ -384,7 +387,7 @@ async def test_refresh_uses_selected_user_and_restores_request_context(
     """Build as the configured user even when another user initiated the refresh."""
     selected = Mock(user_id="selected-user", enabled=True)
     requester = Mock(user_id="requesting-user")
-    provider.config.get_value.return_value = selected.user_id
+    provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = selected.user_id
     provider.mass.webserver.auth.get_user = AsyncMock(return_value=selected)
     provider._refresh_lock = asyncio.Lock()
     provider.api = Mock()
@@ -617,7 +620,7 @@ async def test_refresh_builds_dynamic_genres_from_unmapped_streaming_artist(
 ) -> None:
     """Global Explore and personal artist tags remain separate in one prepared generation."""
     selected = Mock(user_id="selected-user", enabled=True)
-    provider.config.get_value.return_value = selected.user_id
+    provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = selected.user_id
     provider.mass.webserver.auth.get_user = AsyncMock(return_value=selected)
     artist = ItemMapping(
         item_id="external",
@@ -717,7 +720,7 @@ async def test_failed_refresh_preserves_previous_generation(
     previous_folders = []
     previous_playlists = {}
     selected = Mock(user_id="selected-user", enabled=True)
-    provider.config.get_value.return_value = selected.user_id
+    provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = selected.user_id
     provider.mass.webserver.auth.get_user = AsyncMock(return_value=selected)
     provider._refresh_lock = asyncio.Lock()
     provider._recommendation_folders = previous_folders
@@ -734,9 +737,7 @@ async def test_refresh_rejects_missing_user(
     provider: LastFMRecommendationsEnhancedProvider,
 ) -> None:
     """Never fall back to the requester or all users when no MA user was selected."""
-    provider.config.get_value.side_effect = lambda key, _default=None: (
-        None if key == CONF_RECOMMENDATION_USER_ID else "DEBUG"
-    )
+    provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = None
     provider._refresh_lock = asyncio.Lock()
     with pytest.raises(AuthenticationFailed):
         await provider._refresh_recommendations()
@@ -765,7 +766,7 @@ async def test_prepared_results_are_hidden_from_other_users(
             await provider.get_playlist_tracks(items[0].item_id)
     with user_auth_context(Mock(user_id="DEBUG")):
         assert len(await provider.get_recommendations()) == 24
-        provider.config.get_value.return_value = "other-user"
+        provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = "other-user"
         assert not await provider.get_recommendations()
 
 
@@ -779,11 +780,10 @@ async def test_user_setting_only_offers_enabled_ma_users(
             Mock(user_id="disabled", display_name="Disabled", username="disabled", enabled=False),
         ]
     )
-    entries = await provider.get_config_entries()
-    assert len(entries) == 1
-    assert entries[0].key == CONF_RECOMMENDATION_USER_ID
-    assert entries[0].required
-    assert [(option.value, option.title) for option in entries[0].options] == [("alice", "Alice")]
+    entry = await get_recommendation_user_entry(provider.mass)
+    assert entry.key == CONF_RECOMMENDATION_USER_ID
+    assert entry.required
+    assert [(option.value, option.title) for option in entry.options] == [("alice", "Alice")]
 
 
 async def test_initialization_registers_daily_refresh_and_delayed_startup(
@@ -795,7 +795,7 @@ async def test_initialization_registers_daily_refresh_and_delayed_startup(
         "music_assistant.providers.lastfm_recommendations_enhanced.LastFMAPIClient",
         Mock(return_value=api),
     )
-    provider.get_setup_value = Mock(return_value="test-key")
+    provider.mass.config.get.return_value["api_key"] = "test-key"
     provider.mass.webserver.auth.get_user = AsyncMock(
         return_value=Mock(user_id="DEBUG", enabled=True)
     )

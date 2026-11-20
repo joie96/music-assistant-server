@@ -9,8 +9,9 @@ Bibliothek, Favoriten und Hoerverlauf werden nicht veraendert.
 - Ein eigener [Last.fm API-Key](https://www.last.fm/api/account/create).
   Kein mitgelieferter Key, Last.fm-Login, Benutzername oder API-Secret erforderlich.
 - Einen aktivierten MA-Nutzer im Setup auswaehlen. Die Auswahl kann spaeter
-  jederzeit in den Provider-Einstellungen unter "Music Assistant user for
-  recommendations" (`recommendation_user_id`) geaendert werden.
+  durch erneutes Ausfuehren des Provider-Setups unter "Music Assistant user for
+  recommendations" (`recommendation_user_id`) geaendert werden. API-Key und
+  Nutzerwahl werden gemeinsam in `setup_data` gespeichert.
   Seine History, Favoriten und verfuegbaren Musikquellen bilden die
   persoenliche Grundlage; die Reihen sind nur fuer diesen Nutzer sichtbar.
   Persoenliche Genre-Empfehlungen verwenden ausschliesslich Last.fm-Tags seiner bevorzugten
@@ -24,6 +25,8 @@ wird nach dem Aufbau wiederhergestellt, auch bei Fehlern und Abbruch.
 Auch die Throttler-Konfiguration verwendet nur in dieser Version verfuegbare
 Konstruktorargumente. Ein aktiver Last.fm-Cooldown wird vor und nach der
 Slot-Vergabe geprueft: keine weitere Anfrage und keine verlaengerte Wartefrist.
+Der Setup-Abschluss verwendet den in `2.11.0b7` verfuegbaren `finish(values)`-Vertrag
+ohne das neuere `options`-Argument.
 
 ## Limits und Hinweise
 

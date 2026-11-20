@@ -2,7 +2,7 @@
 
 import logging
 import runpy
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, create_autospec
 
 import pytest
 from aiohttp import ClientConnectionError
@@ -52,8 +52,8 @@ def http_session() -> MagicMock:
 
 @pytest.fixture
 def setup_data() -> dict[str, str | None]:
-    """Return the credentials collected by the setup flow."""
-    return {"api_key": "custom-test-key"}
+    """Return the credentials and MA user collected by the setup flow."""
+    return {"api_key": "custom-test-key", CONF_RECOMMENDATION_USER_ID: "selected-user"}
 
 
 @pytest.fixture
@@ -79,7 +79,6 @@ def provider(
     config.values = {}
     config.get_value.side_effect = lambda key, default=None: {
         "log_level": "INFO",
-        CONF_RECOMMENDATION_USER_ID: "selected-user",
     }.get(key, default)
     manifest = Mock()
     manifest.domain = "lastfm_recommendations_enhanced"
@@ -96,8 +95,7 @@ async def test_custom_key_is_required_and_sent_to_lastfm(
 ) -> None:
     """Read the setup key without declaring mandatory credentials as runtime options."""
     entries = await provider.get_config_entries()
-    assert [entry.key for entry in entries] == [CONF_RECOMMENDATION_USER_ID]
-    assert entries[0].required
+    assert not entries
     await provider.handle_async_init()
     assert http_session.get.call_args.kwargs["params"] == {
         "method": "chart.getTopArtists",
@@ -204,17 +202,27 @@ async def test_provider_only_publishes_implemented_folders(
     http_session.get.assert_not_called()
 
 
-async def test_setup_collects_required_api_key_and_ma_user() -> None:
-    """Keep credentials in setup data and store the chosen MA user as a normal option."""
+@pytest.mark.parametrize("prefill_user", [None, "selected-user"])
+async def test_setup_collects_required_api_key_and_ma_user(
+    provider: LastFMRecommendationsEnhancedProvider, prefill_user: str | None
+) -> None:
+    """Keep credentials and the chosen MA user in setup data supported by older servers."""
     session = Mock()
-    session.context.values = {}
+    session.context.setup_data = {CONF_RECOMMENDATION_USER_ID: prefill_user} if prefill_user else {}
     session.mass.webserver.auth.list_users = AsyncMock(
         return_value=[Mock(user_id="selected-user", display_name="Selected", enabled=True)]
     )
     session.form = AsyncMock(
         return_value={"api_key": "custom-test-key", CONF_RECOMMENDATION_USER_ID: "selected-user"}
     )
-    session.finish = AsyncMock()
+
+    async def legacy_finish(values: dict[str, str | None]) -> dict[str, str]:
+        """Apply setup data through the finish signature available in MA 2.11.0b7."""
+        provider.mass.config.get.return_value = values
+        await provider.handle_async_init()
+        return {"instance_id": provider.instance_id}
+
+    session.finish = create_autospec(legacy_finish, side_effect=legacy_finish)
     await run_setup(session)
     entries = session.form.call_args.args[0]
     assert len(entries) == 2
@@ -223,10 +231,11 @@ async def test_setup_collects_required_api_key_and_ma_user() -> None:
     assert entries[0].type == ConfigEntryType.SECURE_STRING
     assert entries[1].key == CONF_RECOMMENDATION_USER_ID
     assert entries[1].required
+    assert entries[1].value == prefill_user
     session.finish.assert_awaited_once_with(
-        {"api_key": "custom-test-key"},
-        options={CONF_RECOMMENDATION_USER_ID: "selected-user"},
+        {"api_key": "custom-test-key", CONF_RECOMMENDATION_USER_ID: "selected-user"}
     )
+    assert provider._recommendation_user_id == "selected-user"
 
 
 @pytest.mark.parametrize(
@@ -311,12 +320,11 @@ async def test_transport_debug_log_excludes_exception_text(
 async def test_initialization_requires_an_enabled_selected_user(
     provider: LastFMRecommendationsEnhancedProvider,
     http_session: MagicMock,
+    setup_data: dict[str, str | None],
     user_id: str | None,
 ) -> None:
     """Invalid user choices must not start network requests or background work."""
-    provider.config.get_value.side_effect = lambda key, default=None: (
-        user_id if key == CONF_RECOMMENDATION_USER_ID else default
-    )
+    setup_data[CONF_RECOMMENDATION_USER_ID] = user_id
     provider.mass.webserver.auth.get_user.return_value = (
         Mock(user_id="disabled", enabled=False) if user_id == "disabled" else None
     )
@@ -330,7 +338,7 @@ async def test_initialization_requires_an_enabled_selected_user(
 async def test_setup_reprompts_for_invalid_user(invalid_user: str | None) -> None:
     """Only an enabled id from the offered MA users may be persisted."""
     session = Mock()
-    session.context.values = {}
+    session.context.setup_data = {}
     session.mass.webserver.auth.list_users = AsyncMock(
         return_value=[
             Mock(user_id="selected-user", display_name="Selected", enabled=True),
@@ -348,6 +356,5 @@ async def test_setup_reprompts_for_invalid_user(invalid_user: str | None) -> Non
     assert session.form.await_count == 2
     assert CONF_RECOMMENDATION_USER_ID in session.form.call_args.kwargs["errors"]
     session.finish.assert_awaited_once_with(
-        {"api_key": "custom-test-key"},
-        options={CONF_RECOMMENDATION_USER_ID: "selected-user"},
+        {"api_key": "custom-test-key", CONF_RECOMMENDATION_USER_ID: "selected-user"}
     )
