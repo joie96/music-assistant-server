@@ -58,6 +58,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced.catalog import (
     GENRE_FOLDER_FAMILIES,
     GenreProfile,
     PlaylistSpec,
+    category_for_key,
 )
 from music_assistant.providers.lastfm_recommendations_enhanced.collections import (
     PLAYLIST_FAMILIES,
@@ -290,7 +291,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                 else genre_profile.explore_genres[:3]
             )
         )
-        texts = await self._get_folder_texts()
+        texts = await self._get_media_texts("recommendations")
         for folder in folders:
             values = texts[folder.translation_key or folder.item_id]
             params = folder.translation_params or []
@@ -301,22 +302,22 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         self.logger.debug("Last.fm recommendation folders ready count=%d", len(folders))
         return folders
 
-    async def _get_folder_texts(self) -> dict[str, dict[str, str]]:
-        """Read provider-owned folder texts, falling back to English for missing translations."""
+    async def _get_media_texts(self, section: str) -> dict[str, dict[str, str]]:
+        """Read provider-owned media texts, falling back to English for missing translations."""
         directory = Path(__file__).parent / "translations"
         source = await load_json_dict(str(directory / "en.json"))
-        texts: dict[str, dict[str, str]] = source["media"]["recommendations"]
+        texts: dict[str, dict[str, str]] = source["media"][section]
         language = self.mass.metadata.locale.lower().replace("-", "_").split("_", 1)[0]
         if language == "en" or not re.fullmatch(r"[a-z]{2,3}", language):
             return texts
         try:
             catalog = await load_json_dict(str(directory / f"{language}.json"))
-            translated = catalog["media"]["recommendations"]
+            translated = catalog["media"][section]
             return {key: {**values, **translated.get(key, {})} for key, values in texts.items()}
         except FileNotFoundError:
             return texts
         except (OSError, ValueError, TypeError, KeyError) as err:
-            self.logger.warning("Failed to load Last.fm folder texts for %s: %s", language, err)
+            self.logger.warning("Failed to load Last.fm media texts for %s: %s", language, err)
             return texts
 
     async def _build_recommendation_items(
@@ -336,9 +337,17 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         if item_id == "user_album_recommendations":
             return UniqueList(await collections.get_personal_albums())
         if item_id in PLAYLIST_FAMILIES.values():
-            return UniqueList(
-                self._playlist(recipe) for recipe in await collections.get_playlist_specs(item_id)
-            )
+            recipes = await collections.get_playlist_specs(item_id)
+            if item_id == "global_mood_playlists":
+                texts = await self._get_media_texts("mood_playlists")
+                recipes = [
+                    replace(
+                        recipe,
+                        name=texts[recipe.item_id.removeprefix("global_mood_playlist_")]["name"],
+                    )
+                    for recipe in recipes
+                ]
+            return UniqueList(self._playlist(recipe) for recipe in recipes)
         if item_id in {folder_id for folder_id, _name in EXTRA_FOLDERS} or item_id.startswith(
             tuple(f"{prefix}_" for prefix, _label in GENRE_FOLDER_FAMILIES)
         ):
@@ -550,6 +559,10 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
         right_title = playlist.name
         if folder_id in {"user_artist_playlists_monthly", "global_artist_radio_playlists"}:
             right_title = right_title.removeprefix("Featuring ")
+        elif folder_id == "global_mood_playlists" and (
+            category := category_for_key(playlist.item_id.removeprefix("global_mood_playlist_"))
+        ):
+            right_title = category.name
         payload = await asyncio.to_thread(
             build_split_cover_png, PLAYLIST_COVER_LABELS[folder_id], images, right_title
         )

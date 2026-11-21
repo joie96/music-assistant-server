@@ -40,7 +40,8 @@ Alle Sprachtexte dieses Providers werden ausschliesslich hier gepflegt:
 - [translations/en.json](translations/en.json): englische Grundsprache und Fallback.
 - [translations/de.json](translations/de.json): deutsche Uebersetzungen.
 
-Der Provider liest diese Dateien selbst beim Folder-Aufbau. Massgeblich ist die
+Der Provider liest diese Dateien selbst beim Aufbau der Folder und Mood-Playlists
+und uebersetzt deren Namen. Massgeblich ist die
 bevorzugte Sprache in den Metadata-Einstellungen des Servers, nicht die Sprache
 des einzelnen Clients. Eine Sprachaenderung gilt beim naechsten Refresh.
 Fuer Docker genuegt der Mount des gesamten Provider-Ordners; Server-Code und zentrale
@@ -49,7 +50,8 @@ wird nicht benoetigt, sodass dies auch mit 2.11 Beta 7 funktioniert.
 Weitere Sprachen verwenden dieselbe verschachtelte JSON-Struktur in
 `translations/<sprache>.json`; fehlende Texte fallen auf Englisch zurueck.
 Die lokalen Dateien werden nicht in den zentralen englischen Gesamtkatalog aufgenommen.
-Die Texte auf generierten Cover-Bildern bleiben unabhaengig von der UI-Sprache englisch.
+Die Texte auf generierten Cover-Bildern bleiben unabhaengig von der UI-Sprache englisch,
+einschliesslich der Mood-Namen und des Schriftzugs `Mood`.
 
 ## Folder und Herleitung
 
@@ -100,11 +102,14 @@ Zufall reduziert Wiederholungen, garantiert aber keine anderen Ergebnisse.
 Innerhalb jeder Playlist bestimmen gueltige Last.fm-`match`-Scores die Beitraege;
 der Seed selbst erhaelt Score 1. Eindeutige Kuenstler absteigend nach Score bearbeiten,
 ohne zusaetzliche Kuenstlergrenze. Die Trackquote ist
-`max(1, ceil(50 * Kuenstlerscore / Summe der Kuenstlerscores))`.
+`ceil(50 * Kuenstlerscore / Summe der Kuenstlerscores)` ohne Mindestquote.
 Erst fuer den aktuellen Kuenstler dessen Last.fm-Top-Tracks abrufen, die besten
 `min(3 * Trackquote, 25)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen.
 Danach erst den naechsten Kuenstler abfragen; bei 50 Tracks sofort stoppen.
-Die Quote ist eine Obergrenze, kein garantierter Beitrag, und wird nicht ueberschritten.
+Positive Quoten sind Obergrenzen, keine reservierten Plaetze.
+Score 0 ergibt Quote 0. Solche Kuenstler erst nach den positiven Quellen zum
+Auffuellen freier Plaetze nutzen, mit der Restkapazitaet statt einer Mindestquote.
+Der Auffuellpool ist `min(3 * Restkapazitaet, 25)`; im Log steht `fallback=True`.
 Der Auswahlpool begrenzt den Beitrag eines Kuenstlers auf hoechstens 25 Tracks.
 Die fertige Playlist nochmals zufaellig mischen. Kein eigener MA-Track-Favoritenbonus.
 
@@ -134,12 +139,15 @@ Match 1; Nachbarn erhalten den Last.fm-Match mit dem beschriebenen Listenrang-Er
 Je Seed gleiche Kuenstler nur einmal beruecksichtigen und Beitraege aus
 `MA-Seedscore * Match` seeduebergreifend addieren. Alle Kuenstler absteigend nach
 Gesamtscore bearbeiten, ohne Begrenzung auf 3 Albumquellen.
-Die Albumquote ist `max(1, ceil(Ergebnismaximum * Kuenstlerscore / Summe der Kuenstlerscores))`.
+Die Albumquote ist `ceil(Ergebnismaximum * Kuenstlerscore / Summe der Kuenstlerscores)`
+ohne Mindestquote; bei Gesamtscore 0 gilt Quote 0.
 Erst fuer den aktuellen Kuenstler `artist.getTopAlbums` abrufen, dessen beste
 `min(3 * Albumquote, 10)` Alben als Auswahlpool zufaellig mischen und daraus
 bis zur Albumquote eindeutige Alben auf MA-Quellen aufloesen.
-Die Quote ist eine Obergrenze, kein garantierter Beitrag; ein erschoepfter Pool beendet
-die Auswahl fuer diesen Kuenstler.
+Positive Quoten sind Obergrenzen, keine reservierten Plaetze. Quellen mit Quote 0
+erst nach den positiven Quellen zum Auffuellen nutzen; ihr Pool ist
+`min(3 * Restkapazitaet, 10)` und im Log steht `fallback=True`.
+Ein erschoepfter Pool beendet die Auswahl fuer diesen Kuenstler.
 Bei 35 Alben stoppen; die fertige Auswahl zufaellig mischen.
 Es gibt keine eigenen MA-Album-Seeds, Albumscores oder MA-Album-Favoritenboni.
 
@@ -182,6 +190,6 @@ Rate Limits und voruebergehende Quellenfehler bleiben vom normalen Nachruecken g
 | `global_genre_albums_{genre_key}` | {Genre}: Alben entdecken | Bis zu 3 Reihen globaler Explore-Genres mit je bis zu 35 Alben. | Bis zu 3 bereinigte, eindeutige globale Last.fm-Genres in Rangfolge aus `chart.getTopTags` auswaehlen; je Genre bis zu 105 Last.fm-Alben aus `tag.getTopAlbums` als Zufallspool vorbereiten. Keine persoenlichen MA-Seeds, MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
 | `global_genre_artists_{genre_key}` | {Genre}: Kuenstler entdecken | Bis zu 3 Reihen globaler Explore-Genres mit je bis zu 25 Kuenstlern. | Bis zu 3 bereinigte, eindeutige globale Last.fm-Genres in Rangfolge aus `chart.getTopTags` auswaehlen; je Genre bis zu 75 Last.fm-Kuenstler aus `tag.getTopArtists` als Zufallspool vorbereiten. Keine persoenlichen MA-Seeds, MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
 | `global_artist_radio_playlists` | Kuenstler-Radios | Bis zu 15 Mehrkuenstler-Playlists mit je bis zu 50 Tracks, etwa Featuring Radiohead. | Bis zu 15 bestplatzierte Last.fm-Kuenstler aus `chart.getTopArtists` bestimmen die Playlists. Je Seed bis zu 50 Last.fm-Nachbarn aus `artist.getSimilar`; der Seed selbst erhaelt Score 1, Nachbarn ihren Match-Score. Daraus Trackquoten berechnen. Je benoetigtem Kuenstler bis zu 50 Tracks aus `artist.getTopTracks` abrufen, die besten `min(3 * Trackquote, 25)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen; bei 50 Tracks stoppen und die Playlist mischen. Keine persoenlichen MA-Seeds, MA-Favoritenboni oder Rotationsausschluesse. |
-| `global_mood_playlists` | Stimmungs-Playlists | Bis zu 10 Stimmungs-Playlists mit je bis zu 50 Tracks. | Feste Last.fm-Tags `chillout`, `ambient`, `energetic`, `melancholic`, `love`, `workout`, `chill`, `sad`, `focus`, `party`; je bis zu 150 Last.fm-Tracks aus `tag.getTopTracks` als Zufallspool vorbereiten; keine Trackgrenze pro Kuenstler. Keine persoenliche MA-History, MA-Favoritenboni, Genreprofil-Auswertung, Audioanalyse oder Deezer-Abfrage. |
+| `global_mood_playlists` | Stimmungs-Playlists | Bis zu 10 Stimmungs-Playlists mit je bis zu 50 Tracks. | Feste Mood-IDs: `relax`, `focus`, `energy`, `melancholy`, `love`, `party`, `happy`, `nostalgic`, `angry`, `epic`; je bis zu 150 Last.fm-Tracks aus `tag.getTopTracks` als Zufallspool vorbereiten; keine Trackgrenze pro Kuenstler. Keine persoenliche MA-History, MA-Favoritenboni, Genreprofil-Auswertung, Audioanalyse oder Deezer-Abfrage. |
 | `global_decade_playlists` | Jahrzehnt-Playlists | Bis zu 5 Jahrzehnt-Playlists mit je bis zu 50 Tracks. | Feste Last.fm-Tags `1980s` bis `2020s`; je bis zu 150 Last.fm-Tracks aus `tag.getTopTracks` als Zufallspool vorbereiten; keine Trackgrenze pro Kuenstler. Keine persoenliche MA-History oder MA-Favoritenboni; Last.fm-Tag-Zugehoerigkeit garantiert kein exaktes Veroeffentlichungsjahr. |
 

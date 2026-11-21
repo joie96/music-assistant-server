@@ -20,22 +20,23 @@ def test_categories_have_unique_stable_keys() -> None:
     assert len({folder_id for folder_id, _name in EXTRA_FOLDERS}) == 8
 
 
-def test_moods_preserve_existing_categories_and_append_six_flow_inspired_categories() -> None:
-    """Keep old playlist identities while adding six independently addressable mood tags."""
+def test_moods_use_ten_distinct_categories_without_near_duplicate_keys() -> None:
+    """Keep the selected mood identities and exclude retired overlapping categories."""
     assert [(category.key, category.name, category.tag) for category in MOODS] == [
         ("relax", "Relaxation", "chillout"),
         ("focus", "Concentration", "ambient"),
         ("energy", "Energy", "energetic"),
         ("melancholy", "Melancholy", "melancholic"),
         ("love", "Love", "love"),
-        ("motivation", "Motivation", "workout"),
-        ("chill", "Chill", "chill"),
-        ("sad", "Sad", "sad"),
-        ("focused", "Focus", "focus"),
         ("party", "Party", "party"),
+        ("happy", "Happy", "happy"),
+        ("nostalgic", "Nostalgic", "nostalgic"),
+        ("angry", "Angry", "angry"),
+        ("epic", "Epic", "epic"),
     ]
     assert len({category.tag for category in MOODS}) == 10
     assert all(genre_for_tag(category.tag) is None for category in MOODS[4:])
+    assert all(category_for_key(key) is None for key in ("motivation", "chill", "sad", "focused"))
 
 
 @pytest.mark.parametrize("tag", ["Shoegaze", "Dream Pop", "Post-Rock", "Ambient", "Mystic Folk"])

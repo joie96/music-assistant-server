@@ -57,9 +57,15 @@ def build_split_cover_png(text_left: str, cover_images: list[bytes], text_right:
     right_font = _load_font(64)
     left_label = fit_cover_text(text_left, left_font, 520)
     right_label = fit_cover_text(text_right, right_font, 480)
-    draw.text((70, 50), left_label, fill="white", font=left_font)
+    left_position = (70, 50)
+    left_bounds = _text_ink_bounds(left_label, left_font)
+    right_bounds = _text_ink_bounds(right_label, right_font)
+    draw.text(left_position, left_label, fill="white", font=left_font)
     draw.text(
-        (1130 - draw.textlength(right_label, font=right_font), 100),
+        (
+            CANVAS_SIZE - left_position[0] - left_bounds[0] - right_bounds[2],
+            left_position[1] + left_bounds[1] - right_bounds[1],
+        ),
         right_label,
         fill="white",
         font=right_font,
@@ -81,6 +87,22 @@ def fit_cover_text(
     while label and font.getlength(label.rstrip() + "...") > max_width:
         label = label[:-1]
     return label.rstrip() + "..."
+
+
+def _text_ink_bounds(
+    label: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont
+) -> tuple[int, int, int, int]:
+    """Return visible glyph bounds, excluding padding in the font's layout box."""
+    ink_bounds = font.getmask(label, mode="L").getbbox()
+    if ink_bounds is None:
+        return (0, 0, 0, 0)
+    font_bounds = font.getbbox(label)
+    return (
+        font_bounds[0] + ink_bounds[0],
+        font_bounds[1] + ink_bounds[1],
+        font_bounds[0] + ink_bounds[2],
+        font_bounds[1] + ink_bounds[3],
+    )
 
 
 @lru_cache(maxsize=8)

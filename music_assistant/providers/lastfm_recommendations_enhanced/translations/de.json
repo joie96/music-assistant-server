@@ -99,6 +99,38 @@
         "name": "Deine meistgehörten Alben",
         "subtitle": "Die Alben, zu denen du in den letzten 30 Tagen am häufigsten zurückgekehrt bist"
       }
+    },
+    "mood_playlists": {
+      "relax": {
+        "name": "Entspannung"
+      },
+      "focus": {
+        "name": "Konzentration"
+      },
+      "energy": {
+        "name": "Energie"
+      },
+      "melancholy": {
+        "name": "Melancholie"
+      },
+      "love": {
+        "name": "Liebe"
+      },
+      "party": {
+        "name": "Party"
+      },
+      "happy": {
+        "name": "Fröhlichkeit"
+      },
+      "nostalgic": {
+        "name": "Nostalgie"
+      },
+      "angry": {
+        "name": "Wut"
+      },
+      "epic": {
+        "name": "Episch"
+      }
     }
   },
   "manifest": {

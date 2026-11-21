@@ -114,20 +114,20 @@ class LastFMCollections:
                 artists.setdefault(key, artist)
                 scores[key] = scores.get(key, 0) + seed.weight * weight
         weight_sum = sum(scores.values())
-        if not weight_sum:
-            return UniqueList()
         target_limit = RESOLUTION_TARGET_LIMITS[MediaType.ALBUM]
         result: UniqueList[Artist | Album | Track] = UniqueList()
         seen: set[str] = set()
         for key in sorted(scores, key=lambda key: scores[key], reverse=True):
             if len(result) >= target_limit:
                 break
-            quota = max(1, ceil(target_limit * scores[key] / weight_sum))
+            quota = ceil(target_limit * scores[key] / weight_sum) if weight_sum else 0
+            selection_limit = quota or target_limit - len(result)
             source_started = perf_counter()
             self.provider.logger.debug(
-                "Last.fm album source build started artist=%s personal=True quota=%d",
+                "Last.fm album source build started artist=%s personal=True quota=%d fallback=%s",
                 artists[key],
                 quota,
+                quota == 0,
             )
             try:
                 top_albums = await self.provider.api.get_items(
@@ -141,12 +141,12 @@ class LastFMCollections:
                     perf_counter() - source_started,
                 )
                 continue
-            candidates = top_albums[: min(3 * quota, ALBUM_RANDOM_POOL_LIMIT)]
+            candidates = top_albums[: min(3 * selection_limit, ALBUM_RANDOM_POOL_LIMIT)]
             shuffle(candidates)
             resolved = await self.discovery.resolve_items(
                 candidates,
                 MediaType.ALBUM,
-                max_items=min(quota, target_limit - len(result)),
+                max_items=min(selection_limit, target_limit - len(result)),
                 excluded_uris=seen,
             )
             previous_count = len(result)
@@ -154,13 +154,14 @@ class LastFMCollections:
             seen.update(item.uri for item in result if item.uri is not None)
             self.provider.logger.debug(
                 "Last.fm album source build completed artist=%s personal=True "
-                "quota=%d candidates=%d added=%d total=%d elapsed=%.3fs",
+                "quota=%d candidates=%d added=%d total=%d elapsed=%.3fs fallback=%s",
                 artists[key],
                 quota,
                 len(candidates),
                 len(result) - previous_count,
                 len(result),
                 perf_counter() - source_started,
+                quota == 0,
             )
         shuffle(result)
         return result
@@ -433,13 +434,15 @@ class LastFMCollections:
         for artist, weight in ranked:
             if len(result) >= RESULT_LIMIT:
                 break
-            quota = max(1, ceil(RESULT_LIMIT * weight / weight_sum))
+            quota = ceil(RESULT_LIMIT * weight / weight_sum)
+            selection_limit = quota or RESULT_LIMIT - len(result)
             source_started = perf_counter()
             self.provider.logger.debug(
-                "Last.fm artist tracks build started seed=%s artist=%s quota=%d",
+                "Last.fm artist tracks build started seed=%s artist=%s quota=%d fallback=%s",
                 seed_artist,
                 artist,
                 quota,
+                quota == 0,
             )
             try:
                 top_tracks = await self.provider.api.get_items(
@@ -454,13 +457,13 @@ class LastFMCollections:
                     perf_counter() - source_started,
                 )
                 continue
-            candidates = top_tracks[: min(3 * quota, ARTIST_PLAYLIST_RANDOM_POOL_LIMIT)]
+            candidates = top_tracks[: min(3 * selection_limit, ARTIST_PLAYLIST_RANDOM_POOL_LIMIT)]
             shuffle(candidates)
             resolved = await self.discovery.resolve_items(
                 candidates,
                 MediaType.TRACK,
-                max_tracks_per_artist=quota,
-                max_items=min(quota, RESULT_LIMIT - len(result)),
+                max_tracks_per_artist=selection_limit,
+                max_items=min(selection_limit, RESULT_LIMIT - len(result)),
                 excluded_uris=seen,
             )
             previous_count = len(result)
@@ -468,7 +471,7 @@ class LastFMCollections:
             seen.update(item.uri for item in result if item.uri is not None)
             self.provider.logger.debug(
                 "Last.fm artist tracks build completed seed=%s artist=%s "
-                "quota=%d candidates=%d added=%d total=%d elapsed=%.3fs",
+                "quota=%d candidates=%d added=%d total=%d elapsed=%.3fs fallback=%s",
                 seed_artist,
                 artist,
                 quota,
@@ -476,6 +479,7 @@ class LastFMCollections:
                 len(result) - previous_count,
                 len(result),
                 perf_counter() - source_started,
+                quota == 0,
             )
         shuffle(result)
         for position, track in enumerate(result, 1):

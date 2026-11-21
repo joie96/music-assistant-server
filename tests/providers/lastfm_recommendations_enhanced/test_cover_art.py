@@ -8,6 +8,7 @@ from PIL import Image, ImageFont
 from music_assistant.providers.lastfm_recommendations_enhanced.cover_art import (
     CANVAS_SIZE,
     PLACEHOLDER_COLORS,
+    TOP_INSET_HEIGHT,
     build_split_cover_png,
     fit_cover_text,
 )
@@ -40,10 +41,35 @@ def test_cover_has_four_real_tiles_and_listenbrainz_title_inset() -> None:
 def test_secondary_text_is_larger_and_stays_inside_title_inset() -> None:
     """Render a readable secondary label without crossing into the artwork tiles."""
     with Image.open(BytesIO(build_split_cover_png("Genre", [], "Secondary"))) as cover:
-        bounds = cover.crop((650, 100, 1130, 190)).convert("L").getbbox()
+        bounds = cover.crop((600, 0, CANVAS_SIZE, TOP_INSET_HEIGHT)).convert("L").getbbox()
         assert bounds is not None
         assert bounds[3] - bounds[1] > 48
-        assert bounds[3] < 90
+        assert bounds[3] < TOP_INSET_HEIGHT
+
+
+@pytest.mark.parametrize(
+    ("left_label", "right_label"),
+    [
+        ("Genre", "Jazz"),
+        ("Mood", "gyp"),
+        ("Feat.", "Tyler, The Creator"),
+        ("Decade", "1990s"),
+        ("Genre", "Very long genre name " * 30),
+    ],
+)
+def test_cover_labels_share_visible_top_and_outer_margins(
+    left_label: str, right_label: str
+) -> None:
+    """Align actual rendered pixels, including glyph bearings and truncated titles."""
+    with Image.open(BytesIO(build_split_cover_png(left_label, [], right_label))) as cover:
+        left_bounds = cover.crop((0, 0, 600, TOP_INSET_HEIGHT)).convert("L").getbbox()
+        right_bounds = cover.crop((600, 0, CANVAS_SIZE, TOP_INSET_HEIGHT)).convert("L").getbbox()
+        assert left_bounds is not None
+        assert right_bounds is not None
+        assert left_bounds[1] == right_bounds[1]
+        assert left_bounds[0] == CANVAS_SIZE - 600 - right_bounds[2]
+        assert left_bounds[0] > 0
+        assert right_bounds[3] < TOP_INSET_HEIGHT
 
 
 @pytest.mark.parametrize("image_count", [0, 1, 2, 3])

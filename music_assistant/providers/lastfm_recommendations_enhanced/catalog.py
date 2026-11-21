@@ -61,6 +61,9 @@ NON_GENRE_TAGS = frozenset(
         "sleep",
         "party",
         "chill",
+        "nostalgic",
+        "angry",
+        "epic",
     }
 )
 GENRE_ALIASES = {
@@ -77,11 +80,11 @@ MOODS = (
     Category("energy", "Energy", "energetic"),
     Category("melancholy", "Melancholy", "melancholic"),
     Category("love", "Love", "love"),
-    Category("motivation", "Motivation", "workout"),
-    Category("chill", "Chill", "chill"),
-    Category("sad", "Sad", "sad"),
-    Category("focused", "Focus", "focus"),
     Category("party", "Party", "party"),
+    Category("happy", "Happy", "happy"),
+    Category("nostalgic", "Nostalgic", "nostalgic"),
+    Category("angry", "Angry", "angry"),
+    Category("epic", "Epic", "epic"),
 )
 DECADES = tuple(Category(str(year), f"{year}s", f"{year}s") for year in range(1980, 2030, 10))
 EXTRA_FOLDERS = (

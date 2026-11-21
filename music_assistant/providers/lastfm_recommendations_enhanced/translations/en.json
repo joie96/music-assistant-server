@@ -99,6 +99,38 @@
         "name": "Your most played albums",
         "subtitle": "The albums you returned to most in the past 30 days"
       }
+    },
+    "mood_playlists": {
+      "relax": {
+        "name": "Relaxation"
+      },
+      "focus": {
+        "name": "Concentration"
+      },
+      "energy": {
+        "name": "Energy"
+      },
+      "melancholy": {
+        "name": "Melancholy"
+      },
+      "love": {
+        "name": "Love"
+      },
+      "party": {
+        "name": "Party"
+      },
+      "happy": {
+        "name": "Happy"
+      },
+      "nostalgic": {
+        "name": "Nostalgic"
+      },
+      "angry": {
+        "name": "Angry"
+      },
+      "epic": {
+        "name": "Epic"
+      }
     }
   },
   "manifest": {

@@ -187,7 +187,7 @@ async def test_artist_playlist_replaces_misses_and_duplicates_without_artist_cap
     monkeypatch: pytest.MonkeyPatch,
     is_personal: bool,
 ) -> None:
-    """Zero-score neighbors get one slot each; missing sources and duplicates allow successors."""
+    """Zero-score neighbors fill remaining capacity after missing sources and duplicates."""
     monkeypatch.setattr(
         collections_module,
         "shuffle",
@@ -235,7 +235,7 @@ async def test_artist_playlist_replaces_misses_and_duplicates_without_artist_cap
                 LastFMItem("Seed 0", "Seed"),
                 LastFMItem("Missing", name),
                 LastFMItem(f"{name} 0", name),
-                LastFMItem("Outside random pool", name),
+                LastFMItem("Missing fallback track", name),
             ]
         if name == "Neighbor 1":
             raise MediaNotFoundError("Artist not found")
@@ -249,10 +249,82 @@ async def test_artist_playlist_replaces_misses_and_duplicates_without_artist_cap
     assert fetched == ["Seed", *(f"Neighbor {index}" for index in range(27))]
     assert sum(track.artists[0].name == "Seed" for track in result) == 24
     assert len({track.artists[0].name for track in result}) == 27
-    assert artist_playlist_resolver._get_cached_resolution.await_count == 53
+    assert artist_playlist_resolver._get_cached_resolution.await_count == 54
     artist_playlist_resolver._resolve_missing.assert_not_awaited()
     if not is_personal:
         collections.discovery.get_seeds.assert_not_awaited()
+
+
+@pytest.mark.parametrize("is_personal", [True, False])
+@pytest.mark.parametrize("positive_tracks", [0, 25])
+async def test_artist_playlist_zero_scores_only_fill_remaining_capacity(
+    collections: LastFMCollections,
+    artist_playlist_resolver: LastFMDiscovery,
+    monkeypatch: pytest.MonkeyPatch,
+    is_personal: bool,
+    positive_tracks: int,
+) -> None:
+    """Zero scores reserve no slots and may fill an exhausted positive-score selection."""
+    monkeypatch.setattr(collections_module, "shuffle", lambda _items: None)
+    items: dict[str, Track] = {}
+    batches: dict[str, list[LastFMItem]] = {}
+    for name in ["Seed", "Strong", "Zero first", "Zero second"]:
+        artist = Artist(item_id=name, provider="library", name=name, provider_mappings=set())
+        batches[name] = []
+        count = positive_tracks if name in {"Seed", "Strong"} else 50
+        for rank in range(count):
+            title = f"{name} {rank}"
+            items[title] = Track(
+                item_id=title,
+                provider="library",
+                name=title,
+                provider_mappings=set(),
+                artists=UniqueList([artist]),
+            )
+            batches[name].append(LastFMItem(title, name))
+    artist_playlist_resolver._get_cached_resolution = AsyncMock(
+        side_effect=lambda candidate, _media_type: (items[candidate.name], False)
+    )
+    fetched: list[str] = []
+
+    async def get_items(
+        method: str, parameters: dict[str, str] | None = None, *, limit: int
+    ) -> list[LastFMItem]:
+        assert limit == 50
+        if method == "chart.getTopArtists":
+            return [LastFMItem("Seed")]
+        if method == "artist.getSimilar":
+            return [
+                LastFMItem("Strong", similarity_weight=1),
+                LastFMItem("Zero first", similarity_weight=0),
+                LastFMItem("Zero second", similarity_weight=0),
+            ]
+        assert method == "artist.getTopTracks"
+        assert parameters is not None
+        fetched.append(parameters["artist"])
+        return batches[parameters["artist"]]
+
+    collections.provider.api.get_items.side_effect = get_items
+    folder_id = "user_artist_playlists_monthly" if is_personal else "global_artist_radio_playlists"
+    recipe = (await collections.get_playlist_specs(folder_id))[0]
+    result = await collections.get_playlist_tracks(recipe.item_id)
+
+    assert len(result) == len({track.uri for track in result}) == 50
+    expected_artists = ["Seed", "Strong"] if positive_tracks else ["Zero first", "Zero second"]
+    assert {track.artists[0].name for track in result} == set(expected_artists)
+    assert all(
+        sum(track.artists[0].name == name for track in result) == 25 for name in expected_artists
+    )
+    assert fetched == ["Seed", "Strong", *([] if positive_tracks else expected_artists)]
+    if not positive_tracks:
+        collections.provider.logger.debug.assert_any_call(
+            "Last.fm artist tracks build started seed=%s artist=%s quota=%d fallback=%s",
+            "Seed",
+            "Zero first",
+            0,
+            True,
+        )
+    artist_playlist_resolver._resolve_missing.assert_not_awaited()
 
 
 @pytest.mark.parametrize("is_personal", [True, False])
@@ -467,7 +539,75 @@ async def test_personal_albums_replace_misses_and_duplicates_only_within_top_ten
     assert sum(album.artists[0].name == "Seed" for album in result) == 8
     assert len({album.artists[0].name for album in result}) == 28
     assert all(album.artists[0].name != "Neighbor 2" for album in result)
-    assert artist_playlist_resolver._get_cached_resolution.await_count == 42
+    assert artist_playlist_resolver._get_cached_resolution.await_count == 49
+    artist_playlist_resolver._resolve_missing.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("positive_albums", "seed_weight"), [(0, 10), (10, 10), (10, 0)])
+async def test_personal_albums_zero_scores_only_fill_remaining_capacity(
+    collections: LastFMCollections,
+    artist_playlist_resolver: LastFMDiscovery,
+    monkeypatch: pytest.MonkeyPatch,
+    positive_albums: int,
+    seed_weight: int,
+) -> None:
+    """Zero-score sources fill only free capacity, including an entirely zero-score pool."""
+    monkeypatch.setattr(collections_module, "shuffle", lambda _items: None)
+    collections.discovery.get_seeds.return_value = [PersonalSeed("Seed", weight=seed_weight)]
+    positive_artists = ["Seed", "Strong first", "Strong second", "Strong third"]
+    zero_artists = ["Zero first", "Zero second", "Zero third", "Zero fourth"]
+    items: dict[str, Album] = {}
+    batches: dict[str, list[LastFMItem]] = {}
+    for name in [*positive_artists, *zero_artists]:
+        artist = Artist(item_id=name, provider="library", name=name, provider_mappings=set())
+        batches[name] = []
+        count = positive_albums if name in positive_artists else 50
+        for rank in range(count):
+            title = f"{name} {rank}"
+            items[title] = Album(
+                item_id=title,
+                provider="library",
+                name=title,
+                provider_mappings=set(),
+                artists=UniqueList([artist]),
+            )
+            batches[name].append(LastFMItem(title, name))
+    artist_playlist_resolver._get_cached_resolution = AsyncMock(
+        side_effect=lambda candidate, _media_type: (items[candidate.name], False)
+    )
+    fetched: list[str] = []
+
+    async def get_items(
+        method: str, parameters: dict[str, str] | None = None, *, limit: int
+    ) -> list[LastFMItem]:
+        assert limit == 50
+        if method == "artist.getSimilar":
+            return [
+                *(LastFMItem(name, similarity_weight=1) for name in positive_artists[1:]),
+                *(LastFMItem(name, similarity_weight=0) for name in zero_artists),
+            ]
+        assert method == "artist.getTopAlbums"
+        assert parameters is not None
+        fetched.append(parameters["artist"])
+        return batches[parameters["artist"]]
+
+    collections.provider.api.get_items.side_effect = get_items
+    result = await collections.get_personal_albums()
+
+    assert len(result) == len({album.uri for album in result}) == 35
+    expected_artists = positive_artists if positive_albums else zero_artists
+    assert {album.artists[0].name for album in result} == set(expected_artists)
+    assert [
+        sum(album.artists[0].name == name for album in result) for name in expected_artists
+    ] == ([9, 9, 9, 8] if positive_albums and seed_weight else [10, 10, 10, 5])
+    assert fetched == [*positive_artists, *([] if positive_albums else zero_artists)]
+    if not positive_albums or not seed_weight:
+        collections.provider.logger.debug.assert_any_call(
+            "Last.fm album source build started artist=%s personal=True quota=%d fallback=%s",
+            expected_artists[0],
+            0,
+            True,
+        )
     artist_playlist_resolver._resolve_missing.assert_not_awaited()
 
 
@@ -680,7 +820,7 @@ async def test_tag_playlists_randomize_one_large_pool_and_respect_family_artist_
     ("folder_id", "tag"),
     [
         ("global_genre_playlists", "jazz"),
-        ("global_mood_playlists", "chill"),
+        ("global_mood_playlists", "chillout"),
         ("global_decade_playlists", "1980s"),
     ],
 )
@@ -819,14 +959,14 @@ async def test_public_recipes_have_playable_identities_without_network(
     ("key", "tag"),
     [
         ("love", "love"),
-        ("motivation", "workout"),
-        ("chill", "chill"),
-        ("sad", "sad"),
-        ("focused", "focus"),
         ("party", "party"),
+        ("happy", "happy"),
+        ("nostalgic", "nostalgic"),
+        ("angry", "angry"),
+        ("epic", "epic"),
     ],
 )
-async def test_flow_inspired_mood_recipes_use_lastfm_without_personal_sources(
+async def test_mood_recipes_use_lastfm_without_personal_sources(
     collections: LastFMCollections, key: str, tag: str
 ) -> None:
     """New moods resolve through the existing Last.fm recipe path without account coupling."""
@@ -934,11 +1074,14 @@ async def test_personal_and_popular_albums_use_the_same_limit_constants(
     ):
         assert source_messages[index * 2] == (
             f"Last.fm album source build started artist={artist} personal={personal} quota=18"
+            + (" fallback=False" if personal else "")
         )
         assert source_messages[index * 2 + 1].startswith(
             f"Last.fm album source build completed artist={artist} personal={personal} "
         )
         assert "elapsed=" in source_messages[index * 2 + 1]
+        if personal:
+            assert source_messages[index * 2 + 1].endswith(" fallback=False")
     calls = collections.provider.api.get_items.await_args_list
     assert [call.args[1]["artist"] for call in calls if call.args[0] == "artist.getTopAlbums"] == [
         "First",

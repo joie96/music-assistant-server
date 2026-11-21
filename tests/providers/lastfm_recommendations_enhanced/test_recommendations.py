@@ -49,6 +49,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced.api_client import
 from music_assistant.providers.lastfm_recommendations_enhanced.catalog import (
     EXTRA_FOLDERS,
     GENRE_FOLDER_FAMILIES,
+    MOODS,
     GenreProfile,
     PlaylistSpec,
     genre_for_tag,
@@ -200,7 +201,7 @@ async def test_missing_or_invalid_local_catalog_falls_back_to_english(
     monkeypatch.setattr(provider_module, "load_json_dict", AsyncMock(side_effect=[source, error]))
     warning = Mock(wraps=provider.logger.warning)
     monkeypatch.setattr(provider.logger, "warning", warning)
-    assert await provider._get_folder_texts() == source["media"]["recommendations"]
+    assert await provider._get_media_texts("recommendations") == source["media"]["recommendations"]
     if isinstance(error, FileNotFoundError):
         warning.assert_not_called()
     else:
@@ -221,7 +222,7 @@ async def test_partial_catalog_keeps_english_fields(
     monkeypatch.setattr(
         provider_module, "load_json_dict", AsyncMock(side_effect=[source, translated])
     )
-    texts = await provider._get_folder_texts()
+    texts = await provider._get_media_texts("recommendations")
     assert texts["user_recommendations"]["name"] == "Empfehlungen"
     assert (
         texts["user_recommendations"]["subtitle"]
@@ -750,6 +751,65 @@ async def test_playlist_cover_titles_and_cached_image_reads(
         assert cover.size == (1200, 1200)
     provider.mass.http_session.get.assert_not_called()
     provider.mass.statistics.get_top_items.assert_not_awaited()
+
+
+@pytest.mark.parametrize("locale", ["en_US", "de_DE", "de-DE", "fr_FR"])
+async def test_mood_playlist_names_are_localized_but_covers_remain_english(
+    provider: LastFMRecommendationsEnhancedProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    locale: str,
+) -> None:
+    """Translate all mood names without changing IDs, English artwork or cached reads."""
+    directory = Path(provider_module.__file__).parent / "translations"
+    english = json.loads((directory / "en.json").read_text(encoding="utf-8"))["media"][
+        "mood_playlists"
+    ]
+    german = json.loads((directory / "de.json").read_text(encoding="utf-8"))["media"][
+        "mood_playlists"
+    ]
+    assert set(english) == set(german) == {mood.key for mood in MOODS}
+    provider.mass.metadata.locale = locale
+    playlists = await provider._build_recommendation_items("global_mood_playlists")
+    catalog = german if locale.startswith("de") else english
+    assert len(playlists) == 10
+    renderer = Mock(wraps=build_split_cover_png)
+    monkeypatch.setattr(provider_module, "build_split_cover_png", renderer)
+    for playlist, mood in zip(playlists, MOODS, strict=True):
+        assert isinstance(playlist, Playlist)
+        assert playlist.item_id == f"global_mood_playlist_{mood.key}"
+        assert playlist.name == playlist.to_dict()["name"] == catalog[mood.key]["name"]
+        assert english[mood.key]["name"] == mood.name
+        await provider._set_playlist_cover(playlist, [], "global_mood_playlists")
+        renderer.assert_called_with("Mood", [], mood.name)
+        assert playlist.image is not None
+        provider._resolved_virtual_playlists[playlist.item_id] = (playlist, [])
+        with user_auth_context(Mock(user_id="DEBUG")):
+            assert (await provider.get_playlist(playlist.item_id)).name == catalog[mood.key]["name"]
+            assert await provider.resolve_image(playlist.image.path) == build_split_cover_png(
+                "Mood", [], mood.name
+            )
+    assert not provider.mass.translations.mock_calls
+    provider.mass.statistics.get_top_items.assert_not_awaited()
+    provider.mass.http_session.get.assert_not_called()
+
+
+async def test_partial_mood_catalog_falls_back_to_english_names(
+    provider: LastFMRecommendationsEnhancedProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing mood translations retain their English names rather than hiding playlists."""
+    source = json.loads(
+        (Path(provider_module.__file__).parent / "translations" / "en.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    translated = {"media": {"mood_playlists": {"relax": {"name": "Entspannung"}}}}
+    provider.mass.metadata.locale = "de_DE"
+    monkeypatch.setattr(
+        provider_module, "load_json_dict", AsyncMock(side_effect=[source, translated])
+    )
+    playlists = await provider._build_recommendation_items("global_mood_playlists")
+    assert playlists[0].name == "Entspannung"
+    assert [playlist.name for playlist in playlists[1:]] == [mood.name for mood in MOODS[1:]]
 
 
 def track_with_cover(item_id: str, path: str) -> Track:
