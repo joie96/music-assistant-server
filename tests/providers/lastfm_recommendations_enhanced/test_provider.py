@@ -64,6 +64,7 @@ def provider(
     """Return a provider configured with an explicit test API key."""
     mass = Mock()
     mass.http_session = http_session
+    mass.translations.load_provider_strings = AsyncMock()
     mass.statistics.get_top_items = AsyncMock(return_value=[])
     mass.music.get_controller.return_value.get_library_items_by_query = AsyncMock(return_value=[])
     selected_user = Mock(

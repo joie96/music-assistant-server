@@ -1,0 +1,107 @@
+{
+  "config_entries": {
+    "api_key": {
+      "label": "Last.fm-API-Schlüssel",
+      "description": "Erforderlich. Gib deinen eigenen Last.fm-API-Schlüssel ein. Es wird kein integrierter Schlüssel, Benutzername oder Konto-Login verwendet."
+    },
+    "recommendation_user_id": {
+      "label": "Music Assistant-Benutzer für Empfehlungen",
+      "description": "Verwende den Hörverlauf, die Favoriten und die verfügbaren Musikquellen dieses Benutzers. Vorbereitete Empfehlungen werden nur diesem Benutzer angezeigt."
+    }
+  },
+  "media": {
+    "recommendations": {
+      "user_genre_playlists_monthly": {
+        "name": "Deine Genre-Playlists",
+        "subtitle": "Mixes inspiriert von deinen Lieblingsgenres"
+      },
+      "user_artist_playlists_monthly": {
+        "name": "Deine Künstler-Playlists",
+        "subtitle": "Deine Lieblingskünstler im Mix mit ähnlichen Klängen"
+      },
+      "global_popular_artist_albums": {
+        "name": "Alben weltweit beliebter Künstler",
+        "subtitle": "Beliebte Alben von Künstlern an der Spitze der weltweiten Charts"
+      },
+      "de_popular_artist_albums": {
+        "name": "Alben beliebter Künstler in Deutschland",
+        "subtitle": "Beliebte Alben von Künstlern, die in Deutschland gefragt sind"
+      },
+      "global_genre_playlists": {
+        "name": "Genre-Playlists entdecken",
+        "subtitle": "Neue Klänge aus Genres und Subgenres entdecken"
+      },
+      "global_artist_radio_playlists": {
+        "name": "Künstler-Radios",
+        "subtitle": "Chart-Favoriten im Mix mit ähnlichen Künstlern"
+      },
+      "global_mood_playlists": {
+        "name": "Stimmungs-Playlists",
+        "subtitle": "Die passende Musik für deine Stimmung"
+      },
+      "global_decade_playlists": {
+        "name": "Jahrzehnt-Playlists",
+        "subtitle": "Entdecke den Sound der einzelnen Jahrzehnte"
+      },
+      "global_genre_albums": {
+        "name": "{0}: Alben entdecken",
+        "subtitle": "Alben aus diesem Genre zum Entdecken"
+      },
+      "global_genre_artists": {
+        "name": "{0}: Künstler entdecken",
+        "subtitle": "Entdecke Künstler aus diesem Genre"
+      },
+      "user_genre_artists": {
+        "name": "{0}: Künstler aus deinem Lieblingsgenre",
+        "subtitle": "Künstler aus den Genres, die du am häufigsten hörst"
+      },
+      "global_top_tracks": {
+        "name": "Track-Charts weltweit",
+        "subtitle": "Die weltweit meistgehörten Tracks"
+      },
+      "de_top_tracks": {
+        "name": "Track-Charts Deutschland",
+        "subtitle": "Die meistgehörten Tracks in Deutschland"
+      },
+      "global_top_artists": {
+        "name": "Künstler-Charts weltweit",
+        "subtitle": "Die weltweit meistgehörten Künstler"
+      },
+      "de_top_artists": {
+        "name": "Künstler-Charts Deutschland",
+        "subtitle": "Die meistgehörten Künstler in Deutschland"
+      },
+      "user_recommendations": {
+        "name": "Track-Empfehlungen",
+        "subtitle": "Tracks passend zu deinem Hörverlauf und deinen Favoriten"
+      },
+      "user_artist_recommendations": {
+        "name": "Künstler-Empfehlungen",
+        "subtitle": "Entdecke Künstler mit einem ähnlichen Sound wie deine Favoriten"
+      },
+      "user_album_recommendations": {
+        "name": "Album-Empfehlungen",
+        "subtitle": "Alben passend zu den Künstlern, die du gerne hörst"
+      },
+      "user_rediscovery_tracks": {
+        "name": "Lange nicht gehört",
+        "subtitle": "Entdecke Tracks wieder, die zuletzt nicht in deiner Rotation waren"
+      },
+      "user_top_artists_monthly": {
+        "name": "Deine meistgehörten Künstler",
+        "subtitle": "Die Künstler, die deine letzten 30 Tage geprägt haben"
+      },
+      "user_top_tracks_monthly": {
+        "name": "Deine meistgehörten Tracks",
+        "subtitle": "Deine meistgespielten Songs der letzten 30 Tage"
+      },
+      "user_top_albums_monthly": {
+        "name": "Deine meistgehörten Alben",
+        "subtitle": "Die Alben, zu denen du in den letzten 30 Tagen am häufigsten zurückgekehrt bist"
+      }
+    }
+  },
+  "manifest": {
+    "description": "Persönliche Empfehlungen auf Basis von Music Assistant und Musikentdeckung über Last.fm mit deinem eigenen API-Schlüssel."
+  }
+}

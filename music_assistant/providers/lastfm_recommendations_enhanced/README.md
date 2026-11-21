@@ -33,6 +33,23 @@ Bibliothek, Favoriten und Hoerverlauf werden nicht veraendert.
 Es gelten die [Last.fm-API-Nutzungsbedingungen](https://www.last.fm/api/tos).
 Last.fm liefert keine Streamingrechte; Audio stammt aus den MA-Musikquellen.
 
+## Uebersetzungen
+
+Alle Sprachtexte dieses Providers werden ausschliesslich hier gepflegt:
+
+- [strings.json](strings.json): englische Grundsprache und Fallback.
+- [translations/de.json](translations/de.json): deutsche Uebersetzungen.
+
+Der Provider registriert diese Kataloge beim Initialisieren ueber die bestehende
+Sprach-API des Servers. Fuer Docker genuegt der Mount des gesamten Provider-Ordners;
+Server-Code und zentrale Sprachdateien muessen dafuer nicht angepasst werden.
+Die Folder-Texte werden erst bei der Ausgabe in der Sprache des jeweiligen Clients
+aufgeloest, nicht beim Hintergrundaufbau auf eine einzige Sprache festgelegt.
+Weitere vom Server unterstuetzte Sprachen verwenden dieselbe verschachtelte JSON-Struktur
+in `translations/<sprache>.json`. Beim regulaeren Server-Build wird `strings.json`
+weiterhin in den generierten englischen Gesamtkatalog aufgenommen.
+Die Texte auf generierten Cover-Bildern bleiben unabhaengig von der UI-Sprache englisch.
+
 ## Folder und Herleitung
 
 MA-`week` umfasst die letzten 7 Tage, MA-`month` die letzten 30 Tage ab dem

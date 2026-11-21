@@ -136,6 +136,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
             self.mass.http_session, api_key, self.logger, cache=self.mass.cache
         )
         await self.api.validate_api_key()
+        await self.mass.translations.load_provider_strings(self.domain, str(Path(__file__).parent))
         self._recommendation_folders: list[RecommendationFolder] = []
         self._resolved_virtual_playlists: dict[str, tuple[Playlist, list[Track]]] = {}
         self._refresh_lock = asyncio.Lock()
@@ -262,7 +263,6 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                 provider=self.instance_id,
                 name=folder.name,
                 translation_key=folder.item_id,
-                subtitle="Powered by Last.fm | https://www.last.fm/" if folder.method else None,
             )
             for folder in DISCOVERY_FOLDERS
         )
@@ -272,7 +272,6 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                 provider=self.instance_id,
                 name=name,
                 translation_key=folder_id,
-                subtitle="Powered by Last.fm | https://www.last.fm/",
             )
             for folder_id, name in EXTRA_FOLDERS
         )
@@ -283,7 +282,6 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                 name=f"{category.name}: {label}",
                 translation_key=prefix,
                 translation_params=[category.name],
-                subtitle="Powered by Last.fm | https://www.last.fm/",
             )
             for prefix, label in GENRE_FOLDER_FAMILIES
             for category in (

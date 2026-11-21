@@ -1,7 +1,9 @@
 """Personal top-items folders and their generation diagnostics."""
 
 import asyncio
+import json
 import logging
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -25,8 +27,11 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 from music_assistant_models.statistics import TopItemResult
+from music_assistant_models.translations import TRANSLATION_RESOLVER
 from PIL import Image
 
+from music_assistant.controllers import translations as translations_module
+from music_assistant.controllers.translations import TranslationController
 from music_assistant.controllers.webserver.helpers import auth_middleware
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
@@ -79,6 +84,7 @@ def provider(tmp_path: Path) -> LastFMRecommendationsEnhancedProvider:
     mass.config.decrypt_string.side_effect = lambda value: value
     mass.statistics.get_top_items = AsyncMock(return_value=[])
     mass.config.get_provider_configs = AsyncMock(return_value=[])
+    mass.translations.load_provider_strings = AsyncMock()
     mass.cache.get = AsyncMock(return_value=None)
     mass.cache.set = AsyncMock()
     mass.music.providers = []
@@ -99,6 +105,79 @@ def provider(tmp_path: Path) -> LastFMRecommendationsEnhancedProvider:
     result._is_unloading = False
     result._recommendation_user_id = "DEBUG"
     return result
+
+
+@pytest.fixture
+async def translation_controller(
+    provider: LastFMRecommendationsEnhancedProvider,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TranslationController:
+    """Initialize the provider with its real catalogs and no shared provider translations."""
+    shared_path = tmp_path / "shared_translations"
+    shared_path.mkdir()
+    for locale in ("en", "de"):
+        (shared_path / f"{locale}.json").write_text(
+            json.dumps(
+                {"common.media.recommendations.recommended_tracks.name": "Recommended tracks"}
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(translations_module, "TRANSLATIONS_PATH", str(shared_path))
+    monkeypatch.setattr(translations_module, "SOURCE_FILE", str(shared_path / "en.json"))
+    provider.mass.config.get_raw_core_config_value.return_value = "GLOBAL"
+    controller = TranslationController(provider.mass)
+    await controller.setup(None)  # type: ignore[arg-type]
+    await controller.ensure_locale_loaded("de")
+    provider.mass.translations = controller
+    monkeypatch.setattr(
+        provider_module, "LastFMAPIClient", Mock(return_value=Mock(validate_api_key=AsyncMock()))
+    )
+    provider.mass.config.get.return_value["api_key"] = "test-key"
+    provider.mass.webserver.auth.get_user = AsyncMock(
+        return_value=Mock(user_id="DEBUG", enabled=True)
+    )
+    provider.mass.tasks.register_scheduled_task.return_value = Mock(schedule=None)
+    await provider.handle_async_init()
+    return controller
+
+
+@pytest.mark.parametrize("is_german_loaded", [False, True])
+async def test_provider_local_catalog_loading_and_unloading(
+    translation_controller: TranslationController,
+    tmp_path: Path,
+    is_german_loaded: bool,
+) -> None:
+    """The unchanged server API loads provider texts before or after a locale is warmed."""
+    providers_path = tmp_path / "providers"
+    translations_path = providers_path / "local_demo" / "translations"
+    translations_path.mkdir(parents=True)
+    for locale, title in (("en", "Local mixes"), ("de", "Lokale Mixe")):
+        path = (
+            translations_path.parent / "strings.json"
+            if locale == "en"
+            else translations_path / f"{locale}.json"
+        )
+        path.write_text(
+            json.dumps({"media": {"recommendations": {"mixes": {"name": title}}}}),
+            encoding="utf-8",
+        )
+    if not is_german_loaded:
+        translation_controller._locales.pop("de")
+    await translation_controller.setup(None)  # type: ignore[arg-type]
+    key = "provider.local_demo.media.recommendations.mixes.name"
+    assert translation_controller.get_translation(key) is None
+    await translation_controller.load_provider_strings("local_demo", str(translations_path.parent))
+    assert translation_controller.get_translation(key) == "Local mixes"
+    await translation_controller.ensure_locale_loaded("de")
+    assert translation_controller.get_translation(key, locale="de") == "Lokale Mixe"
+    shared_key = "common.media.recommendations.recommended_tracks.name"
+    shared_title = translation_controller.get_translation(shared_key)
+    assert shared_title
+    translation_controller.unload_provider_strings("local_demo")
+    assert translation_controller.get_translation(key) is None
+    assert translation_controller.get_translation(key, locale="de") is None
+    assert translation_controller.get_translation(shared_key) == shared_title
 
 
 async def test_folder_listing_is_lightweight_and_translatable(
@@ -127,6 +206,54 @@ async def test_folder_listing_is_lightweight_and_translatable(
     assert all(folder.item_id.startswith(("user_", "global_", "de_")) for folder in folders)
     provider.mass.statistics.get_top_items.assert_not_awaited()
     provider.mass.http_session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("locale", ["en", "de"])
+async def test_folder_catalogs_and_localized_serialization(
+    provider: LastFMRecommendationsEnhancedProvider,
+    translation_controller: TranslationController,
+    locale: str,
+) -> None:
+    """Localize all advertised folders from complete English/German provider catalogs."""
+    owner = "provider.lastfm_recommendations_enhanced."
+    for language in ("en", "de"):
+        central_catalog = json.loads(
+            (Path(translations_module.TRANSLATIONS_PATH) / f"{language}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert not any(key.startswith(owner) for key in central_catalog)
+    source = {
+        key: value for key, value in translation_controller._source.items() if key.startswith(owner)
+    }
+    german = {
+        key: value
+        for key, value in translation_controller._locales["de"].items()
+        if key.startswith(owner)
+    }
+    assert len(source) == 49
+    assert source.keys() == german.keys()
+    catalog = source if locale == "en" else german
+    folders = await provider._get_recommendation_folders(genre_profile=GENRE_PROFILE)
+    assert len(folders) == 22
+    token = TRANSLATION_RESOLVER.set(partial(translation_controller.get_translation, locale=locale))
+    try:
+        for folder in folders:
+            key = f"{owner}media.recommendations.{folder.translation_key}"
+            params = folder.translation_params or []
+            localized = folder.to_dict()
+            assert localized["name"] == catalog[f"{key}.name"].format(*params)
+            assert localized["subtitle"] == catalog[f"{key}.subtitle"]
+            assert "Last.fm" not in localized["subtitle"]
+            assert "https://" not in localized["subtitle"]
+            assert folder.subtitle is None
+            assert folder.name == source[f"{key}.name"].format(*params)
+            if params:
+                assert localized["name"].startswith("Jazz:")
+            if locale == "de":
+                assert localized["name"] != folder.name
+    finally:
+        TRANSLATION_RESOLVER.reset(token)
 
 
 @pytest.mark.parametrize("genre_count", [0, 1, 3, 5])
@@ -595,6 +722,7 @@ async def test_refresh_uses_selected_user_and_restores_request_context(
     provider.mass.webserver.auth.get_user.assert_awaited_once_with(selected.user_id)
 
 
+@pytest.mark.parametrize("locale", ["en", "de"])
 @pytest.mark.parametrize(
     ("folder_id", "name", "left_title", "right_title"),
     [
@@ -609,6 +737,8 @@ async def test_refresh_uses_selected_user_and_restores_request_context(
 async def test_playlist_cover_titles_and_cached_image_reads(
     provider: LastFMRecommendationsEnhancedProvider,
     monkeypatch: pytest.MonkeyPatch,
+    translation_controller: TranslationController,
+    locale: str,
     folder_id: str,
     name: str,
     left_title: str,
@@ -620,7 +750,11 @@ async def test_playlist_cover_titles_and_cached_image_reads(
     )
     renderer = Mock(wraps=build_split_cover_png)
     monkeypatch.setattr(provider_module, "build_split_cover_png", renderer)
-    await provider._set_playlist_cover(playlist, [], folder_id)
+    token = TRANSLATION_RESOLVER.set(partial(translation_controller.get_translation, locale=locale))
+    try:
+        await provider._set_playlist_cover(playlist, [], folder_id)
+    finally:
+        TRANSLATION_RESOLVER.reset(token)
     renderer.assert_called_once_with(left_title, [], right_title)
     assert playlist.image is not None
     assert playlist.image.provider == provider.instance_id
@@ -1044,6 +1178,9 @@ async def test_initialization_registers_daily_refresh_and_delayed_startup(
     )
     provider.mass.tasks.register_scheduled_task.return_value = Mock(schedule=None)
     await provider.handle_async_init()
+    provider.mass.translations.load_provider_strings.assert_awaited_once_with(
+        provider.domain, str(Path(provider_module.__file__).parent)
+    )
     registered = provider.mass.tasks.register_scheduled_task.call_args.kwargs
     assert registered["schedule"] == TaskSchedule.hourly(every=24)
     assert registered["handler"] == provider._refresh_recommendations

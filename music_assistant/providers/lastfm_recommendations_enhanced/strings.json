@@ -13,91 +13,91 @@
     "recommendations": {
       "user_genre_playlists_monthly": {
         "name": "Your genre playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Mixes inspired by your favorite genres"
       },
       "user_artist_playlists_monthly": {
         "name": "Your artist playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Artists you enjoy, mixed with similar sounds"
       },
       "global_popular_artist_albums": {
         "name": "Albums by worldwide popular artists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Popular albums by artists topping the worldwide charts"
       },
       "de_popular_artist_albums": {
         "name": "Albums by popular artists in Germany",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Popular albums by artists trending in Germany"
       },
       "global_genre_playlists": {
         "name": "Explore genre playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Discover new sounds across genres and subgenres"
       },
       "global_artist_radio_playlists": {
         "name": "Artist radios",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Chart favorites mixed with similar artists"
       },
       "global_mood_playlists": {
         "name": "Mood playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Find the right music for your mood"
       },
       "global_decade_playlists": {
         "name": "Decade playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Explore the sounds of each decade"
       },
       "global_genre_albums": {
         "name": "{0}: explore albums",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Albums to explore in this genre"
       },
       "global_genre_artists": {
         "name": "{0}: explore artists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Discover artists from this genre"
       },
       "user_genre_artists": {
         "name": "{0}: artists from your favorite genre",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Artists from the genres you listen to most"
       },
       "global_top_tracks": {
         "name": "Worldwide track charts",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "The tracks listeners worldwide play most"
       },
       "de_top_tracks": {
         "name": "Track charts for Germany",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "The tracks listeners in Germany play most"
       },
       "global_top_artists": {
         "name": "Worldwide artist charts",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "The artists listeners worldwide play most"
       },
       "de_top_artists": {
         "name": "Artist charts for Germany",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "The artists listeners in Germany play most"
       },
       "user_recommendations": {
         "name": "Track recommendations",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Tracks inspired by your listening and favorites"
       },
       "user_artist_recommendations": {
         "name": "Artist recommendations",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Discover artists similar to the ones you enjoy"
       },
       "user_album_recommendations": {
         "name": "Album recommendations",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
+        "subtitle": "Albums inspired by the artists you enjoy"
       },
       "user_rediscovery_tracks": {
         "name": "Not heard in a while",
-        "subtitle": "Previous favorites outside your last 30 days of listening"
+        "subtitle": "Rediscover tracks outside your recent rotation"
       },
       "user_top_artists_monthly": {
         "name": "Your most played artists",
-        "subtitle": "Your most played artists in the last 30 days"
+        "subtitle": "The artists that shaped your last 30 days"
       },
       "user_top_tracks_monthly": {
         "name": "Your most played tracks",
-        "subtitle": "Your most played tracks in the last 30 days"
+        "subtitle": "Your most played songs over the past 30 days"
       },
       "user_top_albums_monthly": {
         "name": "Your most played albums",
-        "subtitle": "Your most played albums in the last 30 days"
+        "subtitle": "The albums you returned to most in the past 30 days"
       }
     }
   },
