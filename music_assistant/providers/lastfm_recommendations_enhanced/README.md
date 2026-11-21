@@ -37,17 +37,18 @@ Last.fm liefert keine Streamingrechte; Audio stammt aus den MA-Musikquellen.
 
 Alle Sprachtexte dieses Providers werden ausschliesslich hier gepflegt:
 
-- [strings.json](strings.json): englische Grundsprache und Fallback.
+- [translations/en.json](translations/en.json): englische Grundsprache und Fallback.
 - [translations/de.json](translations/de.json): deutsche Uebersetzungen.
 
-Der Provider registriert diese Kataloge beim Initialisieren ueber die bestehende
-Sprach-API des Servers. Fuer Docker genuegt der Mount des gesamten Provider-Ordners;
-Server-Code und zentrale Sprachdateien muessen dafuer nicht angepasst werden.
-Die Folder-Texte werden erst bei der Ausgabe in der Sprache des jeweiligen Clients
-aufgeloest, nicht beim Hintergrundaufbau auf eine einzige Sprache festgelegt.
-Weitere vom Server unterstuetzte Sprachen verwenden dieselbe verschachtelte JSON-Struktur
-in `translations/<sprache>.json`. Beim regulaeren Server-Build wird `strings.json`
-weiterhin in den generierten englischen Gesamtkatalog aufgenommen.
+Der Provider liest diese Dateien selbst beim Folder-Aufbau. Massgeblich ist die
+bevorzugte Sprache in den Metadata-Einstellungen des Servers, nicht die Sprache
+des einzelnen Clients. Eine Sprachaenderung gilt beim naechsten Refresh.
+Fuer Docker genuegt der Mount des gesamten Provider-Ordners; Server-Code und zentrale
+Sprachdateien muessen nicht angepasst werden. Die Provider-Sprach-API neuerer Server
+wird nicht benoetigt, sodass dies auch mit 2.11 Beta 7 funktioniert.
+Weitere Sprachen verwenden dieselbe verschachtelte JSON-Struktur in
+`translations/<sprache>.json`; fehlende Texte fallen auf Englisch zurueck.
+Die lokalen Dateien werden nicht in den zentralen englischen Gesamtkatalog aufgenommen.
 Die Texte auf generierten Cover-Bildern bleiben unabhaengig von der UI-Sprache englisch.
 
 ## Folder und Herleitung

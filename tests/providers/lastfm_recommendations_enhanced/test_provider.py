@@ -64,7 +64,8 @@ def provider(
     """Return a provider configured with an explicit test API key."""
     mass = Mock()
     mass.http_session = http_session
-    mass.translations.load_provider_strings = AsyncMock()
+    mass.translations = Mock(spec=[])
+    mass.metadata.locale = "en_US"
     mass.statistics.get_top_items = AsyncMock(return_value=[])
     mass.music.get_controller.return_value.get_library_items_by_query = AsyncMock(return_value=[])
     selected_user = Mock(
@@ -199,7 +200,8 @@ async def test_provider_only_publishes_implemented_folders(
         *(folder_id for folder_id, _name in EXTRA_FOLDERS),
     ]
     assert all(folder.provider == provider.instance_id for folder in folders)
-    assert all(folder.translation_key and not folder.items for folder in folders)
+    assert all(folder.translation_key is None and not folder.items for folder in folders)
+    assert all(folder.subtitle for folder in folders)
     assert not await provider.get_recommendation_items("unknown_folder")
     http_session.get.assert_not_called()
 

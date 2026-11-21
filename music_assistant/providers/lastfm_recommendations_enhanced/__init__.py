@@ -47,6 +47,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
     impersonated_user,
 )
 from music_assistant.helpers.images import get_image_thumb
+from music_assistant.helpers.json import load_json_dict
 from music_assistant.helpers.security import is_safe_path
 from music_assistant.helpers.throttle_retry import RequestPriority, with_request_priority
 from music_assistant.models.media_capabilities import MediaCatalogMixin
@@ -136,7 +137,6 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
             self.mass.http_session, api_key, self.logger, cache=self.mass.cache
         )
         await self.api.validate_api_key()
-        await self.mass.translations.load_provider_strings(self.domain, str(Path(__file__).parent))
         self._recommendation_folders: list[RecommendationFolder] = []
         self._resolved_virtual_playlists: dict[str, tuple[Playlist, list[Track]]] = {}
         self._refresh_lock = asyncio.Lock()
@@ -240,7 +240,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
     async def _get_recommendation_folders(
         self, *, genre_profile: GenreProfile | None = None
     ) -> list[RecommendationFolder]:
-        """Describe all supported rows for the next background generation."""
+        """Describe supported rows in the configured metadata language."""
         self.logger.debug("Listing Last.fm recommendation folders")
         if genre_profile is None:
             collections = LastFMCollections(LastFMDiscovery(self))
@@ -290,8 +290,34 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                 else genre_profile.explore_genres[:3]
             )
         )
+        texts = await self._get_folder_texts()
+        for folder in folders:
+            values = texts[folder.translation_key or folder.item_id]
+            params = folder.translation_params or []
+            folder.name = values["name"].format(*params)
+            folder.subtitle = values["subtitle"].format(*params)
+            folder.translation_key = None
+            folder.translation_params = None
         self.logger.debug("Last.fm recommendation folders ready count=%d", len(folders))
         return folders
+
+    async def _get_folder_texts(self) -> dict[str, dict[str, str]]:
+        """Read provider-owned folder texts, falling back to English for missing translations."""
+        directory = Path(__file__).parent / "translations"
+        source = await load_json_dict(str(directory / "en.json"))
+        texts: dict[str, dict[str, str]] = source["media"]["recommendations"]
+        language = self.mass.metadata.locale.lower().replace("-", "_").split("_", 1)[0]
+        if language == "en" or not re.fullmatch(r"[a-z]{2,3}", language):
+            return texts
+        try:
+            catalog = await load_json_dict(str(directory / f"{language}.json"))
+            translated = catalog["media"]["recommendations"]
+            return {key: {**values, **translated.get(key, {})} for key, values in texts.items()}
+        except FileNotFoundError:
+            return texts
+        except (OSError, ValueError, TypeError, KeyError) as err:
+            self.logger.warning("Failed to load Last.fm folder texts for %s: %s", language, err)
+            return texts
 
     async def _build_recommendation_items(
         self,
