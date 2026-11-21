@@ -50,8 +50,7 @@ from music_assistant.helpers.images import get_image_thumb
 from music_assistant.helpers.json import load_json_dict
 from music_assistant.helpers.security import is_safe_path
 from music_assistant.helpers.throttle_retry import RequestPriority, with_request_priority
-from music_assistant.models.media_capabilities import MediaCatalogMixin
-from music_assistant.models.metadata_provider import MetadataProvider
+from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.lastfm_recommendations_enhanced.api_client import LastFMAPIClient
 from music_assistant.providers.lastfm_recommendations_enhanced.catalog import (
     EXTRA_FOLDERS,
@@ -118,7 +117,7 @@ async def setup(
     return LastFMRecommendationsEnhancedProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin):
+class LastFMRecommendationsEnhancedProvider(PluginProvider):
     """Personal and general recommendations without a Last.fm account."""
 
     async def handle_async_init(self) -> None:

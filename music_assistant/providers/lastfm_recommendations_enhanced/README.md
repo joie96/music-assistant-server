@@ -6,6 +6,8 @@ Bibliothek, Favoriten und Hoerverlauf werden nicht veraendert.
 
 ## Voraussetzungen
 
+- Den Provider unter Plugins einrichten. Eine bisherige Metadata-Instanz vor dem
+  Wechsel entfernen und anschliessend neu einrichten; es gibt keine automatische Migration.
 - Ein eigener [Last.fm API-Key](https://www.last.fm/api/account/create).
   Kein mitgelieferter Key, Last.fm-Login, Benutzername oder API-Secret erforderlich.
 - Einen aktivierten MA-Nutzer im Setup auswaehlen. Seine Hoerdaten, Favoriten

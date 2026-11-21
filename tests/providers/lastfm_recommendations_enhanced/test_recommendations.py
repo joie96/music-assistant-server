@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.enums import ImageType, MediaType, ProviderFeature
+from music_assistant_models.enums import ImageType, MediaType, ProviderFeature, ProviderType
 from music_assistant_models.errors import (
     AuthenticationFailed,
     MediaNotFoundError,
@@ -34,6 +34,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     user_auth_context,
 )
+from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers import lastfm_recommendations_enhanced as provider_module
 from music_assistant.providers.lastfm_recommendations_enhanced import (
     SUPPORTED_FEATURES,
@@ -97,6 +98,11 @@ def provider(tmp_path: Path) -> LastFMRecommendationsEnhancedProvider:
     config.get_value.return_value = "DEBUG"
     manifest = Mock()
     manifest.domain = "lastfm_recommendations_enhanced"
+    manifest.type = ProviderType(
+        json.loads(
+            Path(provider_module.__file__).with_name("manifest.json").read_text(encoding="utf-8")
+        )["type"]
+    )
     result = LastFMRecommendationsEnhancedProvider(mass, manifest, config, SUPPORTED_FEATURES)
     result._recommendation_folders = []
     result._resolved_virtual_playlists = {}
@@ -104,6 +110,38 @@ def provider(tmp_path: Path) -> LastFMRecommendationsEnhancedProvider:
     result._is_unloading = False
     result._recommendation_user_id = "DEBUG"
     return result
+
+
+async def test_generated_playlist_passes_legacy_plugin_playback_gate(
+    provider: LastFMRecommendationsEnhancedProvider,
+) -> None:
+    """Keep generated playlists reachable through b7's plugin source exception."""
+    assert isinstance(provider, PluginProvider)
+    assert provider.type == ProviderType.PLUGIN
+    playlist = provider._playlist(PlaylistSpec("user_genre_playlist_metal", "Metal", tag="metal"))
+    track = Track(
+        item_id="source-track",
+        provider="source--1",
+        name="Song",
+        artists=UniqueList(),
+        provider_mappings={
+            ProviderMapping(
+                item_id="source-track", provider_domain="source", provider_instance="source--1"
+            )
+        },
+    )
+    provider.mass.providers = [provider]
+    plugin_instances = {
+        instance.instance_id
+        for instance in provider.mass.providers
+        if instance.type == ProviderType.PLUGIN
+    }
+    assert playlist.provider in plugin_instances
+    assert playlist.provider != track.provider
+    provider._resolved_virtual_playlists[playlist.item_id] = (playlist, [track])
+    assert await provider.get_playlist(playlist.item_id) == playlist
+    assert await provider.get_playlist_tracks(playlist.item_id) == [track]
+    assert await provider.get_playlist_tracks(playlist.item_id, page=1) == []
 
 
 async def test_folder_listing_is_lightweight_and_translatable(
