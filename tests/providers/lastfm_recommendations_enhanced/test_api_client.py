@@ -23,6 +23,25 @@ from music_assistant.providers.lastfm_recommendations_enhanced.api_client import
 )
 
 
+@pytest.mark.parametrize("method", ITEM_METHODS)
+@pytest.mark.parametrize("local_limit", [1, 20, 50, 75, 105, 150, 500])
+async def test_all_lastfm_methods_send_fifty_item_request_limit(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock], method: str, local_limit: int
+) -> None:
+    """Only tag lists may increase their single request beyond 50, within endpoint bounds."""
+    client, session, _cache = cached_client
+    root, item_key, _ttl = ITEM_METHODS[method]
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        root: {item_key: [{"name": "Item"}]}
+    }
+    await client.get_items(method, limit=local_limit)
+    maximum = {"tag.getTopTracks": 150, "tag.getTopArtists": 75, "tag.getTopAlbums": 105}.get(
+        method, 50
+    )
+    assert session.get.call_args.kwargs["params"]["limit"] == max(50, min(local_limit, maximum))
+    assert "page" not in session.get.call_args.kwargs["params"]
+
+
 def test_client_import_supports_legacy_throttler_constructor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -106,6 +125,43 @@ async def test_artist_tag_weights_preserve_values_and_order(
     assert tags[1].tag_weight is None
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0.75", 0.75),
+        (0.5, 0.5),
+        (0, 0.0),
+        (None, None),
+        ("bad", None),
+        (-1, None),
+        (True, None),
+        ("NaN", None),
+        ("Infinity", None),
+    ],
+)
+@pytest.mark.parametrize("method", ["artist.getSimilar", "track.getSimilar"])
+async def test_similar_scores_preserve_values_without_using_tag_counts(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+    value: object,
+    expected: float | None,
+    method: str,
+) -> None:
+    """Retain numeric match weights independently of tag popularity or list rank."""
+    client, session, _cache = cached_client
+    root, item_key, _ttl = ITEM_METHODS[method]
+    session.get.return_value.__aenter__.return_value.json.return_value = {
+        root: {item_key: [{"name": "Similar", "match": value, "count": 99}, {"name": "Other"}]}
+    }
+    parameters = {"artist": "Seed"}
+    if method == "track.getSimilar":
+        parameters["track"] = "Track"
+    artists = await client.get_items(method, parameters)
+    assert artists[0].similarity_weight == expected
+    assert artists[0].tag_weight is None
+    assert artists[1].similarity_weight is None
+    assert session.get.call_args.kwargs["params"]["limit"] == 50
+
+
 async def test_similar_artists_do_not_inherit_the_seed_identity(
     cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
 ) -> None:
@@ -117,17 +173,14 @@ async def test_similar_artists_do_not_inherit_the_seed_identity(
     assert (await client.get_items("artist.getSimilar", {"artist": "Seed"}))[0].artist == ""
 
 
-async def test_album_information_normalizes_nested_track_lists(
+async def test_removed_album_information_is_rejected_without_http(
     cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
 ) -> None:
-    """Preserve album order and supply its artist when a track does not repeat it."""
+    """The retired spotlight endpoint cannot trigger a Last.fm request."""
     client, session, _cache = cached_client
-    session.get.return_value.__aenter__.return_value.json.return_value = {
-        "album": {"tracks": {"track": [{"name": "Opening"}, {"name": "Closing"}]}}
-    }
-    tracks = await client.get_items("album.getInfo", {"artist": "Artist", "album": "Album"})
-    assert [track.name for track in tracks] == ["Opening", "Closing"]
-    assert all(track.artist == "Artist" for track in tracks)
+    with pytest.raises(InvalidDataError):
+        await client.get_items("album.getInfo", {"artist": "Artist", "album": "Album"})
+    session.get.assert_not_called()
 
 
 @pytest.fixture
@@ -338,16 +391,16 @@ async def test_supported_response_envelopes_and_candidate_limit(
     root, item_key, _ttl = ITEM_METHODS[method]
     session.get.return_value.__aenter__.return_value.json.return_value = {
         root: {
-            item_key: [{"name": str(index), "artist": {"name": "Artist"}} for index in range(60)]
+            item_key: [{"name": str(index), "artist": {"name": "Artist"}} for index in range(200)]
         }
     }
     items = await client.get_items(method, limit=500)
-    assert len(items) == 50
+    maximum = {"tag.getTopTracks": 150, "tag.getTopArtists": 75, "tag.getTopAlbums": 105}.get(
+        method, 50
+    )
+    assert len(items) == maximum
     assert items[0].artist == "Artist"
-    if method == "artist.getTopTags":
-        assert "limit" not in session.get.call_args.kwargs["params"]
-    else:
-        assert session.get.call_args.kwargs["params"]["limit"] == 50
+    assert session.get.call_args.kwargs["params"]["limit"] == maximum
     assert "page" not in session.get.call_args.kwargs["params"]
     session.get.assert_called_once()
 

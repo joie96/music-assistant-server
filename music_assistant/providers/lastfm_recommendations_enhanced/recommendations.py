@@ -7,6 +7,7 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
+from random import shuffle
 from time import perf_counter
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -32,17 +33,19 @@ from music_assistant.helpers.compare import compare_strings
 from music_assistant.helpers.util import parse_title_and_version
 
 from .api_client import LastFMItem
-from .constants import CONF_RECOMMENDATION_USER_ID
+from .constants import CONF_RECOMMENDATION_USER_ID, FAVORITE_BONUS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from . import LastFMRecommendationsEnhancedProvider
 
 RESULT_LIMIT = 50
 SEED_LIMIT = 3
-RESOLUTION_TARGET_LIMIT = 10
-RESOLUTION_MISS_LIMIT = 10
+TRACK_SEED_LIMIT = 15
+ARTIST_SEED_LIMIT = 15
+RESOLUTION_TARGET_LIMITS = {MediaType.TRACK: 50, MediaType.ALBUM: 35, MediaType.ARTIST: 25}
+SEED_RESULT_PERCENT = 20
 SOURCE_SEARCH_RESULT_LIMIT = 2
 SEARCH_CONCURRENCY_LIMIT = 5
 _SEARCH_SEMAPHORE = asyncio.Semaphore(SEARCH_CONCURRENCY_LIMIT)
@@ -84,6 +87,7 @@ class DiscoveryFolder:
     method: str = ""
     country: str = ""
     seed_type: MediaType | None = None
+    max_seeds: int = SEED_LIMIT
 
 
 DISCOVERY_FOLDERS = (
@@ -109,6 +113,7 @@ DISCOVERY_FOLDERS = (
         MediaType.TRACK,
         "track.getSimilar",
         seed_type=MediaType.TRACK,
+        max_seeds=TRACK_SEED_LIMIT,
     ),
     DiscoveryFolder(
         "user_artist_recommendations",
@@ -116,6 +121,7 @@ DISCOVERY_FOLDERS = (
         MediaType.ARTIST,
         "artist.getSimilar",
         seed_type=MediaType.ARTIST,
+        max_seeds=10,
     ),
     DiscoveryFolder(
         "user_album_recommendations",
@@ -126,6 +132,31 @@ DISCOVERY_FOLDERS = (
     ),
     DiscoveryFolder("user_rediscovery_tracks", "Not heard in a while", MediaType.TRACK),
 )
+
+
+def normalize_scores[ScoreKey](scores: dict[ScoreKey, float]) -> dict[ScoreKey, float]:
+    """Normalize nonnegative scores to the strongest score, preserving empty and zero pools."""
+    maximum = max(scores.values(), default=0)
+    return {key: max(score, 0) / maximum if maximum > 0 else 0 for key, score in scores.items()}
+
+
+def similarity_weights(items: list[LastFMItem], *, normalize_matches: bool = False) -> list[float]:
+    """Use explicit match scores, optionally normalized per response, with rank fallback."""
+    scores = {
+        rank: item.similarity_weight
+        for rank, item in enumerate(items, 1)
+        if item.similarity_weight is not None
+    }
+    if normalize_matches:
+        scores = normalize_scores(scores)
+    return [scores.get(rank, 1 / rank) for rank in range(1, len(items) + 1)]
+
+
+def random_candidate_pool(items: list[LastFMItem], max_items: int) -> list[LastFMItem]:
+    """Shuffle a copy of the strongest candidates, capped at three times the result target."""
+    candidates = items[: 3 * max_items]
+    shuffle(candidates)
+    return candidates
 
 
 class LastFMDiscovery:
@@ -149,19 +180,37 @@ class LastFMDiscovery:
         """Build one row, preserving chart order or combining a fixed number of personal seeds."""
         started = perf_counter()
         logger = self.provider.logger
-        logger.debug("Building Last.fm discovery folder=%s limit=%d", folder.item_id, RESULT_LIMIT)
+        logger.debug(
+            "Building Last.fm discovery folder=%s limit=%d",
+            folder.item_id,
+            RESOLUTION_TARGET_LIMITS[folder.media_type] if folder.method else RESULT_LIMIT,
+        )
         result: UniqueList[Artist | Album | Track | ItemMapping] = UniqueList()
         try:
             if not folder.method:
                 result.extend(await self._rediscovery())
             else:
-                candidates = await self._candidates(folder)
+                seeds = (
+                    await self.get_seeds(
+                        folder.seed_type,
+                        limit=folder.max_seeds,
+                    )
+                    if folder.seed_type is not None
+                    else []
+                )
+                candidates = await self._candidates(folder, seeds=seeds)
+                if folder.seed_type is not None:
+                    candidates = random_candidate_pool(
+                        candidates, RESOLUTION_TARGET_LIMITS[folder.media_type]
+                    )
                 logger.debug(
                     "Last.fm folder=%s candidates=%d phase=resolve", folder.item_id, len(candidates)
                 )
-                resolved = await self.resolve_items(candidates, folder.media_type)
-                if folder.seed_type is not None:
-                    resolved = await self.exclude_rotation(resolved, folder.media_type)
+                resolved = await self.resolve_items(
+                    candidates,
+                    folder.media_type,
+                    seeds=seeds,
+                )
                 result.extend(resolved)
         except MusicAssistantError as err:
             logger.debug(
@@ -182,8 +231,10 @@ class LastFMDiscovery:
     async def get_seeds(
         self, media_type: MediaType, *, limit: int = SEED_LIMIT
     ) -> list[PersonalSeed]:
-        """Combine personal listening and favorites into at most ten weighted seeds."""
-        limit = min(max(limit, 1), 10)
+        """Combine personal listening and favorites into bounded, weighted seeds."""
+        limit = min(
+            max(limit, 1), TRACK_SEED_LIMIT if media_type == MediaType.TRACK else ARTIST_SEED_LIMIT
+        )
         weights: dict[str, float] = {}
         history = {}
         for period, factor in (("month", 1.0), ("week", 2.0), ("all_time", 0.1)):
@@ -201,10 +252,15 @@ class LastFMDiscovery:
             if item.available:
                 history[item.uri] = item
                 by_uri[item.uri] = item
-                weights[item.uri] = weights.get(item.uri, 0) + 5
+                weights.setdefault(item.uri, 0)
+        weights = {
+            uri: score + (FAVORITE_BONUS if uri in by_uri else 0)
+            for uri, score in normalize_scores(weights).items()
+        }
         result: list[PersonalSeed] = []
         seen: set[tuple[str, str]] = set()
-        metadata_lookups_remaining = SEED_LIMIT
+        metadata_lookup_limit = limit if media_type == MediaType.TRACK else SEED_LIMIT
+        metadata_lookups_remaining = metadata_lookup_limit
         for uri in sorted(weights, key=lambda uri: weights[uri], reverse=True):
             item = by_uri.get(uri, history[uri])
             if (
@@ -238,116 +294,170 @@ class LastFMDiscovery:
             media_type.value,
             len(history),
             len(result),
-            SEED_LIMIT - metadata_lookups_remaining,
-        )
-        return result
-
-    async def exclude_rotation(
-        self, items: UniqueList[Artist | Album | Track], media_type: MediaType
-    ) -> UniqueList[Artist | Album | Track]:
-        """Omit known identities from the requesting user's bounded current rotation."""
-        recent = await self.provider.mass.statistics.get_top_items(
-            media_type=media_type, period="month", limit=500
-        )
-        recent_uris = {row.item.uri for row in recent}
-        result = UniqueList(item for item in items if item.uri not in recent_uris)
-        self.provider.logger.debug(
-            "Last.fm rotation media_type=%s period=month days=30 recent=%d input=%d removed=%d",
-            media_type.value,
-            len(recent),
-            len(items),
-            len(items) - len(result),
+            metadata_lookup_limit - metadata_lookups_remaining,
         )
         return result
 
     async def resolve_items(
-        self, candidates: list[LastFMItem], media_type: MediaType
+        self,
+        candidates: list[LastFMItem],
+        media_type: MediaType,
+        *,
+        max_tracks_per_artist: int | None = None,
+        seeds: Sequence[PersonalSeed] = (),
+        max_items: int | None = None,
+        excluded_uris: set[str] | None = None,
     ) -> UniqueList[Artist | Album | Track]:
-        """Resolve cached candidates first, then fill the target within the miss limit."""
+        """
+        Fill the media target with at most 20% seeds, respecting artist diversity.
+
+        :param excluded_uris: Previously accepted identities that do not consume the target.
+        """
+        target_limit = (
+            min(RESOLUTION_TARGET_LIMITS[media_type], max_items)
+            if max_items is not None
+            else RESOLUTION_TARGET_LIMITS[media_type]
+        )
         self._has_loading_sources = any(
             config.status == ProviderStatus.LOADING
             for config in await self.provider.mass.config.get_provider_configs(
                 provider_type=ProviderType.MUSIC
             )
         )
-        result: UniqueList[Artist | Album | Track] = UniqueList()
         misses = 0
         duplicates = 0
         attempted = 0
         cached_hits = 0
         searches_before = self._source_search_count
         found: dict[int, Artist | Album | Track] = {}
-        pending: list[int] = []
         for index, candidate in enumerate(candidates):
+            selected = self._select_resolution_indices(
+                found, max_tracks_per_artist, seeds, target_limit
+            )
+            if len(selected) >= target_limit:
+                break
+            attempted += 1
             item, missed = await self._get_cached_resolution(candidate, media_type)
             if item is not None:
                 cached_hits += 1
-                if item.uri not in {value.uri for value in found.values()}:
-                    found[index] = item
-                else:
-                    duplicates += 1
-            elif not missed:
-                pending.append(index)
-        for index in sorted(
-            pending,
-            key=lambda index: (index >= RESOLUTION_TARGET_LIMIT, not candidates[index].mbid),
-        ):
-            if len(found) >= RESOLUTION_TARGET_LIMIT or misses >= RESOLUTION_MISS_LIMIT:
-                if len(found) < RESOLUTION_TARGET_LIMIT:
-                    self.state.retry_after = max(self.state.retry_after, RESOLUTION_RETRY_DELAY)
-                break
-            candidate = candidates[index]
-            attempted += 1
-            item = self._find_match(
-                candidate, self.state.source_items.get(media_type, ()), require_exact_title=True
-            )
-            if item is None:
-                try:
-                    item = await self._resolve_missing(candidate, media_type)
-                except ResourceTemporarilyUnavailable:
-                    self.state.has_incomplete_searches = True
-                    self.state.retry_after = max(self.state.retry_after, RESOLUTION_RETRY_DELAY)
-                    misses += 1
-                    continue
-            cache_key = self._resolution_cache_key(candidate, media_type)
-            await self.provider.mass.cache.set(
-                key=cache_key if item is not None else f"miss_{cache_key}",
-                data=item.to_dict() if item is not None else True,
-                category=CACHE_CATEGORY_RESOLUTION,
-                provider=self.provider.instance_id,
-                expiration=RESOLUTION_CACHE_TTL if item is not None else RESOLUTION_MISS_CACHE_TTL,
-            )
+            elif missed:
+                misses += 1
+                continue
+            else:
+                item = self._find_match(
+                    candidate, self.state.source_items.get(media_type, ()), require_exact_title=True
+                )
+                if item is None:
+                    try:
+                        item = await self._resolve_missing(candidate, media_type)
+                    except ResourceTemporarilyUnavailable:
+                        self.state.has_incomplete_searches = True
+                        self.state.retry_after = max(self.state.retry_after, RESOLUTION_RETRY_DELAY)
+                        misses += 1
+                        continue
+                cache_key = self._resolution_cache_key(candidate, media_type)
+                await self.provider.mass.cache.set(
+                    key=cache_key if item is not None else f"miss_{cache_key}",
+                    data=item.to_dict() if item is not None else True,
+                    category=CACHE_CATEGORY_RESOLUTION,
+                    provider=self.provider.instance_id,
+                    expiration=RESOLUTION_CACHE_TTL
+                    if item is not None
+                    else RESOLUTION_MISS_CACHE_TTL,
+                )
             if item is None:
                 misses += 1
+            elif excluded_uris is not None and item.uri in excluded_uris:
+                misses += 1
+                duplicates += 1
             elif item.uri not in {value.uri for value in found.values()}:
                 found[index] = item
             else:
                 misses += 1
                 duplicates += 1
-        for index in sorted(found)[:RESOLUTION_TARGET_LIMIT]:
-            result.append(self._with_attribution(found[index], candidates[index], media_type))
+        selected = self._select_resolution_indices(
+            found, max_tracks_per_artist, seeds, target_limit
+        )
+        result = UniqueList(
+            self._with_attribution(found[index], candidates[index], media_type)
+            for index in selected[:target_limit]
+        )
         self.provider.logger.debug(
             "Last.fm resolution candidates=%d cached=%d resolved=%d "
             "searches=%d misses=%d limit=%d "
-            "missing_artist=%d deferred=%d duplicates=%d",
+            "missing_artist=%d deferred=%d duplicates=%d filtered=%d",
             len(candidates),
             cached_hits,
             len(result),
             self._source_search_count - searches_before,
             misses,
-            RESOLUTION_TARGET_LIMIT,
+            target_limit,
             sum(not item.artist for item in candidates) if media_type != MediaType.ARTIST else 0,
-            len(pending) - attempted,
+            len(candidates) - attempted,
             duplicates,
+            len(found) - len(selected),
         )
         return result
 
-    async def _candidates(self, folder: DiscoveryFolder) -> list[LastFMItem]:
-        """Limit every source to one page; personal discovery uses at most three seeds."""
+    @staticmethod
+    def _select_resolution_indices(
+        found: dict[int, Artist | Album | Track],
+        max_tracks_per_artist: int | None,
+        seeds: Sequence[PersonalSeed] = (),
+        target_limit: int = RESULT_LIMIT,
+    ) -> list[int]:
+        """Select eligible matches in candidate order before applying the media target."""
+        selected: list[int] = []
+        artist_counts: dict[str, int] = {}
+        seed_count = 0
+        seed_limit = target_limit * SEED_RESULT_PERCENT // 100
+        for index in sorted(found):
+            item = found[index]
+            is_seed = LastFMDiscovery._is_seed(item, seeds)
+            if is_seed and seed_count >= seed_limit:
+                continue
+            if max_tracks_per_artist is not None:
+                if not isinstance(item, Track) or not item.artists:
+                    continue
+                artist = item.artists[0].name.casefold()
+                if artist_counts.get(artist, 0) >= max_tracks_per_artist:
+                    continue
+                artist_counts[artist] = artist_counts.get(artist, 0) + 1
+            seed_count += is_seed
+            selected.append(index)
+        return selected
+
+    @staticmethod
+    def _is_seed(item: Artist | Album | Track, seeds: Sequence[PersonalSeed]) -> bool:
+        """Recognize the same seed across MA sources without conflating artists and their releases."""
+        return any(
+            item.uri == seed.identity
+            or (
+                isinstance(item, Artist)
+                and not seed.track
+                and item.name.casefold() == seed.artist.casefold()
+            )
+            or (
+                isinstance(item, Track)
+                and bool(seed.track)
+                and item.name.casefold() == seed.track.casefold()
+                and any(artist.name.casefold() == seed.artist.casefold() for artist in item.artists)
+            )
+            for seed in seeds
+        )
+
+    async def _candidates(
+        self, folder: DiscoveryFolder, *, seeds: Sequence[PersonalSeed] | None = None
+    ) -> list[LastFMItem]:
+        """Fetch one bounded page per seed, combine weights and retain the strongest candidates."""
         if folder.seed_type is None:
             params = {"country": folder.country} if folder.country else {}
             return await self.provider.api.get_items(folder.method, params, limit=RESULT_LIMIT)
-        seeds = await self.get_seeds(folder.seed_type)
+        if seeds is None:
+            seeds = await self.get_seeds(
+                folder.seed_type,
+                limit=folder.max_seeds,
+            )
         self.provider.logger.debug(
             "Last.fm folder=%s seeds=%d phase=fetch", folder.item_id, len(seeds)
         )
@@ -357,11 +467,18 @@ class LastFMDiscovery:
             params = {"artist": seed.artist}
             if seed.track:
                 params["track"] = seed.track
-            items = await self.provider.api.get_items(folder.method, params, limit=20)
-            for rank, item in enumerate(items, 1):
+            items = await self.provider.api.get_items(
+                folder.method,
+                params,
+                limit=RESULT_LIMIT,
+            )
+            weights = similarity_weights(
+                items, normalize_matches=folder.method == "track.getSimilar"
+            )
+            for item, weight in zip(items, weights, strict=True):
                 key = (item.name.casefold(), item.artist.casefold())
                 candidates.setdefault(key, item)
-                scores[key] = scores.get(key, 0) + max(seed.weight, 1) / rank
+                scores[key] = scores.get(key, 0) + seed.weight * weight
             self.provider.logger.debug(
                 "Last.fm folder=%s seed=%d/%d received=%d",
                 folder.item_id,
@@ -369,15 +486,10 @@ class LastFMDiscovery:
                 len(seeds),
                 len(items),
             )
-        seed_names = {
-            (seed.artist if folder.media_type == MediaType.ARTIST else seed.track).casefold()
-            for seed in seeds
-        }
+        scores = normalize_scores(scores)
         return [
-            candidates[key]
-            for key in sorted(scores, key=lambda key: scores[key], reverse=True)
-            if candidates[key].name.casefold() not in seed_names
-        ][:RESULT_LIMIT]
+            candidates[key] for key in sorted(scores, key=lambda key: scores[key], reverse=True)
+        ]
 
     async def _resolve_missing(
         self, candidate: LastFMItem, media_type: MediaType
@@ -648,11 +760,13 @@ class LastFMDiscovery:
         recent_uris = {row.item.uri for row in recent}
         candidates = [
             row.item for row in previous if row.item.available and row.item.uri not in recent_uris
-        ][:RESULT_LIMIT]
+        ]
+        candidates = list(UniqueList(candidates))[: 3 * RESULT_LIMIT]
         self.provider.logger.debug(
             "Last.fm rediscovery recent=%d historical=%d candidates=%d",
             len(recent),
             len(previous),
             len(candidates),
         )
-        return UniqueList(candidates)
+        shuffle(candidates)
+        return UniqueList(candidates[:RESULT_LIMIT])

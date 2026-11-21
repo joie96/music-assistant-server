@@ -16,10 +16,9 @@ class Category:
 
 @dataclass(frozen=True)
 class GenreProfile:
-    """Separate personal, neighboring and global Explore categories for one generation."""
+    """Separate personal and global Explore categories for one generation."""
 
     genres: tuple[Category, ...]
-    related_genres: tuple[Category, ...]
     explore_genres: tuple[Category, ...] = ()
 
 
@@ -92,10 +91,8 @@ EXTRA_FOLDERS = (
     ("de_popular_artist_albums", "Albums by popular artists in Germany"),
     ("global_genre_playlists", "Explore genre playlists"),
     ("global_artist_radio_playlists", "Artist radios"),
-    ("user_related_genre_playlists", "Related genre playlists"),
     ("global_mood_playlists", "Mood playlists"),
     ("global_decade_playlists", "Decade playlists"),
-    ("user_recommended_album", "An album for you"),
 )
 
 

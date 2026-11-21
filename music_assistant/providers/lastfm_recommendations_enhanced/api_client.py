@@ -43,7 +43,6 @@ ITEM_METHODS: dict[str, tuple[str, str, int]] = {
     "tag.getTopTracks": ("tracks", "track", 86400),
     "tag.getTopArtists": ("topartists", "artist", 86400),
     "tag.getTopAlbums": ("albums", "album", 86400),
-    "album.getInfo": ("album", "tracks", 86400),
 }
 CACHE_NAMESPACE = "lastfm_recommendations_enhanced"
 CACHE_SLOTS = 128
@@ -60,6 +59,7 @@ class LastFMItem:
     url: str = ""
     mbid: str = ""
     tag_weight: float | None = None
+    similarity_weight: float | None = None
 
 
 class LastFMAPIClient:
@@ -92,40 +92,41 @@ class LastFMAPIClient:
         self._cache = cache
 
     async def validate_api_key(self) -> None:
-        """Reject invalid credentials with a minimal read-only Last.fm request."""
-        self.logger.debug("Last.fm API key validation start method=chart.getTopArtists limit=1")
-        await self._request("chart.getTopArtists", {"limit": 1}, use_cache=False)
+        """Reject invalid credentials with a bounded read-only Last.fm request."""
+        self.logger.debug("Last.fm API key validation start method=chart.getTopArtists limit=50")
+        await self._request("chart.getTopArtists", {"limit": 50}, use_cache=False)
         self.logger.debug("Last.fm API key validation successful")
 
     async def get_items(
         self, method: str, parameters: dict[str, str] | None = None, limit: int = 50
     ) -> list[LastFMItem]:
         """
-        Return at most 50 candidates from one documented, read-only discovery endpoint.
+        Return a bounded candidate list from one documented, read-only discovery endpoint.
 
         :param method: An explicitly supported Last.fm discovery method.
-        :param parameters: Artist, track, album, tag or country; no credential overrides.
-        :param limit: Maximum candidate count; capped at 50 and never paginated.
+        :param parameters: Artist, track, tag or country; no credential overrides.
+        :param limit: Candidate maximum; only tag lists support more than 50 items.
         """
         if method not in ITEM_METHODS or set(parameters or {}) - {
             "artist",
             "track",
-            "album",
             "tag",
             "country",
         }:
             raise InvalidDataError("Unsupported Last.fm discovery request")
         if method == "chart.getTopTags" and parameters:
             raise InvalidDataError("Global Last.fm tags do not support country or artist filters")
-        limit = min(max(limit, 1), 50)
+        maximum = {
+            "tag.getTopTracks": 150,
+            "tag.getTopArtists": 75,
+            "tag.getTopAlbums": 105,
+        }.get(method, 50)
+        limit = min(max(limit, 1), maximum)
         request_parameters: dict[str, str | int] = dict(parameters or {})
-        if method != "artist.getTopTags":
-            request_parameters["limit"] = limit
+        request_parameters["limit"] = max(50, limit)
         data = await self._request(method, request_parameters)
         root, item_key, _ttl = ITEM_METHODS[method]
         rows = data[root].get(item_key, [])
-        if method == "album.getInfo" and isinstance(rows, dict):
-            rows = rows.get("track", [])
         if isinstance(rows, dict):
             rows = [rows]
         if not isinstance(rows, list):
@@ -136,7 +137,6 @@ class LastFMAPIClient:
                 continue
             artist = row.get("artist", "")
             if not artist and method in {
-                "album.getInfo",
                 "artist.getTopAlbums",
                 "artist.getTopTracks",
             }:
@@ -154,6 +154,11 @@ class LastFMAPIClient:
                     tag_weight=(
                         self._tag_weight(row.get("count"))
                         if method == "artist.getTopTags"
+                        else None
+                    ),
+                    similarity_weight=(
+                        self._tag_weight(row.get("match"))
+                        if method in {"artist.getSimilar", "track.getSimilar"}
                         else None
                     ),
                 )

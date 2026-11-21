@@ -102,7 +102,6 @@ TOP_ITEMS_LIMIT = 50
 PLAYLIST_COVER_LABELS = {
     "user_genre_playlists_monthly": "Genre",
     "global_genre_playlists": "Genre",
-    "user_related_genre_playlists": "Genre",
     "user_artist_playlists_monthly": "K\u00fcnstler",
     "global_artist_radio_playlists": "Radio",
     "global_mood_playlists": "Stimmung",
@@ -290,7 +289,7 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
             for category in (
                 genre_profile.genres[:3]
                 if prefix == "user_genre_artists"
-                else genre_profile.explore_genres
+                else genre_profile.explore_genres[:3]
             )
         )
         self.logger.debug("Last.fm recommendation folders ready count=%d", len(folders))
@@ -393,20 +392,34 @@ class LastFMRecommendationsEnhancedProvider(MetadataProvider, MediaCatalogMixin)
                     folders = await self._get_recommendation_folders(genre_profile=genre_profile)
                     playlists: dict[str, tuple[Playlist, list[Track]]] = {}
                     for folder in folders:
-                        folder.items = await self._build_recommendation_items(
-                            folder.item_id,
-                            genre_profile=genre_profile,
-                            discovery=LastFMDiscovery(self, state=resolution_state),
-                        )
+                        prepared_tracks: dict[str, list[Track]] = {}
+                        if folder.item_id == "user_genre_playlists_monthly":
+                            completed = await collections.get_personal_genre_playlists()
+                            folder.items = UniqueList(
+                                self._playlist(recipe) for recipe, _tracks in completed
+                            )
+                            prepared_tracks = {
+                                recipe.item_id: tracks for recipe, tracks in completed
+                            }
+                        else:
+                            folder.items = await self._build_recommendation_items(
+                                folder.item_id,
+                                genre_profile=genre_profile,
+                                discovery=LastFMDiscovery(self, state=resolution_state),
+                            )
                         for item in folder.items:
                             if isinstance(item, Playlist) and item.item_id not in playlists:
-                                tracks = await LastFMCollections(
-                                    LastFMDiscovery(
-                                        self,
-                                        state=resolution_state,
-                                    ),
-                                    genre_profile=genre_profile,
-                                ).get_playlist_tracks(item.item_id)
+                                tracks = (
+                                    prepared_tracks[item.item_id]
+                                    if item.item_id in prepared_tracks
+                                    else await LastFMCollections(
+                                        LastFMDiscovery(
+                                            self,
+                                            state=resolution_state,
+                                        ),
+                                        genre_profile=genre_profile,
+                                    ).get_playlist_tracks(item.item_id)
+                                )
                                 await self._set_playlist_cover(item, tracks, folder.item_id)
                                 playlists[item.item_id] = (item, tracks)
                         self.logger.debug(

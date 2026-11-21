@@ -40,11 +40,15 @@ from music_assistant.providers.lastfm_recommendations_enhanced import (
     _recommendation_user_context,
     get_recommendation_user_entry,
 )
+from music_assistant.providers.lastfm_recommendations_enhanced import (
+    recommendations as recommendations_module,
+)
 from music_assistant.providers.lastfm_recommendations_enhanced.api_client import LastFMItem
 from music_assistant.providers.lastfm_recommendations_enhanced.catalog import (
     EXTRA_FOLDERS,
     GENRE_FOLDER_FAMILIES,
     GenreProfile,
+    PlaylistSpec,
     genre_for_tag,
 )
 from music_assistant.providers.lastfm_recommendations_enhanced.collections import LastFMCollections
@@ -62,7 +66,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced.recommendations i
 
 JAZZ = genre_for_tag("jazz")
 assert JAZZ is not None
-GENRE_PROFILE = GenreProfile((JAZZ,), (), (JAZZ,))
+GENRE_PROFILE = GenreProfile((JAZZ,), explore_genres=(JAZZ,))
 GENRE_FOLDER_IDS = tuple(f"{prefix}_{JAZZ.key}" for prefix, _label in GENRE_FOLDER_FAMILIES)
 
 
@@ -119,8 +123,40 @@ async def test_folder_listing_is_lightweight_and_translatable(
     ]
     assert all(folder.provider == provider.instance_id for folder in folders)
     assert all(folder.translation_key and not folder.items for folder in folders)
-    assert len({folder.item_id for folder in folders}) == 24
+    assert len({folder.item_id for folder in folders}) == 22
     assert all(folder.item_id.startswith(("user_", "global_", "de_")) for folder in folders)
+    provider.mass.statistics.get_top_items.assert_not_awaited()
+    provider.mass.http_session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("genre_count", [0, 1, 3, 5])
+async def test_global_genre_rows_are_limited_to_three_without_limiting_playlists(
+    provider: LastFMRecommendationsEnhancedProvider, genre_count: int
+) -> None:
+    """Advertise the first three album and artist genres without limiting genre playlists."""
+    categories = []
+    for name in ("jazz", "rock", "pop", "classical", "blues"):
+        category = genre_for_tag(name)
+        assert category is not None
+        categories.append(category)
+    genres = tuple(categories[:genre_count])
+    profile = GenreProfile(genres, explore_genres=genres)
+
+    folders = await provider._get_recommendation_folders(genre_profile=profile)
+
+    for prefix, expected in (
+        ("global_genre_albums", genres[:3]),
+        ("global_genre_artists", genres[:3]),
+        ("user_genre_artists", genres[:3]),
+    ):
+        assert [
+            folder.item_id for folder in folders if folder.item_id.startswith(f"{prefix}_")
+        ] == [f"{prefix}_{category.key}" for category in expected]
+    collections = LastFMCollections(LastFMDiscovery(provider), genre_profile=profile)
+    recipes = await collections.get_playlist_specs("global_genre_playlists")
+    assert [recipe.item_id for recipe in recipes] == [
+        f"global_genre_playlist_{category.key}" for category in genres
+    ]
     provider.mass.statistics.get_top_items.assert_not_awaited()
     provider.mass.http_session.get.assert_not_called()
 
@@ -311,6 +347,72 @@ async def test_folder_contents_are_prebuilt_and_do_not_query_history_on_read(
     assert provider.mass.statistics.get_top_items.await_count == 1
 
 
+async def test_refresh_changes_random_selection_but_opening_keeps_the_generation(
+    provider: LastFMRecommendationsEnhancedProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a completed refresh replaces a random selection; reads never generate candidates."""
+    provider.mass.webserver.auth.get_user = AsyncMock(
+        return_value=Mock(user_id="DEBUG", enabled=True)
+    )
+    monkeypatch.setattr(
+        LastFMCollections, "get_genre_profile", AsyncMock(return_value=GENRE_PROFILE)
+    )
+    monkeypatch.setattr(LastFMCollections, "get_explore_genres", AsyncMock(return_value=()))
+    folder_id = "user_artist_recommendations"
+    monkeypatch.setattr(
+        provider,
+        "_get_recommendation_folders",
+        AsyncMock(
+            side_effect=lambda **_kwargs: [
+                RecommendationFolder(
+                    item_id=folder_id, provider=provider.instance_id, name="Artists"
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(provider, "_remove_obsolete_covers", AsyncMock())
+    candidates = [LastFMItem(f"Artist {rank}") for rank in range(100)]
+    items = {
+        candidate.name: Artist(
+            item_id=str(rank), provider="library", name=candidate.name, provider_mappings=set()
+        )
+        for rank, candidate in enumerate(candidates)
+    }
+    fetch_candidates = AsyncMock(return_value=candidates)
+    monkeypatch.setattr(LastFMDiscovery, "get_seeds", AsyncMock(return_value=[]))
+    monkeypatch.setattr(LastFMDiscovery, "_candidates", fetch_candidates)
+    monkeypatch.setattr(
+        LastFMDiscovery,
+        "resolve_items",
+        AsyncMock(
+            side_effect=lambda pool, *_args, **_kwargs: UniqueList(
+                items[candidate.name] for candidate in pool[:25]
+            )
+        ),
+    )
+    shuffle_candidates = Mock()
+    shuffle_candidates.side_effect = lambda pool: (
+        pool.reverse() if shuffle_candidates.call_count == 1 else None
+    )
+    monkeypatch.setattr(recommendations_module, "shuffle", shuffle_candidates)
+    await provider._refresh_recommendations()
+    with user_auth_context(Mock(user_id="DEBUG")):
+        first = await provider.get_recommendation_items(folder_id)
+        again = await provider.get_recommendation_items(folder_id)
+        assert [item.name for item in first] == [f"Artist {rank}" for rank in range(74, 49, -1)]
+        assert again == first
+        shuffle_candidates.assert_called_once()
+        fetch_candidates.assert_awaited_once()
+        await provider._refresh_recommendations()
+        second = await provider.get_recommendation_items(folder_id)
+        assert [item.name for item in second] == [f"Artist {rank}" for rank in range(25)]
+        assert await provider.get_recommendation_items(folder_id) == second
+    assert shuffle_candidates.call_count == fetch_candidates.await_count == 2
+    assert candidates[0].name == "Artist 0"
+    provider.mass.http_session.get.assert_not_called()
+
+
 async def test_statistics_error_is_logged_and_propagated(
     provider: LastFMRecommendationsEnhancedProvider, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -349,8 +451,11 @@ async def test_recommendation_playlists_use_native_catalog_contract(
 
 async def test_generated_playlist_returns_streaming_tracks_with_positions(
     provider: LastFMRecommendationsEnhancedProvider,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Preserve playable streaming identities and leave the search result untouched."""
+    shuffle_candidates = Mock()
+    monkeypatch.setattr(recommendations_module, "shuffle", shuffle_candidates)
     mapping = ProviderMapping(
         item_id="source-id", provider_domain="source", provider_instance="source--1"
     )
@@ -385,7 +490,10 @@ async def test_generated_playlist_returns_streaming_tracks_with_positions(
     assert track.position is None
     assert not track.metadata.links
     controller.get_library_items_by_query.assert_not_awaited()
-    provider.api.get_items.assert_awaited_once_with("tag.getTopTracks", {"tag": "jazz"}, limit=50)
+    assert await provider.get_playlist_tracks(playlist.item_id) == tracks
+    assert await provider.get_playlist_tracks(playlist.item_id) == tracks
+    shuffle_candidates.assert_called_once()
+    provider.api.get_items.assert_awaited_once_with("tag.getTopTracks", {"tag": "jazz"}, limit=150)
 
 
 async def test_refresh_uses_selected_user_and_restores_request_context(
@@ -408,7 +516,7 @@ async def test_refresh_uses_selected_user_and_restores_request_context(
     with user_auth_context(requester):
         await provider._refresh_recommendations()
         assert get_current_user() is requester
-    assert len(provider._recommendation_folders) == 21
+    assert len(provider._recommendation_folders) == 19
     assert provider._resolved_virtual_playlists
     provider.mass.webserver.auth.get_user.assert_awaited_once_with(selected.user_id)
 
@@ -418,7 +526,6 @@ async def test_refresh_uses_selected_user_and_restores_request_context(
     [
         ("user_genre_playlists_monthly", "Jazz", "Genre", "Jazz"),
         ("global_genre_playlists", "Rock", "Genre", "Rock"),
-        ("user_related_genre_playlists", "Soul", "Genre", "Soul"),
         ("user_artist_playlists_monthly", "Featuring Radiohead", "K\u00fcnstler", "Radiohead"),
         ("global_artist_radio_playlists", "Radiohead & similar artists", "Radio", "Radiohead"),
         ("global_mood_playlists", "Party", "Stimmung", "Party"),
@@ -622,6 +729,61 @@ async def test_cover_cleanup_keeps_two_generations_and_other_providers(
     assert unrelated.read_bytes() == b"keep"
 
 
+async def test_refresh_publishes_prepared_genre_playlists_without_fetching_tracks_twice(
+    provider: LastFMRecommendationsEnhancedProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publish only completed genre selections and reuse their already prepared tracks."""
+    selected = Mock(user_id="selected-user", enabled=True)
+    provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = selected.user_id
+    provider.mass.webserver.auth.get_user = AsyncMock(return_value=selected)
+    genres = tuple(category for index in range(15) if (category := genre_for_tag(f"Genre {index}")))
+    monkeypatch.setattr(
+        LastFMCollections, "get_genre_profile", AsyncMock(return_value=GenreProfile(genres))
+    )
+    monkeypatch.setattr(LastFMCollections, "get_explore_genres", AsyncMock(return_value=()))
+    artist = Artist(item_id="a", provider="library", name="Artist", provider_mappings=set())
+    track = Track(
+        item_id="t",
+        provider="library",
+        name="Track",
+        provider_mappings=set(),
+        artists=UniqueList([artist]),
+    )
+    completed = [
+        (
+            PlaylistSpec(
+                f"user_genre_playlist_{genre.key}", genre.name, tag=genre.tag, personal=True
+            ),
+            [track],
+        )
+        for genre in genres[:10]
+    ]
+    prepare = AsyncMock(return_value=completed)
+    fetch_tracks = AsyncMock(side_effect=AssertionError("Prepared tracks must be reused"))
+    monkeypatch.setattr(LastFMCollections, "get_personal_genre_playlists", prepare)
+    monkeypatch.setattr(LastFMCollections, "get_playlist_tracks", fetch_tracks)
+    monkeypatch.setattr(
+        provider, "_build_recommendation_items", AsyncMock(return_value=UniqueList())
+    )
+    monkeypatch.setattr(provider, "_set_playlist_cover", AsyncMock())
+    monkeypatch.setattr(provider, "_remove_obsolete_covers", AsyncMock())
+    await provider._refresh_recommendations()
+    folder = next(
+        folder
+        for folder in provider._recommendation_folders
+        if folder.item_id == "user_genre_playlists_monthly"
+    )
+    assert [item.item_id for item in folder.items] == [
+        recipe.item_id for recipe, _tracks in completed
+    ]
+    assert len(provider._resolved_virtual_playlists) == 10
+    assert all(
+        tracks == [track] for _playlist, tracks in provider._resolved_virtual_playlists.values()
+    )
+    prepare.assert_awaited_once()
+    fetch_tracks.assert_not_awaited()
+
+
 async def test_refresh_builds_dynamic_genres_from_unmapped_streaming_artist(
     provider: LastFMRecommendationsEnhancedProvider,
 ) -> None:
@@ -681,7 +843,7 @@ async def test_refresh_builds_dynamic_genres_from_unmapped_streaming_artist(
     for category in tags:
         assert category is not None
         assert f"global_genre_playlist_{category.key}" not in provider._resolved_virtual_playlists
-        assert f"user_genre_playlist_{category.key}" in provider._resolved_virtual_playlists
+        assert f"user_genre_playlist_{category.key}" not in provider._resolved_virtual_playlists
     for tag in ("Afrobeat", "Bluegrass"):
         category = genre_for_tag(tag)
         assert category is not None
@@ -772,7 +934,7 @@ async def test_prepared_results_are_hidden_from_other_users(
         with pytest.raises(MediaNotFoundError):
             await provider.get_playlist_tracks(items[0].item_id)
     with user_auth_context(Mock(user_id="DEBUG")):
-        assert len(await provider.get_recommendations()) == 24
+        assert len(await provider.get_recommendations()) == 22
         provider.mass.config.get.return_value[CONF_RECOMMENDATION_USER_ID] = "other-user"
         assert not await provider.get_recommendations()
 

@@ -17,7 +17,7 @@ def test_categories_have_unique_stable_keys() -> None:
     assert len({category.key for category in categories}) == len(categories)
     assert all(category_for_key(category.key) == category for category in categories)
     assert category_for_key("unpublished") is None
-    assert len({folder_id for folder_id, _name in EXTRA_FOLDERS}) == 10
+    assert len({folder_id for folder_id, _name in EXTRA_FOLDERS}) == 8
 
 
 def test_moods_preserve_existing_categories_and_append_six_flow_inspired_categories() -> None:

@@ -8,240 +8,162 @@ Bibliothek, Favoriten und Hoerverlauf werden nicht veraendert.
 
 - Ein eigener [Last.fm API-Key](https://www.last.fm/api/account/create).
   Kein mitgelieferter Key, Last.fm-Login, Benutzername oder API-Secret erforderlich.
-- Einen aktivierten MA-Nutzer im Setup auswaehlen. Die Auswahl kann spaeter
-  durch erneutes Ausfuehren des Provider-Setups unter "Music Assistant user for
-  recommendations" (`recommendation_user_id`) geaendert werden. API-Key und
-  Nutzerwahl werden gemeinsam in `setup_data` gespeichert.
-  Seine History, Favoriten und verfuegbaren Musikquellen bilden die
-  persoenliche Grundlage; die Reihen sind nur fuer diesen Nutzer sichtbar.
-  Persoenliche Genre-Empfehlungen verwenden ausschliesslich Last.fm-Tags seiner bevorzugten
-  Kuenstler, keine MA-Genrezuordnungen. Auch nicht synchronisierte Streaming-
-  Kuenstler koennen beitragen, wenn MA ihre Credits im Hoerverlauf gespeichert hat.
+- Einen aktivierten MA-Nutzer im Setup auswaehlen. Seine Hoerdaten, Favoriten
+  und verfuegbaren Musikquellen bilden die persoenliche Grundlage; die Reihen
+  sind nur fuer diesen Nutzer sichtbar. Die Nutzerwahl kann durch erneutes
+  Ausfuehren des Setups unter "Music Assistant user for recommendations"
+  (`recommendation_user_id`) geaendert werden.
 
-Der Nutzerkontext verwendet die bereits in MA `2.11.0b7` vorhandenen
-Kontextvariablen. Der dort noch fehlende Core-Helper `user_auth_context` wird
-nicht vorausgesetzt. Ein bereits aktiver anfragender oder impersonierter Nutzer
-wird nach dem Aufbau wiederhergestellt, auch bei Fehlern und Abbruch.
-Auch die Throttler-Konfiguration verwendet nur in dieser Version verfuegbare
-Konstruktorargumente. Ein aktiver Last.fm-Cooldown wird vor und nach der
-Slot-Vergabe geprueft: keine weitere Anfrage und keine verlaengerte Wartefrist.
-Der Setup-Abschluss verwendet den in `2.11.0b7` verfuegbaren `finish(values)`-Vertrag
-ohne das neuere `options`-Argument.
+## Betrieb und Hinweise
 
-## Limits und Hinweise
+- Aufbau 20 Sekunden nach dem Start, danach alle 24 Stunden im Hintergrund.
+  Abrufe liefern den letzten vollstaendigen Stand; bis zum ersten Aufbau ist
+  die Liste leer. Bei Fehlern bleibt der vorherige Stand erhalten.
+  Unvollstaendige Aufloesungen werden fruehestens nach 5 Minuten erneut versucht.
+  Zufallsauswahlen entstehen nur beim Aufbau oder Refresh, nicht beim Oeffnen.
+- Nur ueber die sichtbaren MA-Musikquellen aufloesbare Medien werden ausgegeben.
+  Begrenzte Kandidatenlisten, Verfuegbarkeit und Filter koennen zu kuerzeren
+  oder leeren Reihen fuehren; es gibt keine Katalogdurchlaeufe.
+- Alle Instanzen teilen ein Limit von 5 Last.fm-Anfragen pro Sekunde.
+  Bei Rate Limits gilt ein gemeinsamer Cooldown von mindestens 60 Sekunden;
+  ein laengeres `Retry-After` hat Vorrang, auch bei Wiederholungen.
+- Playlists sind dynamisch und nicht editierbar. Sie werden nicht als dauerhafte
+  MA-Playlists angelegt; Links koennen bei geaendertem Profil ungueltig werden.
 
-- Folder und Playlist-Tracks werden nach dem Start mit 20 Sekunden Verzoegerung
-  und danach alle 24 Stunden im Hintergrund aufgebaut. Abrufe liefern den letzten
-  vollstaendigen Stand ohne neue Abfragen; bis zum ersten Aufbau ist die Liste leer.
-  Bei einem fehlgeschlagenen Refresh bleibt der vorherige Stand erhalten.
-  Unvollstaendige Aufloesungen und erreichte Fehlversuchsgrenzen werden nach
-  mindestens fuenf Minuten erneut versucht; laengere Rate-Limit-Wartezeiten
-  haben Vorrang. Es gibt nur einen entprellten Retry-Timer pro Instanz.
-- Meldet Last.fm einen Katalogeintrag ausdruecklich als nicht gefunden, wird er
-  als leere Kandidatenliste behandelt und hoechstens eine Stunde gecacht.
-  Andere Anfragefehler bleiben Fehler; die Diagnose nennt Methode und sicheren
-  Fehlercode, nicht den API-Key oder die rohe Last.fm-Fehlermeldung.
-- Maximal 50 Kandidaten je Abfrage, keine Katalogdurchlaeufe. Persoenliche
-  Vorschlaege verwenden hoechstens drei Ausgangspunkte; das Genreprofil wertet
-  maximal zehn Kuenstler mit je fuenf bereinigten Tags aus. Wie beim offiziellen
-  Similar-Resolver gilt pro Aufloesung ein Ziel von zehn Medien und ein Abbruch
-  nach zehn erfolglosen Versuchen. Jede Quellsuche fragt zwei Treffer an; maximal
-  fuenf Aufloesungsaufrufe laufen gleichzeitig. Es gibt kein Sechser-Suchbudget
-  und keine breite Kuenstlersuche. Vorhandene Treffer werden zuerst gelesen;
-  neue Suchen fuellen nur das noch fehlende Ziel auf. Streaming-Treffer,
-  abgeschlossene Suchabfragen und voruebergehend gesperrte Quellen werden
-  innerhalb desselben nutzergebundenen Refreshs wiederverwendet.
-  Bestaetigte Fehltreffer werden beim naechsten Durchlauf uebersprungen,
-  sodass weitere Kandidaten geprueft werden koennen. Dubletten verbrauchen
-  ebenfalls das Fehlversuchsbudget, werden aber nicht als Fehltreffer gecacht.
-  Nicht aufloesbare Medien entfallen; Reihen koennen kuerzer oder leer sein.
-- Alle Enhanced-Instanzen teilen ein lokales Limit von fuenf Last.fm-Requests
-  pro Sekunde. Last.fm kann strengere Limits setzen. Bei Rate Limits gilt ein
-  gemeinsamer Cooldown von mindestens 60 Sekunden bzw. einem laengeren `Retry-After`.
-- Oeffentliche Antworten werden im MA-Cache gespeichert: Charts sechs Stunden,
-  Aehnlichkeit und Kuenstler-Tags sieben Tage, weitere Listen einen Tag.
-  Last.fm-Cache-Vorgaben haben Vorrang; die Antwortnutzlast ist auf 32 MiB begrenzt.
-  Vorbereitete persoenliche Ergebnisse bleiben an den ausgewaehlten MA-Nutzer gebunden.
-- Aufgeloeste Medien werden im MA-Cache 90 Tage gespeichert, bestaetigte
-  Fehltreffer einen Tag. Die Schluessel enthalten Nutzer und sichtbare Quellen;
-  gespeicherte Treffer werden erneut auf Verfuegbarkeit geprueft.
-  Ladende Provider, Rate Limits und sonstige unvollstaendige Aufloesungen
-  erzeugen keinen negativen Cache-Eintrag.
-- Rediscovery gleicht maximal 500 historische mit 500 aktuellen Tracks ab.
-  Erreicht die aktuelle Rotation diese Grenze, bleibt die Reihe leer.
-- Playlists sind dynamisch, nicht editierbar und enthalten hoechstens 50 Tracks.
-  Sie werden nicht als dauerhafte MA-Playlists angelegt; Links koennen bei
-  geaendertem Profil oder geaenderter Auswahl ungueltig werden.
-- Last.fm-Rankings sind keine Verkaufscharts. Albumreihen sind abgeleitete
-  Auswahlen; Mood- und Jahrzehnt-Tags garantieren weder Audioeigenschaften noch
-  exakte Veroeffentlichungsjahre.
-- Genregewichte kombinieren persoenliche Kuenstlergewichte mit pro Kuenstler
-  normalisierten Last.fm-`count`-Werten; fehlende oder ungueltige Werte nutzen die
-  Tag-Rangfolge. Nullgewichte entfallen. Bekannte Nicht-Genre-Tags werden entfernt,
-  Synonyme zusammengefuehrt und Subgenres erhalten. Community-Tags sind trotzdem
-  keine gepruefte Genre-Taxonomie und ihre Gewichte keine Wahrscheinlichkeiten.
+Es gelten die [Last.fm-API-Nutzungsbedingungen](https://www.last.fm/api/tos).
+Last.fm liefert keine Streamingrechte; Audio stammt aus den MA-Musikquellen.
 
-Es gelten die [Last.fm-API-Nutzungsbedingungen](https://www.last.fm/api/tos),
-insbesondere fuer Attribution und kommerzielle Nutzung. Last.fm liefert keine
-Streamingrechte; Audio wird ausschliesslich ueber die eingerichteten MA-Quellen abgespielt.
+## Folder und Herleitung
 
-## Folder
+MA-`week` umfasst die letzten 7 Tage, MA-`month` die letzten 30 Tage ab dem
+Hintergrundaufbau, keine Kalenderperioden. MA-Tracks und MA-Kuenstler umfassen
+auch Medienidentitaeten von Streaming-Anbietern. Ihre Hoerdaten und Favoriten
+stammen aus MA; Tags und Listenraenge aus Last.fm, wie in der Tabelle angegeben.
+Rotationsausschluss entfernt Identitaeten aus bis zu 500 MA-Monats-Top-Items.
 
-`weekly` bzw. MA-`week` bezeichnet die letzten 7 Tage, `monthly` bzw. MA-`month`
-die letzten 30 Tage, jeweils rueckwaerts vom Zeitpunkt des Hintergrundaufbaus.
-Es sind keine Kalenderwochen oder Kalendermonate; aktuelle und vorherige
-Kalenderperioden werden deshalb nicht zusammengelegt. Bis zum naechsten
-taeglichen Refresh bleibt das vorbereitete Zeitfenster unveraendert.
-Die drei Toplisten nutzen ausschliesslich die letzten 30 Tage;
-die Ausgangspunkte fuer persoenliche Empfehlungen kombinieren
-dagegen mehrere Zeitraeume, auch bei Folder-IDs mit dem Suffix `monthly`.
+**MA-Seedgewichtung:** Der Hoerscore der MA-Tracks bzw. MA-Kuenstler ist
+`MA-Monats-Plays + 2 * MA-Wochen-Plays + 0.1 * MA-Allzeit-Plays`.
+Die Scores werden durch den hoechsten Score der Auswahl auf 0 bis 1 normalisiert;
+bei Maximum 0 bleiben sie 0. Danach kommen fuer MA-Favoriten 0.2 hinzu.
+MA-Favoriten ohne Plays erhalten damit 0.2; der MA-Seedscore kann 1.2 erreichen.
+Nur verfuegbare, eindeutige MA-Medien werden als Seeds verwendet.
 
-**Track-Seeds** kombinieren jeweils bis zu 50 MA-Top-Tracks aus `month`, `week`
-und `all_time` mit bis zu 50 als Favorit markierten MA-Tracks des ausgewaehlten
-Nutzers. **Kuenstler-Seeds** verwenden entsprechend MA-Top-Kuenstler und
-Kuenstler-Favoriten. Das Gewicht pro MA-Identitaet ist
-`Monats-Plays + 2 * Wochen-Plays + 0.1 * Allzeit-Plays + 5 bei Favorit`.
-Die Zeitfenster ueberlappen absichtlich; aktuelle Plays wirken dadurch staerker.
-Der Favoritenbonus ist ein Empfehlungsgewicht, keine zusaetzliche Wiedergabe.
-Auch Favoriten ohne Plays koennen beitragen. Nur verfuegbare Ausgangspunkte
-werden beruecksichtigt; fuer normale Empfehlungen bleiben die drei staerksten
-eindeutigen Seeds, fuer das Genreprofil bis zu zehn Kuenstler.
-Fuer Track-Seeds ohne vollstaendige Credits werden hoechstens drei konkrete
-MA-Medienidentitaeten ueber den Mediencontroller geladen, ohne automatische
-Metadatenupdates oder eine namensbasierte Bibliotheksvorabpruefung.
+**MA-Track-Seeds** kombinieren MA-Top-Tracks aus `month`, `week` und `all_time`
+mit MA-Track-Favoriten. Die MA-Seedgewichtung bestimmt die Reihenfolge.
+**MA-Kuenstler-Seeds** entstehen entsprechend aus MA-Top-Kuenstlern und
+MA-Kuenstler-Favoriten. Die Anzahl der verwendeten Seeds steht je Sammlung
+in der Tabelle.
 
-Last.fm liefert in diesem Provider keine persoenliche Hoerhistorie: es wird kein
-Last.fm-Benutzername verwendet. Die verwendeten Charts-, Tag-, Top- und
-Aehnlichkeitsendpunkte bieten keinen frei waehlbaren 7-/30-Tage-Zeitraum.
-Insbesondere beschreibt Last.fm `geo.getTopTracks` als Charts der letzten Woche.
-Ohne abrufbare historische Zeitgrenzen lassen sich dort weder rollierende
-Fenster noch zwei benachbarte Kalenderperioden verlaesslich zusammensetzen.
+**Seed-Wiederholungen:** In den Ergebnissen seedbasierter Empfehlungen duerfen MA-Seed-Medien
+hoechstens 20% des jeweiligen Ergebnismaximums belegen, unabhaengig von der
+tatsaechlichen Listenlaenge. Auch kuerzlich gehoerte Medien bleiben zulaessig.
+Nur dieselben Medien zaehlen, nicht andere Tracks oder Alben eines Kuenstler-Seeds.
 
-Track-Favoriten fliessen nur in `user_recommendations` ein. Kuenstler-Favoriten
-fliessen in Kuenstler-Seeds und darueber in persoenliche Kuenstler- und Album-
-Empfehlungen sowie `user_genre_playlists_monthly`, `user_genre_artists_{genre_key}`
-und `user_related_genre_playlists` ein. Die drei Explore-Genre-Familien verwenden keine
-persoenlichen Seeds oder Favoriten. Track-Favoriten werden nicht als
-Kuenstler-Favoriten umgedeutet; Album-Favoriten werden nirgends separat gewichtet.
-Die Auswahl eines Favoriten legt keine neuen Bibliotheksobjekte an.
+**Last.fm-Aehnlichkeitsgewichtung:** In Empfehlungen erhaelt ein Last.fm-Treffer
+`MA-Seedscore * Last.fm-match`. Artist-Matches werden direkt verwendet;
+Track-Matches werden je Antwort auf deren staerksten gueltigen Match normalisiert,
+damit unterschiedliche Last.fm-Skalen das MA-Seedgewicht nicht ueberlagern.
+Bei ausschliesslich 0 bleiben die Matches 0. Fuer fehlende oder ungueltige Matches
+ersetzt `1 / Last.fm-Listenrang` den Match, nicht aber fuer einen gueltigen Match 0.
+Beitraege gleicher Treffer werden addiert,
+die fertigen Summen normalisiert und absteigend sortiert. Der geerbte
+MA-Favoritenbonus wird nicht erneut addiert.
 
-**Genreprofil** bedeutet hier ausschliesslich die Last.fm-Tags der Kuenstler-Seeds,
-keine MA-Genrestatistik oder MA-Genrezuordnung. Je Kuenstler werden die ersten
-20 `artist.getTopTags` geprueft und bis zu fuenf bereinigte, eindeutige Genre-Tags
-behalten. Gueltige `count`-Werte werden relativ zum staerksten Tag gewichtet;
-fehlende oder ungueltige Werte verwenden `1 / Listenrang`. Nullgewichte entfallen.
-Diese Gewichte werden pro Kuenstler auf Summe eins normalisiert, mit dessen
-persoenlichem Seed-Gewicht multipliziert und pro Genre ueber Kuenstler addiert.
-Die drei staerksten Genres bestimmen die persoenlichen Genre-Reihen und Playlists;
-die sechs Hauptprofil-Genres werden beim Ausschluss verwandter Genres beruecksichtigt.
-Fuer verwandte Genres
-wird je einem der drei staerksten Kuenstler ein Last.fm-Nachbar zugeordnet:
-dessen Tags erben das Ausgangskuenstlergewicht. Bereits im Hauptprofil enthaltene
-Genres entfallen; bis zu drei weitere bleiben. `{genre_key}` ist ein stabiler
-Hash des normalisierten Tags, nicht dessen wechselnder Rang.
+**Zufallsauswahl ohne Quoten:** Bei Empfehlungs- und Entdeckungslisten bilden die
+besten `min(3 * Ergebnismaximum, vorhandene Kandidaten)` nach der jeweiligen
+Gewichtung den Auswahlpool. Diesen zufaellig mischen und bis zum Ergebnismaximum
+aufloesen. Charts und MA-Meistgehoert-Reihen behalten dagegen ihre Rangfolge.
+Bei Rediscovery erst den Monats-Ausschluss anwenden, dann bis zu 50 Tracks zufaellig
+aus den besten 150 verbleibenden historischen Tracks auswaehlen.
+Die vorbereitete Auswahl bleibt bis zum naechsten erfolgreichen Aufbau unveraendert;
+Zufall reduziert Wiederholungen, garantiert aber keine anderen Ergebnisse.
 
-**Explore-Genres** stammen dagegen nur aus den globalen Last.fm-Top-Tags:
-`chart.getTopTags` liefert eine Seite mit hoechstens 50 Tags. Bekannte Nicht-Genre-
-Tags werden entfernt, Synonyme dedupliziert und die ersten bis zu 20 verbleibenden
-Tags in Last.fm-Reihenfolge fuer Playlists, Album- und Kuenstlerreihen verwendet.
-Keine persoenlichen Gewichte, kein Rotationsausschluss, kein Rueckfall auf
-Lieblingsgenres bei leerer Quelle. Last.fm bietet keinen dokumentierten
-Laender-Top-Tags-Endpunkt; die Geo-API liefert nur Top-Kuenstler und Top-Tracks.
-Die globale Auswahl benoetigt daher keine Laenderableitung oder eigene Genreliste.
-Folder- und Playlist-IDs tragen ihren Geltungsbereich als Praefix: `user_` fuer
-persoenliche Auswahlen, `global_` fuer weltweite oder allgemein nutzerunabhaengige
-Auswahlen und `de_` fuer Deutschland. Einzelne Explore-Playlists verwenden
-`global_genre_playlist_{genre_key}`, verwandte persoenliche Genre-Playlists
-`user_related_genre_playlist_{genre_key}`.
+**Persoenliche Kuenstler-Playlists:** Die MA-Seedgewichtung bestimmt die Playlist-Auswahl.
+Innerhalb jeder Playlist bestimmen gueltige Last.fm-`match`-Scores die Beitraege;
+der Seed selbst erhaelt Score 1. Eindeutige Kuenstler absteigend nach Score bearbeiten,
+ohne zusaetzliche Kuenstlergrenze. Die Trackquote ist
+`max(1, ceil(50 * Kuenstlerscore / Summe der Kuenstlerscores))`.
+Erst fuer den aktuellen Kuenstler dessen Last.fm-Top-Tracks abrufen, die besten
+`min(3 * Trackquote, 25)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen.
+Danach erst den naechsten Kuenstler abfragen; bei 50 Tracks sofort stoppen.
+Die Quote ist eine Obergrenze, kein garantierter Beitrag, und wird nicht ueberschritten.
+Der Auswahlpool begrenzt den Beitrag eines Kuenstlers auf hoechstens 25 Tracks.
+Die fertige Playlist nochmals zufaellig mischen. Kein eigener MA-Track-Favoritenbonus.
 
-**Mood-Auswahl:** Die vier bestehenden Kategorien Relaxation (`chillout`),
-Concentration (`ambient`), Energy (`energetic`) und Melancholy (`melancholic`)
-bleiben erhalten. Zusaetzlich gibt es sechs an Deezer Flow orientierte Kategorien:
-Love/Liebe (`love`), Motivation (`workout`), Chill (`chill`), Sad/Traurigkeit (`sad`),
-Focus/Fokus (`focus`) und Party (`party`). Der neue Focus-Eintrag verwendet den
-Schluessel `focused`, damit die bestehende Concentration-Playlist mit Schluessel
-`focus` unveraendert bleibt. Insgesamt entstehen zehn feste Mood-Playlists;
-deren Tracks werden weiterhin dynamisch aus Last.fm-Tags geladen. Das ist eine
-eigene Tag-Zuordnung, keine Deezer-Flow-Anbindung oder identische Mood-Klassifikation.
-Ein Deezer-Konto wird nicht benoetigt.
+**Globale Kuenstler-Radios:** Der Chart-Ausgangskuenstler erhaelt Score 1;
+hoechstens 2 eindeutige Nachbarn werden nach Last.fm-Match ausgewaehlt.
+Fuer fehlende Matches gilt der Listenrang-Ersatz. Erst nach dieser Auswahl
+Trackquoten aus der Summe der ausgewaehlten Scores berechnen. Zufallsauswahl,
+sequenzielle Aufloesung und abschliessendes Mischen wie bei den persoenlichen
+Kuenstler-Playlists; keine zusaetzlichen Kuenstler-Abfragen.
 
-**Darstellung und Bilder:** 17 der 24 Familien liefern Tracks, Kuenstler oder
-Alben direkt unter ihrer Sammlungsueberschrift, ohne zusaetzliche Ordnerkachel.
-Ihre Originalbilder bleiben unveraendert. `user_recommended_album` zeigt das
-Album samt Tracks direkt mit seinem Originalcover.
+**Persoenliches Genreprofil:** MA-Kuenstler-Seeds liefern Last.fm-Tags aus
+`artist.getTopTags`, aus denen bereinigte Genres ausgewaehlt werden.
+Last.fm-counts oder ersatzweise `1 / Last.fm-Tagrang` bestimmen die Taggewichte.
+Diese werden je Kuenstler auf Genreanteile mit Summe 1 verteilt und mit dessen
+MA-Seedscore multipliziert. Beitraege je Genre addieren und normalisieren;
+die staerksten Genres bestimmen die persoenlichen Genre-Reihen und Playlists.
 
-Die sieben Playlist-Bereiche sind `user_genre_playlists_monthly`,
-`user_artist_playlists_monthly`, `global_genre_playlists`,
-`global_artist_radio_playlists`, `user_related_genre_playlists`,
-`global_mood_playlists` und `global_decade_playlists`. Diese enthalten die
-einzelnen Playlists ohne weitere Zwischenordner. Jede Playlist bekommt eine
-2x2-Collage aus bis zu vier unterschiedlichen Bildern ihrer vorbereiteten
-Tracks, einschliesslich vorhandener Albumcover. Fehlende Kacheln erhalten
-neutrale Platzhalter; fehlgeschlagene Bilder und Duplikate werden uebersprungen.
-Pro Playlist werden hoechstens acht unterschiedliche Bildquellen versucht.
+**Verwandtes Genreprofil:** Je Ausgangskuenstler den staerksten Last.fm-Nachbarn
+aus `artist.getSimilar` auswaehlen. Er erhaelt `MA-Seedscore * Last.fm-match`
+mit dem beschriebenen Listenrang-Ersatz. Seine Last.fm-Tags werden wie im
+persoenlichen Genreprofil gewichtet. Hauptprofil-Genres entfallen;
+die staerksten verbleibenden Genres werden ausgewaehlt.
 
-Wie bei der ListenBrainz-Recommendations-Vorlage liegt oben ein schwarzer
-Titel-Einschub mit geschwungener Unterkante: links gross `Genre`, `Kuenstler`,
-`Radio`, `Stimmung` oder `Jahrzehnt`, rechts kleiner der zugehoerige Genre-,
-Kuenstler-, Mood- oder Jahrzehntname. Lange Namen werden passend zur verfuegbaren
-Pixelbreite gekuerzt, nicht ueber andere Beschriftungen gelegt.
+**Persoenliche Album-Auswahl:** MA-Kuenstler-Seeds inklusive MA-Kuenstler-Favoriten
+liefern Last.fm-Nachbarn aus `artist.getSimilar`. Jeder Seed erhaelt fuer sich selbst
+Match 1; Nachbarn erhalten den Last.fm-Match mit dem beschriebenen Listenrang-Ersatz.
+Je Seed gleiche Kuenstler nur einmal beruecksichtigen und Beitraege aus
+`MA-Seedscore * Match` seeduebergreifend addieren. Alle Kuenstler absteigend nach
+Gesamtscore bearbeiten, ohne Begrenzung auf 3 Albumquellen.
+Die Albumquote ist `max(1, ceil(Ergebnismaximum * Kuenstlerscore / Summe der Kuenstlerscores))`.
+Erst fuer den aktuellen Kuenstler `artist.getTopAlbums` abrufen, dessen beste
+`min(3 * Albumquote, 10)` Alben als Auswahlpool zufaellig mischen und daraus
+bis zur Albumquote eindeutige Alben auf MA-Quellen aufloesen.
+Die Quote ist eine Obergrenze, kein garantierter Beitrag; ein erschoepfter Pool beendet
+die Auswahl fuer diesen Kuenstler.
+Bei 35 Alben stoppen; die fertige Auswahl zufaellig mischen.
+Es gibt keine eigenen MA-Album-Seeds, Albumscores oder MA-Album-Favoritenboni.
 
-Die gemeinsame MA-Bildbeschaffung nutzt vorhandene Bildcaches. Die Collagen
-werden nur beim taeglichen Refresh erzeugt, ausserhalb der Ereignisschleife
-gerendert und atomar im instanzbezogenen MA-Bildcache gespeichert. Listen-,
-Playlist- und Bildabrufe bauen keine Collagen neu. Die Bildaufloesung prueft
-Nutzersichtbarkeit, Instanzzugehoerigkeit und Pfadsicherheit. Aktuelle und
-vorherige Covergeneration bleiben erhalten; aeltere eigene Dateien werden
-bereinigt. Ein fehlgeschlagener oder abgebrochener Build veroeffentlicht keine
-unvollstaendige neue Sammlung.
+**Alben beliebter Kuenstler:** Bis zu 10 staerkste Chart-Kuenstler bilden die Quellen.
+Jeder erhaelt die gleiche Albumquote `ceil(35 / Anzahl der Quellen)`.
+Je Kuenstler die besten `min(3 * Albumquote, 10)` Alben zufaellig mischen und bis
+zur Quote aufloesen; erst danach den naechsten Kuenstler abfragen. Bei 35 Alben stoppen
+und die fertige Auswahl nochmals mischen. Keine persoenlichen Scores oder Favoritenboni.
 
-**Ergebnisaufbereitung:** Bei vorhandener MusicBrainz-ID wird zuerst die
-oeffentliche MBID-Aufloesung des MA-Mediencontrollers verwendet. Diese kann
-ein passendes Bibliotheksobjekt liefern oder ueber MusicBrainz einen
-Streaming-Anbieter aufloesen. Liefert sie keinen passenden Treffer, folgt
-die Namenssuche auf den sichtbaren Streaming-Quellen. Es gibt keine direkte
-Abhaengigkeit von einem anderen Provider und keine ausschliessliche
-Bibliotheksaufloesung. Titel mit und ohne vorangestelltem
-Kuenstler werden geprueft; exakte normalisierte Titel haben Vorrang vor
-unscharfen Treffern. Falsche Kuenstler, fehlende Credits und widerspruechliche
-MusicBrainz-IDs werden nicht akzeptiert. Das ist keine Favoritengewichtung.
-Nicht aufloesbare Kandidaten entfallen. Die Diagnose nennt Kandidaten,
-aufgeloeste Medien, Suchverbrauch, Fehlversuche und Zielgrenze,
-fehlende Kuenstler, nicht aufgeloeste Kandidaten und Dubletten. Der Monatsfilter
-protokolliert separat die Zahl entfernter Medien; Bibliothekszaehler entfallen.
-`Rotation ausschliessen` bedeutet: bereits in den bis zu 500 MA-Top-Items des
-jeweiligen Medientyps aus `month` enthaltene Identitaeten werden entfernt,
-nicht nur nach hinten sortiert. Rediscovery verwendet die verfuegbaren
-Track-Identitaeten aus der MA-Historie, auch von Streaming-Anbietern,
-ohne erneute Namensaufloesung oder Streaming-Suche. Die Zahl konkreter Genre-
-Reihen haengt von persoenlichen Tags bzw. globalen Explore-Tags ab; Mood- und
-Jahrzehnt-Auswahlen bleiben fest. Sichtbarkeit und verfuegbare Wiedergabequellen
-bleiben an den ausgewaehlten MA-Nutzer gebunden, auch fuer allgemeine Explore-Reihen.
+**Last.fm-Abfragen und Auffuellen:** Last.fm-Abfragen senden `limit=50`, ausser
+Taglisten fuer die groesseren Zufallspools: `tag.getTopTracks` bis zu 150,
+`tag.getTopArtists` bis zu 75 und `tag.getTopAlbums` bis zu 105 Kandidaten.
+Je benoetigter Liste bleibt es bei einer gecachten, gedrosselten Anfrage ohne Paging.
+Lokale Auswahlgrenzen fuer Genres und Ausgangskuenstler bleiben bestehen.
+Kandidaten werden in ihrer vorbereiteten Rangfolge einzeln auf MA-Quellen
+aufgeloest. Fehlende, doppelte oder ausgeschlossene Treffer lassen den naechsten
+Kandidaten nachruecken. Die Aufloesung endet beim Ergebnismaximum oder einem
+erschoepften Kandidatenpool, nicht nach einer festen Anzahl fehlender Treffer.
+Rate Limits und voruebergehende Quellenfehler bleiben vom normalen Nachruecken getrennt.
 
 | Folder-ID | Titel | Inhalt | Herleitung |
 | --- | --- | --- | --- |
-| `user_recommendations` | Track-Empfehlungen | Persoenlich empfohlene Tracks. | Drei Track-Seeds inklusive Track-Favoriten; je bis zu 20 `track.getSimilar`. Kandidatengewicht = Summe `Seed-Gewicht / Listenrang`; gemeinsame Treffer addieren, Seed-Namen entfernen und Track-Rotation ausschliessen. |
-| `user_genre_playlists_monthly` | Deine Genre-Playlists | Playlists der drei staerksten persoenlichen Genres. | Genreprofil aus Kuenstler-Seeds inklusive Kuenstler-Favoriten; je Genre bis zu 50 `tag.getTopTracks`. Track-Rotation ausschliessen, maximal fuenf Tracks pro Kuenstler; keine zusaetzliche Favoritengewichtung der Tracks. |
-| `user_top_artists_monthly` | Deine meistgehoerten Kuenstler | Kuenstler-Ranking der letzten 30 Tage. | Nur MA-`statistics/top_items`, `media_type=artist`, `period=month`, bis zu 50. Play-Rangfolge erhalten, unverfuegbare und doppelte Identitaeten entfernen; keine Favoritenboni oder Last.fm-Daten. |
-| `user_top_tracks_monthly` | Deine meistgehoerten Tracks | Track-Ranking der letzten 30 Tage. | Nur MA-`statistics/top_items`, `media_type=track`, `period=month`, bis zu 50. Play-Rangfolge erhalten, unverfuegbare und doppelte Identitaeten entfernen; keine Favoritenboni oder Last.fm-Daten. |
-| `user_artist_recommendations` | Kuenstler-Empfehlungen | Passende, bislang weniger gehoerte Kuenstler. | Drei Kuenstler-Seeds inklusive Kuenstler-Favoriten; je bis zu 20 `artist.getSimilar`. Kandidatengewicht = Summe `Seed-Gewicht / Listenrang`; gemeinsame Treffer addieren, Seed-Namen entfernen und Kuenstler-Rotation ausschliessen. |
-| `user_artist_playlists_monthly` | Deine Kuenstler-Playlists | Dynamische Playlists wie Featuring Radiohead. | Je einer der drei Kuenstler-Seeds inklusive Kuenstler-Favoriten plus bis zu zwei `artist.getSimilar`-Nachbarn; je bis zu 20 `artist.getTopTracks`. Listen reihum mischen und deduplizieren, Track-Rotation ausschliessen; keine separate Einspeisung von Track-Favoriten. |
-| `user_album_recommendations` | Album-Empfehlungen | Zum persoenlichen Geschmack passende Alben. | Drei Kuenstler-Seeds inklusive Kuenstler-Favoriten liefern je bis zu drei `artist.getSimilar`-Nachbarn. Staerksten Seed, danach Nachbarn, danach weitere Seeds priorisieren; hoechstens drei eindeutige Kuenstler. Je bis zu 20 `artist.getTopAlbums` reihum mischen, auf 50 begrenzen und Album-Rotation ausschliessen. Keine Album-Favoritenboni. |
-| `user_top_albums_monthly` | Deine meistgehoerten Alben | Album-Ranking der letzten 30 Tage. | Nur MA-`statistics/top_items`, `media_type=album`, `period=month`, bis zu 50; beruht auf MA-Zuordnungen gehoerter Tracks zu Alben. Play-Rangfolge erhalten; keine Album-Favoritenboni oder Last.fm-Daten. |
-| `user_rediscovery_tracks` | Lange nicht gehoert | Frueher haeufig gehoerte Tracks ausserhalb der aktuellen Rotation. | Ohne Favoriten oder Last.fm: bis zu 500 MA-Allzeit-Top-Tracks minus bis zu 500 Monats-Top-Tracks nach URI. Erste 50 verfuegbare historische Kandidaten in Allzeit-Rangfolge; nur lokal aufloesbare Track-Identitaeten behalten. Bei 500 Monats-Treffern leer. |
-| `user_genre_artists_{genre_key}` | Kuenstler aus deinem Lieblingsgenre: {Genre} | Kuenstler eines persoenlichen Schwerpunktgenres. | Eines der drei staerksten Genres aus Kuenstler-Seeds inklusive Kuenstler-Favoriten; bis zu 50 `tag.getTopArtists`. Drei Kuenstler-Seeds geben eigenen Treffern ihr Seed-Gewicht, je bis zu 20 `artist.getSimilar`-Nachbarn `Seed-Gewicht / Listenrang`; Gewichte addieren, nur innerhalb der Genre-Kandidaten sortieren und Kuenstler-Rotation ausschliessen. |
-| `global_top_tracks` | Track-Charts weltweit | Bis zu 50 bestplatzierte Last.fm-Tracks. | Nur `chart.getTopTracks`; Last.fm-Reihenfolge erhalten und auf MA-Quellen aufloesen. Keine persoenliche History, Favoritenboni oder Rotationsausschluesse. |
-| `de_top_tracks` | Track-Charts Deutschland | Bis zu 50 bestplatzierte Tracks unter deutschen Last.fm-Hoerern. | Nur `geo.getTopTracks`, `country=Germany`; laut API-Dokumentation letzte Woche. Last.fm-Reihenfolge erhalten; keine persoenliche History, Favoritenboni oder Rotationsausschluesse. |
-| `global_top_artists` | Kuenstler-Charts weltweit | Weltweit beliebte Kuenstler. | Nur `chart.getTopArtists`, bis zu 50; Last.fm-Reihenfolge erhalten. Keine persoenliche History, Favoritenboni oder Rotationsausschluesse. |
-| `de_top_artists` | Kuenstler-Charts Deutschland | In Deutschland beliebte Kuenstler. | Nur `geo.getTopArtists`, `country=Germany`, bis zu 50; Last.fm-Reihenfolge erhalten. Keine persoenliche History, Favoritenboni oder Rotationsausschluesse. |
-| `global_popular_artist_albums` | Alben weltweit beliebter Kuenstler | Allgemeine Albumauswahl, keine Albumcharts. | Drei Kuenstler aus `chart.getTopArtists`; je bis zu 20 `artist.getTopAlbums` reihum mischen und deduplizieren, insgesamt bis zu 50. Keine persoenliche History, Favoritenboni oder Rotationsausschluesse. |
-| `de_popular_artist_albums` | Alben in Deutschland beliebter Kuenstler | Albumauswahl anhand des deutschen Kuenstler-Rankings. | Drei Kuenstler aus `geo.getTopArtists`, `country=Germany`; je bis zu 20 `artist.getTopAlbums` reihum mischen und deduplizieren, insgesamt bis zu 50. Keine persoenliche History, Favoritenboni oder Rotationsausschluesse. |
-| `global_genre_playlists` | Genre-Playlists entdecken | Playlists globaler Explore-Genres und Subgenres. | Bis zu 20 bereinigte, eindeutige globale `chart.getTopTags`; je bis zu 50 `tag.getTopTracks`, maximal fuenf Tracks pro Kuenstler. Keine persoenlichen Seeds, History, Favoritenboni oder Rotationsausschluesse. |
-| `global_genre_albums_{genre_key}` | {Genre}: Alben entdecken | Albumreihe eines globalen Explore-Genres. | Gleiche globale Tag-Auswahl wie `global_genre_playlists`; je bis zu 50 `tag.getTopAlbums` in Last.fm-Reihenfolge. Keine persoenlichen Seeds, History, Favoritenboni oder Rotationsausschluesse. |
-| `global_genre_artists_{genre_key}` | {Genre}: Kuenstler entdecken | Kuenstlerreihe eines globalen Explore-Genres. | Gleiche globale Tag-Auswahl wie `global_genre_playlists`; je bis zu 50 `tag.getTopArtists` in Last.fm-Reihenfolge. Keine persoenlichen Seeds, History, Favoritenboni oder Rotationsausschluesse. |
-| `global_artist_radio_playlists` | Kuenstler-Radios | Mehrkuenstler-Playlists wie Radiohead & aehnliche Kuenstler. | Drei Kuenstler aus `chart.getTopArtists`, je mit bis zu zwei `artist.getSimilar`-Nachbarn; je Kuenstler bis zu 20 `artist.getTopTracks` reihum mischen und deduplizieren. Keine persoenlichen Seeds, Favoritenboni oder Rotationsausschluesse. |
-| `user_related_genre_playlists` | Verwandte Genre-Playlists | Genres nahe am persoenlichen Geschmack. | Last.fm-Tags je eines Nachbarn der drei staerksten Kuenstler-Seeds inklusive Kuenstler-Favoriten erben deren Seed-Gewicht. Hauptprofil-Genres entfernen, drei weitere Genres waehlen; je bis zu 50 `tag.getTopTracks`, Track-Rotation ausschliessen, maximal fuenf Tracks pro Kuenstler. |
-| `global_mood_playlists` | Stimmungs-Playlists | Vier bestehende und sechs Deezer-Flow-orientierte Mood-Kategorien. | Feste Last.fm-Tags `chillout`, `ambient`, `energetic`, `melancholic`, `love`, `workout`, `chill`, `sad`, `focus`, `party`; je bis zu 50 `tag.getTopTracks`, maximal fuenf Tracks pro Kuenstler. Keine persoenliche History, Favoritenboni, Genreprofil-Auswertung, Audioanalyse oder Deezer-Abfrage. |
-| `global_decade_playlists` | Jahrzehnt-Playlists | Etwa 80er, 90er und 2000er. | Feste Last.fm-Tags `1980s` bis `2020s`; je bis zu 50 `tag.getTopTracks`, maximal fuenf Tracks pro Kuenstler. Keine persoenliche History oder Favoritenboni; Tag-Zugehoerigkeit garantiert kein exaktes Veroeffentlichungsjahr. |
-| `user_recommended_album` | Album fuer dich | Ein Album mit seinen aufloesbaren Tracks in einer Reihe. | Gleiche Kuenstler-Seeds und Kuenstlerauswahl wie `user_album_recommendations`, inklusive Kuenstler-Favoriten. Nur den ersten reihum gewaehlten Albumkandidaten aufloesen und bei Album-Rotation verwerfen; falls vorhanden bis zu 50 Album-Tracks aus `album.getInfo` anhaengen. Kein Ersatzalbum bei Ausschluss, keine Album-Favoritenboni. |
+| `user_recommendations` | Track-Empfehlungen | Bis zu 50 persoenlich empfohlene Tracks. | Bis zu 15 MA-Track-Seeds inklusive MA-Favoriten; je bis zu 50 Last.fm-Treffer aus `track.getSimilar`, nach Last.fm-Aehnlichkeitsgewichtung sortiert. Eindeutige Kandidaten als Zufallspool vorbereiten und auf MA-Quellen aufloesen. |
+| `user_genre_playlists_monthly` | Deine Genre-Playlists | Bis zu 10 Playlists der staerksten persoenlichen Genres mit je bis zu 50 Tracks. | Bis zu 15 MA-Kuenstler-Seeds mit je maximal 5 bereinigten Last.fm-Genres; staerkste Genres nach Genregewicht auswaehlen. Bis zu 150 Tracks aus `tag.getTopTracks` nach normalisiertem Listenrang plus 0.2 MA-Track-Favoritenbonus als Zufallspool vorbereiten; maximal 10 Tracks pro Kuenstler. |
+| `user_top_artists_monthly` | Deine meistgehoerten Kuenstler | Bis zu 50 Kuenstler im Ranking der letzten 30 Tage. | Nur MA-`statistics/top_items`, `media_type=artist`, `period=month`. Play-Rangfolge erhalten, unverfuegbare und doppelte Identitaeten entfernen; keine Favoritenboni oder Last.fm-Daten. |
+| `user_top_tracks_monthly` | Deine meistgehoerten Tracks | Bis zu 50 Tracks im Ranking der letzten 30 Tage. | Nur MA-`statistics/top_items`, `media_type=track`, `period=month`. Play-Rangfolge erhalten, unverfuegbare und doppelte Identitaeten entfernen; keine Favoritenboni oder Last.fm-Daten. |
+| `user_artist_recommendations` | Kuenstler-Empfehlungen | Bis zu 25 passende, bislang weniger gehoerte Kuenstler. | Bis zu 10 MA-Kuenstler-Seeds inklusive MA-Favoriten; je bis zu 50 Last.fm-Treffer aus `artist.getSimilar`, nach Last.fm-Aehnlichkeitsgewichtung sortiert. Eindeutige Kandidaten als Zufallspool vorbereiten und auf MA-Quellen aufloesen. |
+| `user_artist_playlists_monthly` | Deine Kuenstler-Playlists | Bis zu 10 dynamische Kuenstler-Playlists mit je bis zu 50 Tracks, etwa Featuring Radiohead. | Bis zu 10 MA-Kuenstler-Seeds inklusive MA-Favoriten bestimmen die Playlists. Je Seed bis zu 50 Last.fm-Nachbarn aus `artist.getSimilar`; der Seed selbst erhaelt Score 1, Nachbarn ihren Match-Score. Daraus Trackquoten berechnen. Je benoetigtem Kuenstler bis zu 50 Tracks aus `artist.getTopTracks` abrufen, die besten `min(3 * Trackquote, 25)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen; bei 50 Tracks stoppen und die Playlist mischen. |
+| `user_album_recommendations` | Album-Empfehlungen | Bis zu 35 zum persoenlichen Geschmack passende Alben. | Bis zu 10 MA-Kuenstler-Seeds inklusive MA-Favoriten, je bis zu 50 Last.fm-Nachbarn. Kuenstler nach kombiniertem Seed-/Match-Score bearbeiten; je Kuenstler bis zur Albumquote zufaellig aus dessen besten `min(3 * Albumquote, 10)` Alben auswaehlen und auf MA-Quellen aufloesen. |
+| `user_top_albums_monthly` | Deine meistgehoerten Alben | Bis zu 50 Alben im Ranking der letzten 30 Tage. | Nur MA-`statistics/top_items`, `media_type=album`, `period=month`; beruht auf MA-Zuordnungen gehoerter Tracks zu Alben. Play-Rangfolge erhalten; keine Album-Favoritenboni oder Last.fm-Daten. |
+| `user_rediscovery_tracks` | Lange nicht gehoert | Bis zu 50 frueher haeufig gehoerte Tracks ausserhalb der aktuellen Rotation. | Nur MA-`statistics/top_items`, ohne MA-Favoritenbonus oder Last.fm: bis zu 500 MA-Allzeit-Top-Tracks minus bis zu 500 MA-Monats-Top-Tracks nach URI. Bis zu 50 zufaellig aus den besten 150 verbleibenden verfuegbaren historischen Track-Identitaeten waehlen. Bei 500 MA-Monats-Treffern leer. |
+| `user_genre_artists_{genre_key}` | Kuenstler aus deinem Lieblingsgenre: {Genre} | Bis zu 3 Reihen persoenlicher Schwerpunktgenres mit je bis zu 25 Kuenstlern. | Bis zu 15 MA-Kuenstler-Seeds inklusive MA-Favoriten mit je maximal 5 bereinigten Last.fm-Genres; die 3 staerksten Genres nach Genregewicht auswaehlen. Je Genre bis zu 75 Last.fm-Kandidaten aus `tag.getTopArtists`. Bis zu 3 MA-Kuenstler-Seeds erhalten ihren MA-Seedscore, je bis zu 50 Last.fm-Nachbarn aus `artist.getSimilar` die Last.fm-Aehnlichkeitsgewichtung. Beitraege addieren und normalisieren, nur die Genre-Kandidaten danach als Zufallspool vorbereiten; ohne Beitrag Score 0. Genregewicht nicht in den Kuenstlerscore einrechnen. Auf MA-Quellen aufloesen. |
+| `global_top_tracks` | Track-Charts weltweit | Bis zu 50 bestplatzierte Last.fm-Tracks. | Nur Last.fm `chart.getTopTracks`; Last.fm-Reihenfolge erhalten und auf MA-Quellen aufloesen. Keine persoenliche MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `de_top_tracks` | Track-Charts Deutschland | Bis zu 50 bestplatzierte Tracks unter deutschen Last.fm-Hoerern. | Nur Last.fm `geo.getTopTracks`, `country=Germany`; laut Last.fm-API-Dokumentation letzte Woche. Last.fm-Reihenfolge erhalten; keine persoenliche MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_top_artists` | Kuenstler-Charts weltweit | Bis zu 25 weltweit beliebte Kuenstler. | Nur Last.fm `chart.getTopArtists`, bis zu 50 Kandidaten; Last.fm-Reihenfolge erhalten. Keine persoenliche MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `de_top_artists` | Kuenstler-Charts Deutschland | Bis zu 25 in Deutschland beliebte Kuenstler. | Nur Last.fm `geo.getTopArtists`, `country=Germany`, bis zu 50 Kandidaten; Last.fm-Reihenfolge erhalten. Keine persoenliche MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_popular_artist_albums` | Alben weltweit beliebter Kuenstler | Bis zu 35 Alben, keine Albumcharts. | Bis zu 10 bestplatzierte Last.fm-Kuenstler aus `chart.getTopArtists` bestimmen die Albumquellen. Das Ergebnismaximum gleichmaessig auf die Kuenstler verteilen und zur Albumquote aufrunden. Je Kuenstler bis zu 50 Alben aus `artist.getTopAlbums` abrufen, die besten `min(3 * Albumquote, 10)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen; bei 35 Alben stoppen und die Auswahl mischen. Keine persoenliche MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `de_popular_artist_albums` | Alben in Deutschland beliebter Kuenstler | Bis zu 35 Alben anhand des deutschen Kuenstler-Rankings. | Bis zu 10 bestplatzierte Last.fm-Kuenstler aus `geo.getTopArtists` mit `country=Germany` bestimmen die Albumquellen. Das Ergebnismaximum gleichmaessig auf die Kuenstler verteilen und zur Albumquote aufrunden. Je Kuenstler bis zu 50 Alben aus `artist.getTopAlbums` abrufen, die besten `min(3 * Albumquote, 10)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen; bei 35 Alben stoppen und die Auswahl mischen. Keine persoenliche MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_genre_playlists` | Genre-Playlists entdecken | Bis zu 20 Playlists globaler Explore-Genres und Subgenres mit je bis zu 50 Tracks. | Bereinigte, eindeutige globale Last.fm-Tags aus `chart.getTopTags` auswaehlen; je Tag bis zu 150 Track-Kandidaten aus einer `tag.getTopTracks`-Abfrage als Zufallspool vorbereiten. Eindeutige Kandidaten mischen und bis zu 50 Tracks auf MA-Quellen aufloesen; fehlende Treffer durch weitere Kandidaten ersetzen. Keine Trackgrenze pro Kuenstler, persoenlichen MA-Seeds, MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_genre_albums_{genre_key}` | {Genre}: Alben entdecken | Bis zu 3 Reihen globaler Explore-Genres mit je bis zu 35 Alben. | Bis zu 3 bereinigte, eindeutige globale Last.fm-Genres in Rangfolge aus `chart.getTopTags` auswaehlen; je Genre bis zu 105 Last.fm-Alben aus `tag.getTopAlbums` als Zufallspool vorbereiten. Keine persoenlichen MA-Seeds, MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_genre_artists_{genre_key}` | {Genre}: Kuenstler entdecken | Bis zu 3 Reihen globaler Explore-Genres mit je bis zu 25 Kuenstlern. | Bis zu 3 bereinigte, eindeutige globale Last.fm-Genres in Rangfolge aus `chart.getTopTags` auswaehlen; je Genre bis zu 75 Last.fm-Kuenstler aus `tag.getTopArtists` als Zufallspool vorbereiten. Keine persoenlichen MA-Seeds, MA-History, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_artist_radio_playlists` | Kuenstler-Radios | Bis zu 15 Mehrkuenstler-Playlists mit je bis zu 50 Tracks, etwa Radiohead & aehnliche Kuenstler. | Bis zu 15 bestplatzierte Last.fm-Kuenstler aus `chart.getTopArtists` bestimmen die Playlists. Je Seed bis zu 50 Last.fm-Nachbarn aus `artist.getSimilar`; der Seed selbst erhaelt Score 1, Nachbarn ihren Match-Score. Daraus Trackquoten berechnen. Je benoetigtem Kuenstler bis zu 50 Tracks aus `artist.getTopTracks` abrufen, die besten `min(3 * Trackquote, 25)` zufaellig mischen und bis zur Quote auf MA-Quellen aufloesen; bei 50 Tracks stoppen und die Playlist mischen. Keine persoenlichen MA-Seeds, MA-Favoritenboni oder Rotationsausschluesse. |
+| `global_mood_playlists` | Stimmungs-Playlists | Bis zu 10 Stimmungs-Playlists mit je bis zu 50 Tracks. | Feste Last.fm-Tags `chillout`, `ambient`, `energetic`, `melancholic`, `love`, `workout`, `chill`, `sad`, `focus`, `party`; je bis zu 150 Last.fm-Tracks aus `tag.getTopTracks` als Zufallspool vorbereiten; keine Trackgrenze pro Kuenstler. Keine persoenliche MA-History, MA-Favoritenboni, Genreprofil-Auswertung, Audioanalyse oder Deezer-Abfrage. |
+| `global_decade_playlists` | Jahrzehnt-Playlists | Bis zu 5 Jahrzehnt-Playlists mit je bis zu 50 Tracks. | Feste Last.fm-Tags `1980s` bis `2020s`; je bis zu 150 Last.fm-Tracks aus `tag.getTopTracks` als Zufallspool vorbereiten; keine Trackgrenze pro Kuenstler. Keine persoenliche MA-History oder MA-Favoritenboni; Last.fm-Tag-Zugehoerigkeit garantiert kein exaktes Veroeffentlichungsjahr. |
 

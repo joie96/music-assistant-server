@@ -12,21 +12,25 @@ from music_assistant_models.enums import (
     ProviderStatus,
 )
 from music_assistant_models.errors import RateLimited, ResourceTemporarilyUnavailable
-from music_assistant_models.media_items import Artist, ItemMapping, Track, UniqueList
+from music_assistant_models.media_items import Album, Artist, ItemMapping, Track, UniqueList
 from music_assistant_models.statistics import TopItemResult
 
 from music_assistant.helpers.throttle_retry import ThrottlerManager
+from music_assistant.providers.lastfm_recommendations_enhanced import (
+    recommendations as recommendations_module,
+)
 from music_assistant.providers.lastfm_recommendations_enhanced.api_client import (
     LastFMAPIClient,
     LastFMItem,
 )
 from music_assistant.providers.lastfm_recommendations_enhanced.recommendations import (
     DISCOVERY_FOLDERS,
-    RESOLUTION_MISS_LIMIT,
-    RESOLUTION_TARGET_LIMIT,
+    RESOLUTION_TARGET_LIMITS,
     LastFMDiscovery,
     PersonalSeed,
     ResolutionState,
+    normalize_scores,
+    similarity_weights,
 )
 
 
@@ -34,6 +38,7 @@ from music_assistant.providers.lastfm_recommendations_enhanced.recommendations i
 def discovery(monkeypatch: pytest.MonkeyPatch) -> LastFMDiscovery:
     """Keep real media models; mock only API and controller boundaries."""
     monkeypatch.setattr(Artist, "available", property(lambda _item: True))
+    monkeypatch.setattr(Album, "available", property(lambda _item: True))
     monkeypatch.setattr(Track, "available", property(lambda _item: True))
     provider = Mock()
     provider.get_setup_value.return_value = "selected--1"
@@ -50,6 +55,69 @@ def discovery(monkeypatch: pytest.MonkeyPatch) -> LastFMDiscovery:
     controller.get = AsyncMock(return_value=None)
     controller.get_item_by_external_id = AsyncMock(return_value=None)
     return LastFMDiscovery(provider)
+
+
+@pytest.mark.parametrize(
+    ("normalize_matches", "expected"),
+    [(False, [10.95, 5.475, 0, 0.25]), (True, [1, 0.5, 0, 0.25])],
+)
+def test_similarity_weights_preserve_zero_and_normalize_only_explicit_matches(
+    normalize_matches: bool, expected: list[float]
+) -> None:
+    """Unknown scores use rank fallback; actual zero scores do not become rank contributions."""
+    items = [
+        LastFMItem("First", similarity_weight=10.95),
+        LastFMItem("Second", similarity_weight=5.475),
+        LastFMItem("Zero", similarity_weight=0),
+        LastFMItem("Unknown"),
+    ]
+    assert similarity_weights(items, normalize_matches=normalize_matches) == pytest.approx(expected)
+    assert similarity_weights([], normalize_matches=normalize_matches) == []
+    assert similarity_weights(
+        [LastFMItem("Zero", similarity_weight=0)], normalize_matches=normalize_matches
+    ) == [0]
+
+
+@pytest.mark.parametrize("folder_id", ["user_recommendations", "user_artist_recommendations"])
+async def test_similar_recommendations_aggregate_match_scores_and_personal_seed_weights(
+    discovery: LastFMDiscovery, folder_id: str
+) -> None:
+    """Match scores outrank list positions, and per-track response scales cannot dominate seeds."""
+    is_track = folder_id == "user_recommendations"
+    credit = "Related" if is_track else ""
+    discovery.get_seeds = AsyncMock(
+        return_value=[
+            PersonalSeed("First", "Seed" if is_track else "", weight=1),
+            PersonalSeed("Second", "Seed" if is_track else "", weight=0.2),
+        ]
+    )
+    first_scale = 100 if is_track else 1
+    second_scale = 10 if is_track else 1
+    discovery.provider.api.get_items.side_effect = [
+        [
+            LastFMItem("Rank first", credit, similarity_weight=0.1 * first_scale),
+            LastFMItem("Shared", credit, similarity_weight=0.9 * first_scale),
+            LastFMItem("Zero", credit, similarity_weight=0),
+            LastFMItem("Missing", credit),
+        ],
+        [
+            LastFMItem("Shared", credit, similarity_weight=0.5 * second_scale),
+            LastFMItem("Other", credit, similarity_weight=second_scale),
+        ],
+    ]
+    folder = next(folder for folder in DISCOVERY_FOLDERS if folder.item_id == folder_id)
+    candidates = await discovery._candidates(folder)
+    assert [candidate.name for candidate in candidates] == [
+        "Shared",
+        "Missing",
+        "Other",
+        "Rank first",
+        "Zero",
+    ]
+    assert discovery.provider.api.get_items.await_count == 2
+    assert all(
+        call.kwargs == {"limit": 50} for call in discovery.provider.api.get_items.await_args_list
+    )
 
 
 async def test_missing_track_is_resolved_on_a_visible_streaming_source(
@@ -76,10 +144,40 @@ async def test_missing_track_is_resolved_on_a_visible_streaming_source(
     controller.search.assert_awaited_once_with("Artist - Song", "stream--1", limit=2)
 
 
-async def test_resolution_stops_after_official_miss_limit(
+async def test_resolution_replaces_previously_accepted_tracks_without_consuming_target(
     discovery: LastFMDiscovery,
 ) -> None:
-    """Even a full external chart cannot trigger a search request for every entry."""
+    """A duplicate from an earlier artist leaves room for the next ranked candidate."""
+    artist = Artist(item_id="a", provider="library", name="Artist", provider_mappings=set())
+    tracks = [
+        Track(
+            item_id=str(index),
+            provider="library",
+            name=f"Song {index}",
+            artists=UniqueList([artist]),
+            provider_mappings=set(),
+        )
+        for index in range(3)
+    ]
+    discovery._get_cached_resolution = AsyncMock(side_effect=[(track, False) for track in tracks])
+    excluded_uri = tracks[0].uri
+    assert excluded_uri is not None
+    excluded = {excluded_uri}
+    result = await discovery.resolve_items(
+        [LastFMItem(track.name, artist.name) for track in tracks],
+        MediaType.TRACK,
+        max_items=1,
+        excluded_uris=excluded,
+    )
+    assert [track.uri for track in result] == [tracks[1].uri]
+    assert discovery._get_cached_resolution.await_count == 2
+    assert excluded == {excluded_uri}
+
+
+async def test_resolution_exhausts_bounded_candidates_when_all_items_are_missing(
+    discovery: LastFMDiscovery,
+) -> None:
+    """An empty result requires trying the complete bounded candidate list without paging."""
     source = Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
     source.supported_features = {ProviderFeature.SEARCH, ProviderFeature.LIBRARY_ARTISTS}
     discovery.provider.mass.music.providers = [source]
@@ -88,36 +186,62 @@ async def test_resolution_stops_after_official_miss_limit(
     assert not await discovery.resolve_items(
         [LastFMItem(f"Artist {index}") for index in range(50)], MediaType.ARTIST
     )
-    assert controller.search.await_count == RESOLUTION_MISS_LIMIT
+    assert controller.search.await_count == 50
 
 
-async def test_successful_streaming_resolution_is_not_limited_to_six_searches(
+@pytest.mark.parametrize(
+    ("media_type", "target_limit"),
+    [(MediaType.TRACK, 50), (MediaType.ALBUM, 35), (MediaType.ARTIST, 25)],
+)
+async def test_successful_streaming_resolution_uses_media_type_limit(
     discovery: LastFMDiscovery,
+    media_type: MediaType,
+    target_limit: int,
 ) -> None:
-    """Resolve the official target count rather than stopping after six successful searches."""
+    """Fill each media target without stopping at the former ten-item boundary."""
     source = Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
     source.supported_features = {ProviderFeature.SEARCH}
     discovery.provider.mass.music.providers = [source]
     artist = Artist(item_id="a", provider="stream--1", name="Artist", provider_mappings=set())
-    tracks = [
-        Track(
-            item_id=str(index),
-            provider="stream--1",
-            name=f"Song {index}",
-            artists=UniqueList([artist]),
-            provider_mappings=set(),
-        )
-        for index in range(50)
-    ]
+    items: list[Artist | Album | Track] = []
+    for index in range(50):
+        if media_type == MediaType.ARTIST:
+            items.append(
+                Artist(
+                    item_id=str(index),
+                    provider="stream--1",
+                    name=f"Song {index}",
+                    provider_mappings=set(),
+                )
+            )
+        elif media_type == MediaType.ALBUM:
+            items.append(
+                Album(
+                    item_id=str(index),
+                    provider="stream--1",
+                    name=f"Song {index}",
+                    provider_mappings=set(),
+                    artists=UniqueList([artist]),
+                )
+            )
+        else:
+            items.append(
+                Track(
+                    item_id=str(index),
+                    provider="stream--1",
+                    name=f"Song {index}",
+                    provider_mappings=set(),
+                    artists=UniqueList([artist]),
+                )
+            )
     controller = discovery.provider.mass.music.get_controller.return_value
-    controller.search = AsyncMock(side_effect=[[track] for track in tracks])
+    controller.search = AsyncMock(side_effect=[[item] for item in items])
     result = await discovery.resolve_items(
-        [LastFMItem(track.name, artist.name) for track in tracks], MediaType.TRACK
+        [LastFMItem(item.name, artist.name) for item in items], media_type
     )
-    assert [item.uri for item in result] == [
-        track.uri for track in tracks[:RESOLUTION_TARGET_LIMIT]
-    ]
-    assert controller.search.await_count == RESOLUTION_TARGET_LIMIT
+    assert RESOLUTION_TARGET_LIMITS[media_type] == target_limit
+    assert [item.uri for item in result] == [item.uri for item in items[:target_limit]]
+    assert controller.search.await_count == target_limit
     assert all(call.kwargs["limit"] == 2 for call in controller.search.await_args_list)
 
 
@@ -221,38 +345,56 @@ async def test_streaming_matching_checks_credited_titles_and_identity(
     controller.get_library_items_by_query.assert_not_awaited()
 
 
-async def test_personal_seeds_combine_month_week_and_favorites(discovery: LastFMDiscovery) -> None:
+@pytest.mark.parametrize("play_scale", [1, 100])
+async def test_personal_seeds_combine_month_week_and_favorites(
+    discovery: LastFMDiscovery, play_scale: int
+) -> None:
     """Recent listening and favorites can change the ranking without rewriting play counts."""
     first = Artist(item_id="a", provider="library", name="First", provider_mappings=set())
     second = Artist(item_id="b", provider="library", name="Second", provider_mappings=set())
     discovery.provider.mass.statistics.get_top_items.side_effect = [
         [
-            TopItemResult(item=ItemMapping.from_item(first), play_count=10),
-            TopItemResult(item=ItemMapping.from_item(second), play_count=11),
+            TopItemResult(item=ItemMapping.from_item(first), play_count=10 * play_scale),
+            TopItemResult(item=ItemMapping.from_item(second), play_count=11 * play_scale),
         ],
-        [TopItemResult(item=ItemMapping.from_item(first), play_count=2)],
+        [TopItemResult(item=ItemMapping.from_item(first), play_count=2 * play_scale)],
         [],
     ]
     discovery.provider.mass.music.get_controller.return_value.get_library_items_by_query.return_value = [
         second
     ]
     seeds = await discovery.get_seeds(MediaType.ARTIST)
-    assert [seed.artist for seed in seeds] == ["Second", "First"]
-    assert [seed.weight for seed in seeds] == [16, 14]
-    assert seeds[0].identity == second.uri
+    assert [seed.artist for seed in seeds] == ["First", "Second"]
+    assert [seed.weight for seed in seeds] == pytest.approx([1, 11 / 14 + 0.2])
+    assert seeds[0].identity == first.uri
     assert [
         call.kwargs["period"]
         for call in discovery.provider.mass.statistics.get_top_items.await_args_list
     ] == ["month", "week", "all_time"]
 
 
-@pytest.mark.parametrize(("requested", "expected"), [(3, 3), (10, 10), (100, 10)])
+@pytest.mark.parametrize(
+    ("scores", "expected"),
+    [
+        ({}, {}),
+        ({"first": 0, "second": 0}, {"first": 0, "second": 0}),
+        ({"first": 20, "second": 5}, {"first": 1, "second": 0.25}),
+    ],
+)
+def test_score_normalization_handles_empty_zero_and_positive_pools(
+    scores: dict[str, float], expected: dict[str, float]
+) -> None:
+    """Normalization preserves relative strength without a division by zero."""
+    assert normalize_scores(scores) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(("requested", "expected"), [(3, 3), (10, 10), (15, 15), (100, 15)])
 async def test_artist_seed_limit_retains_unmapped_streaming_history(
     discovery: LastFMDiscovery,
     requested: int,
     expected: int,
 ) -> None:
-    """Genre profiles can use ten streaming artists without resolving local artist metadata."""
+    """Genre profiles can use fifteen streaming artists without resolving local artist metadata."""
     discovery.provider.mass.statistics.get_top_items.return_value = [
         TopItemResult(
             item=ItemMapping(
@@ -358,10 +500,10 @@ async def test_loading_music_source_does_not_create_a_confirmed_miss(
     assert discovery.state.retry_after >= 300
 
 
-async def test_miss_budget_continues_with_later_candidates_on_next_refresh(
+async def test_cached_misses_are_not_searched_again_on_next_refresh(
     discovery: LastFMDiscovery,
 ) -> None:
-    """Cached complete misses let the next bounded run continue rather than repeat its first ten."""
+    """Complete misses are cached, so a later refresh never repeats unsuccessful source searches."""
     source = Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
     source.supported_features = {ProviderFeature.SEARCH}
     discovery.provider.mass.music.providers = [source]
@@ -379,14 +521,14 @@ async def test_miss_budget_continues_with_later_candidates_on_next_refresh(
     discovery.provider.mass.cache.get.side_effect = recalled
     candidates = [LastFMItem(f"Artist {index}") for index in range(50)]
     assert not await discovery.resolve_items(candidates, MediaType.ARTIST)
-    assert controller.search.await_count == RESOLUTION_MISS_LIMIT
-    assert discovery.state.retry_after >= 300
+    assert controller.search.await_count == 50
+    assert discovery.state.retry_after == 0
     second = LastFMDiscovery(discovery.provider)
     assert not await second.resolve_items(candidates, MediaType.ARTIST)
-    assert controller.search.await_count == 2 * RESOLUTION_MISS_LIMIT
+    assert controller.search.await_count == 50
     searched_names = [call.args[0] for call in controller.search.await_args_list]
-    assert searched_names == [candidate.name for candidate in candidates[:20]]
-    assert second.state.retry_after >= 300
+    assert searched_names == [candidate.name for candidate in candidates]
+    assert second.state.retry_after == 0
 
 
 def test_resolution_cache_identity_is_private_to_user_and_visible_sources(
@@ -479,12 +621,13 @@ async def test_musicbrainz_rate_limit_stops_further_external_resolution(
     assert discovery.state.retry_after == 900
 
 
-@pytest.mark.parametrize("cached_count", [10, 50])
-async def test_cached_target_is_resolved_before_uncached_candidates(
+@pytest.mark.parametrize("cached_count", [25, 50])
+async def test_higher_ranked_uncached_items_precede_lower_ranked_cached_items(
     discovery: LastFMDiscovery, cached_count: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Use the official cache-first strategy even when cached entries occur later in a list."""
+    """A cached lower-ranked result never displaces an available higher-ranked candidate."""
     source = Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
+    source.supported_features = {ProviderFeature.SEARCH}
     discovery.provider.mass.music.providers = [source]
     candidates = [LastFMItem(f"Artist {index}") for index in range(50)]
     cached = {
@@ -502,15 +645,298 @@ async def test_cached_target_is_resolved_before_uncached_candidates(
 
     discovery.provider.mass.cache.get.side_effect = recalled
     controller = discovery.provider.mass.music.get_controller.return_value
-    controller.search = AsyncMock()
+    controller.search = AsyncMock(
+        side_effect=[
+            [
+                Artist(
+                    item_id=str(index),
+                    provider="stream--1",
+                    name=candidate.name,
+                    provider_mappings=set(),
+                )
+            ]
+            for index, candidate in enumerate(candidates[:25])
+        ]
+    )
     with caplog.at_level(logging.DEBUG, logger=discovery.provider.logger.name):
         result = await discovery.resolve_items(candidates, MediaType.ARTIST)
     assert [item.name for item in result] == [
-        item.name for item in candidates[-cached_count:][:RESOLUTION_TARGET_LIMIT]
+        item.name for item in candidates[: RESOLUTION_TARGET_LIMITS[MediaType.ARTIST]]
     ]
     assert "duplicates=0" in caplog.text
-    controller.search.assert_not_awaited()
+    assert controller.search.await_count == (25 if cached_count == 25 else 0)
     controller.get_item_by_external_id.assert_not_awaited()
+
+
+@pytest.mark.parametrize("media_type", [MediaType.TRACK, MediaType.ALBUM, MediaType.ARTIST])
+async def test_resolution_fills_in_rank_order_after_many_misses_and_stops_at_target(
+    discovery: LastFMDiscovery, media_type: MediaType
+) -> None:
+    """Regular misses admit successors, without pre-resolving candidates past the final target."""
+    target = RESOLUTION_TARGET_LIMITS[media_type]
+    artist = Artist(item_id="a", provider="library", name="Artist", provider_mappings=set())
+    model = {MediaType.TRACK: Track, MediaType.ALBUM: Album, MediaType.ARTIST: Artist}[media_type]
+    items = [
+        model(
+            item_id=str(index),
+            provider="library",
+            name=f"Item {index}",
+            provider_mappings=set(),
+            **({"artists": UniqueList([artist])} if media_type != MediaType.ARTIST else {}),
+        )
+        for index in range(target + 30)
+    ]
+    candidates = [
+        LastFMItem(item.name, "Artist", mbid="mbid" if index % 2 else "")
+        for index, item in enumerate(items)
+    ]
+    discovery._get_cached_resolution = AsyncMock(return_value=(None, False))
+    discovery._resolve_missing = AsyncMock(side_effect=[None] * 12 + items[12:])
+    result = await discovery.resolve_items(candidates, media_type)
+    assert [item.uri for item in result] == [item.uri for item in items[12 : 12 + target]]
+    assert discovery._get_cached_resolution.await_count == target + 12
+    assert discovery._resolve_missing.await_count == target + 12
+    assert [call.args[0] for call in discovery._resolve_missing.await_args_list] == candidates[
+        : 12 + target
+    ]
+
+
+@pytest.mark.parametrize("media_type", [MediaType.TRACK, MediaType.ALBUM, MediaType.ARTIST])
+async def test_resolution_keeps_recent_non_seed_candidates_without_querying_history(
+    discovery: LastFMDiscovery,
+    media_type: MediaType,
+) -> None:
+    """Recent non-seed media remain eligible without a separate monthly-history lookup."""
+    candidates = [LastFMItem(f"Artist {index}") for index in range(50)]
+    model = {MediaType.TRACK: Track, MediaType.ALBUM: Album, MediaType.ARTIST: Artist}[media_type]
+    items = [
+        model(
+            item_id=str(index), provider="stream--1", name=candidate.name, provider_mappings=set()
+        )
+        for index, candidate in enumerate(candidates)
+    ]
+    discovery._get_cached_resolution = AsyncMock(side_effect=[(item, False) for item in items])
+    discovery.provider.mass.statistics.get_top_items.return_value = [
+        TopItemResult(item=item, play_count=1) for item in items[:25]
+    ]
+    result = await discovery.resolve_items(candidates, media_type)
+    assert [item.uri for item in result] == [
+        item.uri for item in items[: RESOLUTION_TARGET_LIMITS[media_type]]
+    ]
+    discovery.provider.mass.statistics.get_top_items.assert_not_awaited()
+
+
+@pytest.mark.parametrize("media_type", [MediaType.TRACK, MediaType.ARTIST])
+@pytest.mark.parametrize("candidate_count", [15, 80])
+async def test_seed_quota_uses_result_maximum_and_fills_from_remaining_candidates(
+    discovery: LastFMDiscovery, media_type: MediaType, candidate_count: int
+) -> None:
+    """Seed matches use a fixed maximum-based quota, including cross-source matches."""
+    items: list[Artist | Track] = []
+    for index in range(candidate_count):
+        artist = Artist(
+            item_id=str(index),
+            provider="stream--1",
+            name=f"Artist {index}",
+            provider_mappings=set(),
+        )
+        items.append(
+            Track(
+                item_id=str(index),
+                provider="stream--1",
+                name=f"Song {index}",
+                provider_mappings=set(),
+                artists=UniqueList([artist]),
+            )
+            if media_type == MediaType.TRACK
+            else artist
+        )
+    seeds = [
+        PersonalSeed(
+            artist=f"ARTIST {index}",
+            track=f"SONG {index}" if media_type == MediaType.TRACK else "",
+            identity=items[index].uri if index % 2 else "",
+        )
+        for index in range(15)
+    ]
+    candidates = [
+        LastFMItem(item.name, f"Artist {index}" if media_type == MediaType.TRACK else "")
+        for index, item in enumerate(items)
+    ]
+    discovery._get_cached_resolution = AsyncMock(side_effect=[(item, False) for item in items])
+    discovery.provider.mass.statistics.get_top_items.return_value = [
+        TopItemResult(item=item, play_count=1) for item in items[:15]
+    ]
+    result = await discovery.resolve_items(candidates, media_type, seeds=seeds)
+    target = RESOLUTION_TARGET_LIMITS[media_type]
+    quota = target // 5
+    assert [item.uri for item in result] == [
+        item.uri for item in [*items[:quota], *items[15 : 15 + target - quota]]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("folder_id", "seed_count", "matches_per_seed", "expected_seed_count"),
+    [("user_recommendations", 15, 4, 10), ("user_artist_recommendations", 10, 4, 5)],
+)
+async def test_personal_recommendations_apply_seed_quota_after_ranking_and_resolution(
+    discovery: LastFMDiscovery,
+    folder_id: str,
+    seed_count: int,
+    matches_per_seed: int,
+    expected_seed_count: int,
+) -> None:
+    """The real folder builder admits seed returns within the quota and fills the media target."""
+    folder = next(folder for folder in DISCOVERY_FOLDERS if folder.item_id == folder_id)
+    seeds = [
+        PersonalSeed(
+            f"Seed artist {index}",
+            f"Seed track {index}" if folder.media_type == MediaType.TRACK else "",
+        )
+        for index in range(seed_count)
+    ]
+    discovery.get_seeds = AsyncMock(return_value=seeds)
+    batches = [
+        [LastFMItem(seed.track or seed.artist, seed.artist if seed.track else "")]
+        + [
+            LastFMItem(f"Other {index}-{rank}", f"Other artist {index}")
+            for rank in range(matches_per_seed - 1)
+        ]
+        for index, seed in enumerate(seeds)
+    ]
+    discovery.provider.api.get_items.side_effect = batches
+    items: dict[str, Artist | Track] = {}
+    for batch in batches:
+        for candidate in batch:
+            artist = Artist(
+                item_id=candidate.name,
+                provider="stream--1",
+                name=candidate.artist or candidate.name,
+                provider_mappings=set(),
+            )
+            items[candidate.name] = (
+                Track(
+                    item_id=candidate.name,
+                    provider="stream--1",
+                    name=candidate.name,
+                    provider_mappings=set(),
+                    artists=UniqueList([artist]),
+                )
+                if folder.media_type == MediaType.TRACK
+                else artist
+            )
+    discovery._get_cached_resolution = AsyncMock(
+        side_effect=lambda candidate, _media_type: (items[candidate.name], False)
+    )
+    discovery.provider.mass.statistics.get_top_items.return_value = [
+        TopItemResult(item=items[seed.track or seed.artist], play_count=1) for seed in seeds
+    ]
+    result = await discovery.build_items(folder)
+    assert len(result) == RESOLUTION_TARGET_LIMITS[folder.media_type]
+    assert sum(item.name.startswith("Seed") for item in result) == expected_seed_count
+    discovery.get_seeds.assert_awaited_once_with(folder.seed_type, limit=seed_count)
+    assert discovery.provider.api.get_items.await_count == seed_count
+
+
+def test_seed_matching_does_not_confuse_releases_or_same_titles_by_other_artists() -> None:
+    """Artist seeds are not their albums or tracks, and a title alone is not a track identity."""
+    artist = Artist(item_id="a", provider="library", name="Artist", provider_mappings=set())
+    track = Track(
+        item_id="t",
+        provider="library",
+        name="Title",
+        provider_mappings=set(),
+        artists=UniqueList([artist]),
+    )
+    album = Album(
+        item_id="b",
+        provider="library",
+        name="Artist",
+        provider_mappings=set(),
+        artists=UniqueList([artist]),
+    )
+    artist_seeds = [PersonalSeed("Artist", identity=artist.uri)]
+    assert not LastFMDiscovery._is_seed(track, artist_seeds)
+    assert not LastFMDiscovery._is_seed(album, artist_seeds)
+    assert not LastFMDiscovery._is_seed(track, [PersonalSeed("Other Artist", "Title")])
+    assert not LastFMDiscovery._is_seed(artist, [PersonalSeed("Artist", "Title")])
+
+
+async def test_artist_diversity_fills_from_remaining_candidates(discovery: LastFMDiscovery) -> None:
+    """Artist-capped tracks do not prevent later playable tracks from filling the playlist."""
+    source = Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
+    source.supported_features = {ProviderFeature.SEARCH}
+    discovery.provider.mass.music.providers = [source]
+    items = [
+        Track(
+            item_id=str(index),
+            provider="stream--1",
+            name=f"Song {index}",
+            provider_mappings=set(),
+            artists=UniqueList(
+                [
+                    Artist(
+                        item_id=str(index),
+                        provider="stream--1",
+                        name="Repeated" if index < 10 else f"Artist {index}",
+                        provider_mappings=set(),
+                    )
+                ]
+            ),
+        )
+        for index in range(60)
+    ]
+    controller = discovery.provider.mass.music.get_controller.return_value
+    controller.search = AsyncMock(side_effect=[[item] for item in items])
+    result = await discovery.resolve_items(
+        [LastFMItem(item.name, item.artists[0].name) for item in items],
+        MediaType.TRACK,
+        max_tracks_per_artist=5,
+    )
+    assert [item.uri for item in result] == [item.uri for item in [*items[:5], *items[10:55]]]
+    assert controller.search.await_count == 55
+
+
+async def test_fixed_ten_track_artist_cap_fills_fifty_tracks_without_history_filter(
+    discovery: LastFMDiscovery,
+) -> None:
+    """The artist cap admits later tracks while recently played tracks remain eligible."""
+    items = [
+        Track(
+            item_id=str(index),
+            provider="stream--1",
+            name=f"Song {index}",
+            provider_mappings=set(),
+            artists=UniqueList(
+                [
+                    Artist(
+                        item_id=str(index // 20),
+                        provider="stream--1",
+                        name=f"Artist {index // 20}",
+                        provider_mappings=set(),
+                    )
+                ]
+            ),
+        )
+        for index in range(100)
+    ]
+    candidates = [
+        LastFMItem(item.name, f"Last.fm Artist {index // 20}") for index, item in enumerate(items)
+    ]
+    discovery._get_cached_resolution = AsyncMock(side_effect=[(item, False) for item in items])
+    discovery.provider.mass.statistics.get_top_items.return_value = [
+        TopItemResult(item=items[0], play_count=1)
+    ]
+    result = await discovery.resolve_items(
+        candidates,
+        MediaType.TRACK,
+        max_tracks_per_artist=10,
+    )
+    assert len(result) == 50
+    assert result[0].uri == items[0].uri
+    discovery.provider.mass.statistics.get_top_items.assert_not_awaited()
+    for index in range(5):
+        assert sum(item.artists[0].name == f"Artist {index}" for item in result) == 10
 
 
 @pytest.mark.parametrize(
@@ -570,15 +996,49 @@ async def test_track_artist_mismatch_is_not_resolved(discovery: LastFMDiscovery)
     assert not await discovery.build_items(folder)
 
 
+@pytest.mark.parametrize(
+    ("folder_id", "pool_size"),
+    [
+        ("user_recommendations", 150),
+        ("user_artist_recommendations", 75),
+        ("global_top_tracks", 200),
+    ],
+)
+async def test_generation_randomizes_only_bounded_personal_candidate_pools(
+    discovery: LastFMDiscovery,
+    monkeypatch: pytest.MonkeyPatch,
+    folder_id: str,
+    pool_size: int,
+) -> None:
+    """Randomize personal selections during generation without mutating charts or API batches."""
+    shuffle_candidates = Mock(side_effect=lambda items: items.reverse())
+    monkeypatch.setattr(recommendations_module, "shuffle", shuffle_candidates)
+    candidates = [LastFMItem(f"Candidate {rank}", "Artist") for rank in range(200)]
+    discovery.get_seeds = AsyncMock(return_value=[])
+    discovery._candidates = AsyncMock(return_value=candidates)
+    discovery.resolve_items = AsyncMock(return_value=[])
+    folder = next(folder for folder in DISCOVERY_FOLDERS if folder.item_id == folder_id)
+    await discovery.build_items(folder)
+    actual = discovery.resolve_items.await_args.args[0]
+    expected = candidates[:pool_size]
+    if folder.seed_type is not None:
+        expected.reverse()
+        shuffle_candidates.assert_called_once()
+    else:
+        shuffle_candidates.assert_not_called()
+    assert actual == expected
+    assert candidates[0].name == "Candidate 0"
+
+
 async def test_personal_seeds_are_bounded_and_progress_is_logged(
     discovery: LastFMDiscovery, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Make at most three discovery requests and record seed progress without user identifiers."""
+    """Make at most ten discovery requests and record seed progress without user identifiers."""
     seeds = [
         Artist(
             item_id=str(index), provider="library", name=f"Seed {index}", provider_mappings=set()
         )
-        for index in range(3)
+        for index in range(15)
     ]
     discovery.provider.mass.statistics.get_top_items.return_value = [
         TopItemResult(item=ItemMapping.from_item(seed), play_count=10) for seed in seeds
@@ -588,8 +1048,11 @@ async def test_personal_seeds_are_bounded_and_progress_is_logged(
     )
     with caplog.at_level(logging.DEBUG):
         assert not await discovery.build_items(folder)
-    assert discovery.provider.api.get_items.await_count == 3
-    assert "seed=3/3" in caplog.text
+    assert discovery.provider.api.get_items.await_count == 10
+    assert all(
+        call.kwargs["limit"] == 50 for call in discovery.provider.api.get_items.await_args_list
+    )
+    assert "seed=10/10" in caplog.text
     assert "phase=resolve" in caplog.text
     assert "discovery completed" in caplog.text
 
@@ -651,12 +1114,12 @@ async def test_track_seed_uses_verified_artist_and_title(discovery: LastFMDiscov
     )
     assert not await discovery.build_items(folder)
     discovery.provider.api.get_items.assert_awaited_once_with(
-        "track.getSimilar", {"artist": "Artist", "track": "Song"}, limit=20
+        "track.getSimilar", {"artist": "Artist", "track": "Song"}, limit=50
     )
 
 
 async def test_streaming_track_seeds_do_not_require_library(discovery: LastFMDiscovery) -> None:
-    """Fetch credits for only three ranked streaming seeds, preserving their original identities."""
+    """Fetch credits for up to fifteen ranked streaming seeds, preserving their identities."""
     artist = Artist(item_id="a", provider="stream--1", name="Artist", provider_mappings=set())
     tracks = [
         Track(
@@ -666,21 +1129,111 @@ async def test_streaming_track_seeds_do_not_require_library(discovery: LastFMDis
             artists=UniqueList([artist]),
             provider_mappings=set(),
         )
-        for index in range(10)
+        for index in range(20)
     ]
     discovery.provider.mass.statistics.get_top_items.return_value = [
-        TopItemResult(item=ItemMapping.from_item(track), play_count=10 - index)
+        TopItemResult(item=ItemMapping.from_item(track), play_count=20 - index)
         for index, track in enumerate(tracks)
     ]
     controller = discovery.provider.mass.music.get_controller.return_value
-    controller.get.side_effect = tracks[:3]
-    seeds = await discovery.get_seeds(MediaType.TRACK, limit=10)
-    assert [seed.track for seed in seeds] == [track.name for track in tracks[:3]]
-    assert [seed.identity for seed in seeds] == [track.uri for track in tracks[:3]]
-    assert controller.get.await_count == 3
+    controller.get.side_effect = tracks[:15]
+    seeds = await discovery.get_seeds(MediaType.TRACK, limit=15)
+    assert [seed.track for seed in seeds] == [track.name for track in tracks[:15]]
+    assert [seed.identity for seed in seeds] == [track.uri for track in tracks[:15]]
+    assert controller.get.await_count == 15
     assert all(
         call.kwargs == {"allow_update_metadata": False} for call in controller.get.await_args_list
     )
+
+
+async def test_track_seeds_include_favorites_in_fifteen_seed_selection(
+    discovery: LastFMDiscovery,
+) -> None:
+    """Favorites without listening history contribute to the expanded weighted selection."""
+    artist = Artist(item_id="a", provider="library", name="Artist", provider_mappings=set())
+    tracks = [
+        Track(
+            item_id=str(index),
+            provider="library",
+            name=f"Song {index}",
+            artists=UniqueList([artist]),
+            provider_mappings=set(),
+        )
+        for index in range(20)
+    ]
+    discovery.provider.mass.statistics.get_top_items.side_effect = [
+        [
+            TopItemResult(item=track, play_count=20 - index)
+            for index, track in enumerate(tracks[:12])
+        ],
+        [],
+        [],
+    ]
+    controller = discovery.provider.mass.music.get_controller.return_value
+    controller.get_library_items_by_query.return_value = [tracks[0], *tracks[12:]]
+    seeds = await discovery.get_seeds(MediaType.TRACK, limit=100)
+    assert [seed.identity for seed in seeds] == [track.uri for track in tracks[:15]]
+    assert seeds[0].weight == pytest.approx(1.2)
+    assert [seed.weight for seed in seeds[12:]] == pytest.approx([0.2, 0.2, 0.2])
+    controller.get_library_items_by_query.assert_awaited_once_with(favorite=True, limit=50)
+    controller.get.assert_not_awaited()
+
+
+@pytest.mark.parametrize("folder_id", ["user_recommendations", "user_artist_recommendations"])
+async def test_similar_recommendations_preserve_normalized_seed_strength(
+    discovery: LastFMDiscovery, monkeypatch: pytest.MonkeyPatch, folder_id: str
+) -> None:
+    """Strong seeds outweigh weak seeds, and shared matches combine contributions from both."""
+    seed_track = "Seed" if folder_id == "user_recommendations" else ""
+    artist_credit = "Related" if seed_track else ""
+    monkeypatch.setattr(
+        discovery,
+        "get_seeds",
+        AsyncMock(
+            return_value=[
+                PersonalSeed("Weak", seed_track, 0.2),
+                PersonalSeed("Strong", seed_track, 1),
+            ]
+        ),
+    )
+    discovery.provider.api.get_items.side_effect = [
+        [LastFMItem("Weak match", artist_credit), LastFMItem("Shared", artist_credit)],
+        [LastFMItem("Strong match", artist_credit), LastFMItem("Shared", artist_credit)],
+    ]
+    folder = next(folder for folder in DISCOVERY_FOLDERS if folder.item_id == folder_id)
+    candidates = await discovery._candidates(folder)
+    assert [item.name for item in candidates] == ["Strong match", "Shared", "Weak match"]
+
+
+async def test_track_recommendations_fetch_fifty_similar_items_for_fifteen_seeds(
+    discovery: LastFMDiscovery,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the bounded, deduplicated seed pool so final exclusions can be filled afterwards."""
+    seeds = [PersonalSeed("Artist", f"Seed {index}") for index in range(15)]
+    get_seeds = AsyncMock(return_value=seeds)
+    monkeypatch.setattr(discovery, "get_seeds", get_seeds)
+    discovery.provider.api.get_items.side_effect = [
+        [LastFMItem("Shared", "Related"), LastFMItem(seed.track, seed.artist)]
+        + [LastFMItem(f"Candidate {index}-{rank}", "Related") for rank in range(48)]
+        for index, seed in enumerate(seeds)
+    ]
+    folder = next(
+        folder for folder in DISCOVERY_FOLDERS if folder.item_id == "user_recommendations"
+    )
+    candidates = await discovery._candidates(folder)
+    get_seeds.assert_awaited_once_with(MediaType.TRACK, limit=15)
+    calls = discovery.provider.api.get_items.await_args_list
+    assert len(calls) == 15
+    assert all(
+        call.args == ("track.getSimilar", {"artist": seed.artist, "track": seed.track})
+        and call.kwargs == {"limit": 50}
+        for call, seed in zip(calls, seeds, strict=True)
+    )
+    assert len(candidates) == 736
+    assert candidates[0].name == "Shared"
+    assert sum(candidate.name == "Shared" for candidate in candidates) == 1
+    assert {seed.track for seed in seeds} <= {candidate.name for candidate in candidates}
 
 
 @pytest.mark.parametrize("error_type", [RateLimited, ResourceTemporarilyUnavailable])
@@ -771,6 +1324,45 @@ async def test_rediscovery_excludes_current_rotation_without_lastfm_requests(
     )
     assert [item.uri for item in await discovery.build_items(folder)] == [previous.uri]
     discovery.provider.api.get_items.assert_not_awaited()
+
+
+async def test_rediscovery_randomizes_after_exclusions_within_the_best_150(
+    discovery: LastFMDiscovery,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refreshes may choose different historical tracks without expanding history or API reads."""
+    shuffle_candidates = Mock()
+    shuffle_candidates.side_effect = lambda items: (
+        items.reverse() if shuffle_candidates.call_count == 1 else None
+    )
+    monkeypatch.setattr(recommendations_module, "shuffle", shuffle_candidates)
+    mappings = [
+        ItemMapping(
+            item_id=str(rank), provider="library", name=str(rank), media_type=MediaType.TRACK
+        )
+        for rank in range(200)
+    ]
+    previous = [
+        TopItemResult(item=item, play_count=200 - rank) for rank, item in enumerate(mappings)
+    ]
+    recent = previous[:5]
+    discovery.provider.mass.statistics.get_top_items.side_effect = [
+        recent,
+        previous,
+        recent,
+        previous,
+    ]
+    folder = next(
+        folder for folder in DISCOVERY_FOLDERS if folder.item_id == "user_rediscovery_tracks"
+    )
+    first = await discovery.build_items(folder)
+    second = await discovery.build_items(folder)
+    assert [item.uri for item in first] == [item.uri for item in mappings[105:155][::-1]]
+    assert [item.uri for item in second] == [item.uri for item in mappings[5:55]]
+    assert all(len(call.args[0]) == 150 for call in shuffle_candidates.call_args_list)
+    assert discovery.provider.mass.statistics.get_top_items.await_count == 4
+    discovery.provider.api.get_items.assert_not_awaited()
+    assert mappings[0].name == "0"
 
 
 async def test_rediscovery_retains_unmapped_streaming_history(discovery: LastFMDiscovery) -> None:

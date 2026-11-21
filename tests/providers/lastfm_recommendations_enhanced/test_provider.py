@@ -101,7 +101,7 @@ async def test_custom_key_is_required_and_sent_to_lastfm(
         "method": "chart.getTopArtists",
         "api_key": "custom-test-key",
         "format": "json",
-        "limit": 1,
+        "limit": 50,
     }
 
 
@@ -181,7 +181,7 @@ async def test_provider_only_publishes_implemented_folders(
     provider: LastFMRecommendationsEnhancedProvider, http_session: MagicMock
 ) -> None:
     """Publish the implemented MA toplists but no future Last.fm discovery folders."""
-    folders = await provider._get_recommendation_folders(genre_profile=GenreProfile((), ()))
+    folders = await provider._get_recommendation_folders(genre_profile=GenreProfile(()))
     assert [folder.item_id for folder in folders] == [
         "user_top_artists_monthly",
         "user_top_tracks_monthly",
@@ -272,14 +272,14 @@ async def test_initialization_debug_log_uses_provider_logger(
     """Trace initialization and request timing through the configured instance logger."""
     with caplog.at_level(logging.DEBUG, logger=provider.logger.name):
         await provider.handle_async_init()
-        await provider._get_recommendation_folders(genre_profile=GenreProfile((), ()))
+        await provider._get_recommendation_folders(genre_profile=GenreProfile(()))
         await provider._build_recommendation_items("unknown_folder")
     assert provider.api.logger is provider.logger
     assert "initialization start" in caplog.text
     assert "method=chart.getTopArtists status=200" in caplog.text
     assert "elapsed=" in caplog.text
     assert "validation successful" in caplog.text
-    assert "folders ready count=21" in caplog.text
+    assert "folders ready count=19" in caplog.text
     assert "reason=unknown_folder" in caplog.text
     assert "custom-test-key" not in caplog.text
     assert all(record.name == provider.logger.name for record in caplog.records)

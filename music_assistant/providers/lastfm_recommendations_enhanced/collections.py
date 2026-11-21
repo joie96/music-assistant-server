@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from hashlib import sha256
 from itertools import zip_longest
+from math import ceil
+from random import shuffle
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -20,7 +22,15 @@ from .catalog import (
     PlaylistSpec,
     genre_for_tag,
 )
-from .recommendations import PersonalSeed
+from .constants import FAVORITE_BONUS
+from .recommendations import (
+    RESOLUTION_TARGET_LIMITS,
+    RESULT_LIMIT,
+    PersonalSeed,
+    normalize_scores,
+    random_candidate_pool,
+    similarity_weights,
+)
 
 if TYPE_CHECKING:
     from .recommendations import LastFMDiscovery
@@ -28,16 +38,21 @@ if TYPE_CHECKING:
 PLAYLIST_FAMILIES = {
     "global_genre_playlist_": "global_genre_playlists",
     "user_genre_playlist_": "user_genre_playlists_monthly",
-    "user_related_genre_playlist_": "user_related_genre_playlists",
     "global_mood_playlist_": "global_mood_playlists",
     "global_decade_playlist_": "global_decade_playlists",
     "user_artist_playlist_": "user_artist_playlists_monthly",
     "global_artist_radio_playlist_": "global_artist_radio_playlists",
 }
-GENRE_ARTIST_LIMIT = 10
-GENRE_LIMIT = 6
+GENRE_ARTIST_LIMIT = 15
+PERSONAL_GENRE_PLAYLIST_LIMIT = 10
 EXPLORE_GENRE_LIMIT = 20
 TAGS_PER_ARTIST = 5
+PERSONAL_GENRE_ARTIST_TRACK_LIMIT = 10
+PERSONAL_ARTIST_PLAYLIST_LIMIT = 10
+GLOBAL_ARTIST_RADIO_PLAYLIST_LIMIT = 15
+ALBUM_SEED_LIMIT = 10
+ALBUM_RANDOM_POOL_LIMIT = 10
+ARTIST_PLAYLIST_RANDOM_POOL_LIMIT = 25
 
 
 class LastFMCollections:
@@ -51,6 +66,8 @@ class LastFMCollections:
         self.provider = discovery.provider
         self._genre_profile = genre_profile
         self._explore_genres = genre_profile.explore_genres if genre_profile is not None else None
+        self._favorite_track_keys: set[tuple[str, str]] | None = None
+        self._genre_seeds: list[PersonalSeed] | None = None
 
     async def get_folder_items(self, folder_id: str) -> UniqueList[Artist | Album | Track]:
         """Build an album or genre row; playlist descriptors use get_playlist_specs."""
@@ -61,19 +78,9 @@ class LastFMCollections:
             artists = await self.provider.api.get_items(
                 "geo.getTopArtists" if is_germany else "chart.getTopArtists",
                 {"country": "Germany"} if is_germany else {},
-                limit=3,
+                limit=50,
             )
             result = await self._albums([artist.name for artist in artists])
-        elif folder_id == "user_recommended_album":
-            albums = await self.get_personal_albums(spotlight=True)
-            result = UniqueList(albums[:1])
-            if albums and isinstance(album := albums[0], Album) and album.artists:
-                candidates = await self.provider.api.get_items(
-                    "album.getInfo",
-                    {"artist": album.artists[0].name, "album": album.name},
-                    limit=50,
-                )
-                result.extend(await self.discovery.resolve_items(candidates, MediaType.TRACK))
         else:
             result = await self._genre_items(folder_id)
         self.provider.logger.debug(
@@ -84,25 +91,82 @@ class LastFMCollections:
         )
         return result
 
-    async def get_personal_albums(
-        self, *, spotlight: bool = False
-    ) -> UniqueList[Artist | Album | Track]:
-        """Recommend albums from preferred and similar artists, excluding current rotation."""
-        seeds = await self.discovery.get_seeds(MediaType.ARTIST)
+    async def get_personal_albums(self) -> UniqueList[Artist | Album | Track]:
+        """Recommend random top-ten albums with similarity-weighted artist contributions."""
+        seeds = (await self.discovery.get_seeds(MediaType.ARTIST, limit=ALBUM_SEED_LIMIT))[
+            :ALBUM_SEED_LIMIT
+        ]
         if not seeds:
             return UniqueList()
-        similar: list[str] = []
-        for seed in seeds[:3]:
+        artists: dict[str, str] = {}
+        scores: dict[str, float] = {}
+        for seed in seeds:
+            seed_key = seed.artist.casefold()
+            contributions = {seed_key: (seed.artist, 1.0)}
             candidates = await self.provider.api.get_items(
-                "artist.getSimilar", {"artist": seed.artist}, limit=3
+                "artist.getSimilar", {"artist": seed.artist}, limit=50
             )
-            similar.extend(item.name for item in candidates)
-        artists = list(
-            dict.fromkeys([seeds[0].artist, *similar, *(seed.artist for seed in seeds)])
-        )[:3]
-        return await self.discovery.exclude_rotation(
-            await self._albums(artists, limit=1 if spotlight else 50), MediaType.ALBUM
-        )
+            for item, weight in zip(candidates, similarity_weights(candidates), strict=True):
+                key = item.name.casefold()
+                if key != seed_key and weight > contributions.get(key, ("", -1))[1]:
+                    contributions[key] = (item.name, weight)
+            for key, (artist, weight) in contributions.items():
+                artists.setdefault(key, artist)
+                scores[key] = scores.get(key, 0) + seed.weight * weight
+        weight_sum = sum(scores.values())
+        if not weight_sum:
+            return UniqueList()
+        target_limit = RESOLUTION_TARGET_LIMITS[MediaType.ALBUM]
+        result: UniqueList[Artist | Album | Track] = UniqueList()
+        seen: set[str] = set()
+        for key in sorted(scores, key=lambda key: scores[key], reverse=True):
+            if len(result) >= target_limit:
+                break
+            quota = max(1, ceil(target_limit * scores[key] / weight_sum))
+            try:
+                top_albums = await self.provider.api.get_items(
+                    "artist.getTopAlbums", {"artist": artists[key]}, limit=50
+                )
+            except MediaNotFoundError:
+                self.provider.logger.debug("Last.fm personal album source missing")
+                continue
+            candidates = top_albums[: min(3 * quota, ALBUM_RANDOM_POOL_LIMIT)]
+            shuffle(candidates)
+            resolved = await self.discovery.resolve_items(
+                candidates,
+                MediaType.ALBUM,
+                max_items=min(quota, target_limit - len(result)),
+                excluded_uris=seen,
+            )
+            result.extend(item for item in resolved if isinstance(item, Album))
+            seen.update(item.uri for item in result if item.uri is not None)
+            self.provider.logger.debug(
+                "Last.fm personal album source quota=%d candidates=%d added=%d total=%d",
+                quota,
+                len(candidates),
+                len(resolved),
+                len(result),
+            )
+        shuffle(result)
+        return result
+
+    async def get_personal_genre_playlists(self) -> list[tuple[PlaylistSpec, list[Track]]]:
+        """Prepare the strongest playable genre playlists, replacing empty or missing genres."""
+        recipes = await self.get_playlist_specs("user_genre_playlists_monthly")
+        result: list[tuple[PlaylistSpec, list[Track]]] = []
+        for recipe in recipes:
+            try:
+                tracks = await self.get_playlist_tracks(recipe.item_id)
+            except MediaNotFoundError:
+                self.provider.logger.debug("Last.fm genre playlist missing tag=%s", recipe.tag)
+                continue
+            if not tracks:
+                self.provider.logger.debug("Last.fm genre playlist empty tag=%s", recipe.tag)
+                continue
+            result.append((recipe, tracks))
+            if len(result) == PERSONAL_GENRE_PLAYLIST_LIMIT:
+                break
+        return result
 
     async def get_playlist_specs(self, folder_id: str) -> list[PlaylistSpec]:
         """List recipes without building their track lists or persisting private selections."""
@@ -121,23 +185,28 @@ class LastFMCollections:
                 PlaylistSpec(f"global_decade_playlist_{item.key}", item.name, tag=item.tag)
                 for item in DECADES
             ]
-        if folder_id in {"user_genre_playlists_monthly", "user_related_genre_playlists"}:
-            related = folder_id == "user_related_genre_playlists"
-            categories = await self.get_genres(related=related)
-            prefix = "user_related_genre_playlist" if related else "user_genre_playlist"
+        if folder_id == "user_genre_playlists_monthly":
+            categories = (await self.get_genre_profile()).genres
             return [
-                PlaylistSpec(f"{prefix}_{item.key}", item.name, tag=item.tag, personal=True)
+                PlaylistSpec(
+                    f"user_genre_playlist_{item.key}", item.name, tag=item.tag, personal=True
+                )
                 for item in categories
             ]
         if folder_id == "user_artist_playlists_monthly":
-            seeds = await self.discovery.get_seeds(MediaType.ARTIST)
+            seeds = await self.discovery.get_seeds(
+                MediaType.ARTIST, limit=PERSONAL_ARTIST_PLAYLIST_LIMIT
+            )
             return [
                 self._artist_spec(seed.artist, personal=True, identity=seed.identity)
-                for seed in seeds[:3]
+                for seed in seeds[:PERSONAL_ARTIST_PLAYLIST_LIMIT]
             ]
         if folder_id == "global_artist_radio_playlists":
-            artists = await self.provider.api.get_items("chart.getTopArtists", limit=3)
-            return [self._artist_spec(artist.name, identity=artist.mbid) for artist in artists]
+            artists = await self.provider.api.get_items("chart.getTopArtists", limit=50)
+            return [
+                self._artist_spec(artist.name, identity=artist.mbid)
+                for artist in artists[:GLOBAL_ARTIST_RADIO_PLAYLIST_LIMIT]
+            ]
         return []
 
     async def get_playlist_spec(self, item_id: str) -> PlaylistSpec:
@@ -154,47 +223,33 @@ class LastFMCollections:
         )
 
     async def get_playlist_tracks(self, item_id: str, page: int = 0) -> list[Track]:
-        """Return one bounded, artist-diverse batch; all subsequent pages are empty."""
+        """Return one bounded batch with the recipe's artist limits; later pages are empty."""
         if page != 0:
             return []
         recipe = await self.get_playlist_spec(item_id)
         started = perf_counter()
         self.provider.logger.debug("Building Last.fm playlist personal=%s", recipe.personal)
         if recipe.artist:
-            similar = await self.provider.api.get_items(
-                "artist.getSimilar", {"artist": recipe.artist}, limit=2
-            )
-            artists = list(dict.fromkeys([recipe.artist, *(item.name for item in similar)]))[:3]
-            batches = []
-            for index, artist in enumerate(artists, 1):
-                batches.append(
-                    await self.provider.api.get_items(
-                        "artist.getTopTracks", {"artist": artist}, limit=20
-                    )
-                )
-                self.provider.logger.debug(
-                    "Last.fm playlist source=%d/%d received=%d",
-                    index,
-                    len(artists),
-                    len(batches[-1]),
-                )
-            candidates = self._interleave(batches)
-        else:
-            candidates = await self.provider.api.get_items(
-                "tag.getTopTracks", {"tag": recipe.tag}, limit=50
-            )
-        resolved = await self.discovery.resolve_items(candidates, MediaType.TRACK)
-        if recipe.personal:
-            resolved = await self.discovery.exclude_rotation(resolved, MediaType.TRACK)
-        counts: dict[str, int] = {}
+            return await self._artist_playlist_tracks(recipe.artist)
+        candidates = await self.provider.api.get_items(
+            "tag.getTopTracks", {"tag": recipe.tag}, limit=3 * RESULT_LIMIT
+        )
+        if item_id.startswith("user_genre_playlist_"):
+            candidates = await self._rank_personal_genre_tracks(candidates)
+        candidates = random_candidate_pool(self._interleave([candidates]), RESULT_LIMIT)
+        resolved = await self.discovery.resolve_items(
+            candidates,
+            MediaType.TRACK,
+            max_tracks_per_artist=(
+                PERSONAL_GENRE_ARTIST_TRACK_LIMIT
+                if item_id.startswith("user_genre_playlist_")
+                else None
+            ),
+        )
         result = []
         for item in resolved:
             if not isinstance(item, Track) or not item.artists:
                 continue
-            artist = item.artists[0].name.casefold()
-            if counts.get(artist, 0) >= (20 if recipe.artist else 5):
-                continue
-            counts[artist] = counts.get(artist, 0) + 1
             item.position = len(result) + 1
             result.append(item)
         self.provider.logger.debug(
@@ -220,41 +275,72 @@ class LastFMCollections:
         self._explore_genres = tuple(categories.values())
         return self._explore_genres
 
-    async def get_genres(self, *, related: bool = False) -> list[Category]:
-        """Return the strongest personal or neighboring genres from the generation's profile."""
+    async def get_genres(self) -> list[Category]:
+        """Return the strongest personal genres from the generation's profile."""
         profile = await self.get_genre_profile()
-        return list(profile.related_genres if related else profile.genres[:3])
+        return list(profile.genres[:3])
 
     async def get_genre_profile(self) -> GenreProfile:
         """Prepare bounded personal genre categories solely from weighted Last.fm artist tags."""
         if self._genre_profile is not None:
             return self._genre_profile
-        seeds = await self.discovery.get_seeds(MediaType.ARTIST, limit=GENRE_ARTIST_LIMIT)
+        seeds = await self._get_genre_seeds()
         scores = await self._genre_scores(seeds)
         genres = tuple(
             category
-            for category, _weight in sorted(scores, key=lambda entry: (-entry[1], entry[0].key))[
-                :GENRE_LIMIT
-            ]
+            for category, _weight in sorted(scores, key=lambda entry: (-entry[1], entry[0].key))
         )
-        neighbors: list[PersonalSeed] = []
-        if genres:
-            for seed in seeds[:3]:
-                similar = await self.provider.api.get_items(
-                    "artist.getSimilar", {"artist": seed.artist}, limit=1
-                )
-                neighbors.extend(PersonalSeed(item.name, weight=seed.weight) for item in similar)
-        related_scores = await self._genre_scores(neighbors[:3])
-        primary_keys = {category.key for category in genres}
-        related = tuple(
-            category
-            for category, _weight in sorted(
-                related_scores, key=lambda entry: (-entry[1], entry[0].key)
-            )
-            if category.key not in primary_keys
-        )[:3]
-        self._genre_profile = GenreProfile(genres, related)
+        self._genre_profile = GenreProfile(genres)
         return self._genre_profile
+
+    async def _rank_personal_genre_tracks(self, candidates: list[LastFMItem]) -> list[LastFMItem]:
+        """Rank unique genre tracks by Last.fm rank and the selected user's track favorites."""
+        favorites = await self._get_favorite_track_keys()
+        candidates = self._interleave([candidates])
+        scores = normalize_scores(
+            {rank: float(len(candidates) - rank) for rank in range(len(candidates))}
+        )
+        weighted = [
+            (
+                candidate,
+                scores[rank]
+                + (
+                    FAVORITE_BONUS
+                    if (candidate.name.casefold(), candidate.artist.casefold()) in favorites
+                    else 0
+                ),
+            )
+            for rank, candidate in enumerate(candidates)
+        ]
+        self.provider.logger.debug(
+            "Last.fm personal genre playlist candidates=%d max_artist_tracks=%d",
+            len(candidates),
+            PERSONAL_GENRE_ARTIST_TRACK_LIMIT,
+        )
+        return [candidate for candidate, _score in sorted(weighted, key=lambda entry: -entry[1])]
+
+    async def _get_favorite_track_keys(self) -> set[tuple[str, str]]:
+        """Read the selected user's track favorites once per collection, preserving artist credits."""
+        if self._favorite_track_keys is not None:
+            return self._favorite_track_keys
+        controller = self.provider.mass.music.get_controller(MediaType.TRACK)
+        keys: set[tuple[str, str]] = set()
+        offset = 0
+        while True:
+            items = await controller.get_library_items_by_query(
+                favorite=True, limit=500, offset=offset
+            )
+            keys.update(
+                (item.name.casefold(), artist.name.casefold())
+                for item in items
+                if isinstance(item, Track) and item.available
+                for artist in item.artists
+            )
+            if len(items) < 500:
+                break
+            offset += len(items)
+        self._favorite_track_keys = keys
+        return keys
 
     async def _genre_scores(self, seeds: list[PersonalSeed]) -> list[tuple[Category, float]]:
         """Weight community genre candidates by personal importance, never by MA genre mappings."""
@@ -271,10 +357,10 @@ class LastFMCollections:
             )
         for seed in artists.values():
             tags = await self.provider.api.get_items(
-                "artist.getTopTags", {"artist": seed.artist}, limit=20
+                "artist.getTopTags", {"artist": seed.artist}, limit=50
             )
             selected: dict[str, tuple[Category, float | None, int]] = {}
-            for rank, tag in enumerate(tags[:20], 1):
+            for rank, tag in enumerate(tags[:50], 1):
                 if (category := genre_for_tag(tag.name)) is None:
                     continue
                 if category.key not in selected:
@@ -304,7 +390,65 @@ class LastFMCollections:
         self.provider.logger.debug(
             "Last.fm genre profile seeds=%d genres=%d", len(seeds), len(scores)
         )
-        return [(categories[key], weight) for key, weight in scores.items()]
+        return [(categories[key], weight) for key, weight in normalize_scores(scores).items()]
+
+    async def _artist_playlist_tracks(self, seed_artist: str) -> list[Track]:
+        """Build a randomized playlist with similarity-weighted contributions per artist."""
+        started = perf_counter()
+        similar = await self.provider.api.get_items(
+            "artist.getSimilar", {"artist": seed_artist}, limit=50
+        )
+        seed_key = seed_artist.casefold()
+        artists: dict[str, tuple[str, float]] = {seed_key: (seed_artist, 1.0)}
+        for item, weight in zip(similar, similarity_weights(similar), strict=True):
+            key = item.name.casefold()
+            if item.similarity_weight is None:
+                self.provider.logger.debug("Last.fm similar artist has no valid score")
+                continue
+            if key != seed_key and weight > artists.get(key, ("", -1))[1]:
+                artists[key] = (item.name, weight)
+        ranked = sorted(artists.values(), key=lambda entry: entry[1], reverse=True)
+        weight_sum = sum(weight for _artist, weight in ranked)
+        result: list[Track] = []
+        seen: set[str] = set()
+        for artist, weight in ranked:
+            if len(result) >= RESULT_LIMIT:
+                break
+            quota = max(1, ceil(RESULT_LIMIT * weight / weight_sum))
+            try:
+                top_tracks = await self.provider.api.get_items(
+                    "artist.getTopTracks", {"artist": artist}, limit=50
+                )
+            except MediaNotFoundError:
+                self.provider.logger.debug("Last.fm artist playlist source missing")
+                continue
+            candidates = top_tracks[: min(3 * quota, ARTIST_PLAYLIST_RANDOM_POOL_LIMIT)]
+            shuffle(candidates)
+            resolved = await self.discovery.resolve_items(
+                candidates,
+                MediaType.TRACK,
+                max_tracks_per_artist=quota,
+                max_items=min(quota, RESULT_LIMIT - len(result)),
+                excluded_uris=seen,
+            )
+            result.extend(item for item in resolved if isinstance(item, Track) and item.artists)
+            seen.update(item.uri for item in result if item.uri is not None)
+            self.provider.logger.debug(
+                "Last.fm artist playlist source quota=%d candidates=%d added=%d total=%d",
+                quota,
+                len(candidates),
+                len(resolved),
+                len(result),
+            )
+        shuffle(result)
+        for position, track in enumerate(result, 1):
+            track.position = position
+        self.provider.logger.debug(
+            "Last.fm artist playlist completed tracks=%d elapsed=%.3fs",
+            len(result),
+            perf_counter() - started,
+        )
+        return result
 
     async def _genre_items(self, folder_id: str) -> UniqueList[Artist | Album | Track]:
         """Build only advertised genre keys, with personal rows gated by the genre profile."""
@@ -326,53 +470,85 @@ class LastFMCollections:
             )
             if category is None:
                 break
-            candidates = await self.provider.api.get_items(method, {"tag": category.tag}, limit=50)
+            candidates = await self.provider.api.get_items(
+                method, {"tag": category.tag}, limit=3 * RESOLUTION_TARGET_LIMITS[media_type]
+            )
+            seeds = []
             if prefix == "user_genre_artists_":
+                seeds = await self._get_genre_seeds()
                 candidates = await self._rank_personal_artists(candidates)
-            result = await self.discovery.resolve_items(candidates, media_type)
-            return (
-                await self.discovery.exclude_rotation(result, media_type)
-                if prefix == "user_genre_artists_"
-                else result
+            candidates = random_candidate_pool(
+                self._interleave([candidates]), RESOLUTION_TARGET_LIMITS[media_type]
+            )
+            return await self.discovery.resolve_items(
+                candidates,
+                media_type,
+                seeds=seeds,
             )
         return UniqueList()
 
+    async def _get_genre_seeds(self) -> list[PersonalSeed]:
+        """Reuse the genre profile's MA artist seeds for ranking and the final seed quota."""
+        if self._genre_seeds is None:
+            self._genre_seeds = await self.discovery.get_seeds(
+                MediaType.ARTIST, limit=GENRE_ARTIST_LIMIT
+            )
+        return self._genre_seeds
+
     async def _rank_personal_artists(self, candidates: list[LastFMItem]) -> list[LastFMItem]:
         """Promote preferred and similar artists within the genre, never outside its tag list."""
-        seeds = await self.discovery.get_seeds(MediaType.ARTIST)
+        seeds = await self._get_genre_seeds()
         weights: dict[str, float] = {}
         for seed in seeds[:3]:
             weights[seed.artist.casefold()] = weights.get(seed.artist.casefold(), 0) + seed.weight
             similar = await self.provider.api.get_items(
-                "artist.getSimilar", {"artist": seed.artist}, limit=20
+                "artist.getSimilar", {"artist": seed.artist}, limit=50
             )
-            for rank, item in enumerate(similar, 1):
+            for item, weight in zip(similar, similarity_weights(similar), strict=True):
                 key = item.name.casefold()
-                weights[key] = weights.get(key, 0) + seed.weight / rank
+                weights[key] = weights.get(key, 0) + seed.weight * weight
+        weights = normalize_scores(weights)
         return sorted(
             candidates, key=lambda item: weights.get(item.name.casefold(), 0), reverse=True
         )
 
     async def _albums(
-        self, artists: list[str], *, limit: int = 50
+        self, artists: list[str], *, max_items: int | None = None
     ) -> UniqueList[Artist | Album | Track]:
-        """Select top albums for at most three artists, never their complete discographies."""
-        batches = []
-        for index, artist in enumerate(list(dict.fromkeys(artists))[:3], 1):
-            batches.append(
-                await self.provider.api.get_items(
-                    "artist.getTopAlbums", {"artist": artist}, limit=20
-                )
+        """Randomly select popular albums using the shared artist and candidate pool limits."""
+        artists = list(dict.fromkeys(artists))[:ALBUM_SEED_LIMIT]
+        result: UniqueList[Artist | Album | Track] = UniqueList()
+        if not artists:
+            return result
+        target_limit = RESOLUTION_TARGET_LIMITS[MediaType.ALBUM]
+        if max_items is not None:
+            target_limit = min(target_limit, max_items)
+        quota = ceil(target_limit / len(artists))
+        seen: set[str] = set()
+        for index, artist in enumerate(artists, 1):
+            if len(result) >= target_limit:
+                break
+            top_albums = await self.provider.api.get_items(
+                "artist.getTopAlbums", {"artist": artist}, limit=50
             )
+            candidates = self._interleave([top_albums])[: min(3 * quota, ALBUM_RANDOM_POOL_LIMIT)]
+            shuffle(candidates)
+            resolved = await self.discovery.resolve_items(
+                candidates,
+                MediaType.ALBUM,
+                max_items=min(quota, target_limit - len(result)),
+                excluded_uris=seen,
+            )
+            result.extend(item for item in resolved if isinstance(item, Album))
+            seen.update(item.uri for item in result if item.uri is not None)
             self.provider.logger.debug(
                 "Last.fm album source=%d/%d received=%d",
                 index,
-                min(len(artists), 3),
-                len(batches[-1]),
+                len(artists),
+                len(top_albums),
             )
-        return await self.discovery.resolve_items(
-            self._interleave(batches)[:limit], MediaType.ALBUM
-        )
+        shuffle(result)
+        return result
 
     @staticmethod
     def _artist_spec(artist: str, *, personal: bool = False, identity: str = "") -> PlaylistSpec:
@@ -395,4 +571,4 @@ class LastFMCollections:
                 if key not in seen:
                     seen.add(key)
                     result.append(item)
-        return result[:50]
+        return result

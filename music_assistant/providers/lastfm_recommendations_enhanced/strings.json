@@ -35,20 +35,12 @@
         "name": "Artist radios",
         "subtitle": "Powered by Last.fm | https://www.last.fm/"
       },
-      "user_related_genre_playlists": {
-        "name": "Related genre playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
-      },
       "global_mood_playlists": {
         "name": "Mood playlists",
         "subtitle": "Powered by Last.fm | https://www.last.fm/"
       },
       "global_decade_playlists": {
         "name": "Decade playlists",
-        "subtitle": "Powered by Last.fm | https://www.last.fm/"
-      },
-      "user_recommended_album": {
-        "name": "An album for you",
         "subtitle": "Powered by Last.fm | https://www.last.fm/"
       },
       "global_genre_albums": {
