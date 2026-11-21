@@ -54,7 +54,7 @@ def build_split_cover_png(text_left: str, cover_images: list[bytes], text_right:
     points.append((0, 0))
     draw.polygon(points, fill="black")
     left_font = _load_font(110)
-    right_font = _load_font(48)
+    right_font = _load_font(64)
     left_label = fit_cover_text(text_left, left_font, 520)
     right_label = fit_cover_text(text_right, right_font, 480)
     draw.text((70, 50), left_label, fill="white", font=left_font)

@@ -37,6 +37,15 @@ def test_cover_has_four_real_tiles_and_listenbrainz_title_inset() -> None:
         assert max(cover.crop((650, 100, 1130, 185)).convert("L").getextrema()) == 255
 
 
+def test_secondary_text_is_larger_and_stays_inside_title_inset() -> None:
+    """Render a readable secondary label without crossing into the artwork tiles."""
+    with Image.open(BytesIO(build_split_cover_png("Genre", [], "Secondary"))) as cover:
+        bounds = cover.crop((650, 100, 1130, 190)).convert("L").getbbox()
+        assert bounds is not None
+        assert bounds[3] - bounds[1] > 48
+        assert bounds[3] < 90
+
+
 @pytest.mark.parametrize("image_count", [0, 1, 2, 3])
 def test_missing_images_use_placeholders_without_repeating_artwork(image_count: int) -> None:
     """Use a predictable four-tile layout even when fewer covers are available."""
@@ -59,7 +68,7 @@ def test_duplicate_and_empty_images_do_not_fill_multiple_tiles() -> None:
 
 def test_long_titles_fit_their_pixel_budget_and_keep_one_line() -> None:
     """Limit both labels without trusting a character-count approximation."""
-    font = ImageFont.load_default(size=48)
+    font = ImageFont.load_default(size=64)
     fitted = fit_cover_text("Very long genre name " * 30, font, 480)
     assert fitted.endswith("...")
     assert font.getlength(fitted) <= 480

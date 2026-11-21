@@ -29,6 +29,7 @@ from music_assistant_models.errors import (
 from music_assistant_models.media_items import Album, Artist, ItemMapping, Track, UniqueList
 from music_assistant_models.media_items.metadata import MediaItemLink
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.compare import compare_strings
 from music_assistant.helpers.util import parse_title_and_version
 
@@ -528,6 +529,13 @@ class LastFMDiscovery:
                     failed = True
                     continue
                 self._source_search_count += 1
+                self.provider.logger.log(
+                    VERBOSE_LOG_LEVEL,
+                    "Last.fm source search started media_type=%s source=%s query=%s",
+                    media_type.value,
+                    source.instance_id,
+                    query,
+                )
                 try:
                     results = await controller.search(
                         query, source.instance_id, limit=SOURCE_SEARCH_RESULT_LIMIT
@@ -561,9 +569,13 @@ class LastFMDiscovery:
                     and item.media_type == media_type
                     and item.available
                 )
-                self.provider.logger.debug(
-                    "Last.fm source search media_type=%s results=%d reusable=%d",
+                self.provider.logger.log(
+                    VERBOSE_LOG_LEVEL,
+                    "Last.fm source search completed media_type=%s source=%s query=%s "
+                    "results=%d reusable=%d",
                     media_type.value,
+                    source.instance_id,
+                    query,
                     len(results),
                     len(reusable),
                 )

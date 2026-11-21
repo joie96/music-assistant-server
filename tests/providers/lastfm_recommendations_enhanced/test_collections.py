@@ -1,5 +1,6 @@
 """Bounded generated collections and dynamic playlist contracts."""
 
+import logging
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -66,6 +67,9 @@ async def test_personal_artist_playlist_recipes_use_ten_ma_seeds(
     recipes = await collections.get_playlist_specs("user_artist_playlists_monthly")
     assert len(recipes) == len({recipe.item_id for recipe in recipes}) == 10
     assert [recipe.artist for recipe in recipes] == [f"Artist {index}" for index in range(10)]
+    assert [recipe.name for recipe in recipes] == [
+        f"Featuring Artist {index}" for index in range(10)
+    ]
     collections.discovery.get_seeds.assert_awaited_once_with(MediaType.ARTIST, limit=10)
     collections.provider.api.get_items.assert_not_awaited()
 
@@ -84,6 +88,9 @@ async def test_global_artist_radios_create_up_to_fifteen_ranked_playlists(
     assert len(recipes) == len({recipe.item_id for recipe in recipes}) == min(artist_count, 15)
     assert [recipe.artist for recipe in recipes] == [
         f"Artist {rank}" for rank in range(min(artist_count, 15))
+    ]
+    assert [recipe.name for recipe in recipes] == [
+        f"Featuring Artist {rank}" for rank in range(min(artist_count, 15))
     ]
     assert all(not recipe.personal for recipe in recipes)
     collections.provider.api.get_items.assert_awaited_once_with("chart.getTopArtists", limit=50)
@@ -580,6 +587,60 @@ async def test_genre_rows_randomize_the_triple_sized_ranked_pool(
     assert candidates[0].name == "Candidate 0"
 
 
+@pytest.mark.parametrize("is_artist_playlist", [False, True])
+async def test_playlist_debug_logs_start_and_completion_with_identity(
+    collections: LastFMCollections,
+    caplog: pytest.LogCaptureFixture,
+    is_artist_playlist: bool,
+) -> None:
+    """Tag and artist playlist children both report their identity before and after resolution."""
+    collections.provider.logger = logging.getLogger("lastfm_playlist_logging_test")
+    playlist_id = (
+        "global_artist_radio_playlist_test" if is_artist_playlist else "global_mood_playlist_chill"
+    )
+    collections.get_playlist_spec = AsyncMock(
+        return_value=Mock(artist="Seed" if is_artist_playlist else "", tag="chill", personal=False)
+    )
+    artist = Artist(item_id="a", provider="library", name="Seed", provider_mappings=set())
+    track = Track(
+        item_id="t",
+        provider="library",
+        name="Song",
+        provider_mappings=set(),
+        artists=UniqueList([artist]),
+    )
+    candidates = [LastFMItem(track.name, artist.name)]
+    collections.provider.api.get_items.side_effect = (
+        [[], candidates] if is_artist_playlist else [candidates]
+    )
+
+    async def resolve(
+        _candidates: list[LastFMItem], *_args: object, **_kwargs: object
+    ) -> UniqueList[Track]:
+        assert f"Last.fm playlist build started playlist={playlist_id}" in caplog.text
+        assert f"Last.fm playlist build completed playlist={playlist_id}" not in caplog.text
+        return UniqueList([track])
+
+    collections.discovery.resolve_items = AsyncMock(side_effect=resolve)
+    with caplog.at_level(logging.DEBUG, logger=collections.provider.logger.name):
+        result = await collections.get_playlist_tracks(playlist_id)
+
+    assert [item.uri for item in result] == [track.uri]
+    messages = [
+        record.getMessage().split(" elapsed=")[0]
+        for record in caplog.records
+        if record.getMessage().startswith("Last.fm playlist build ")
+    ]
+    assert messages == [
+        f"Last.fm playlist build started playlist={playlist_id} personal=False",
+        f"Last.fm playlist build completed playlist={playlist_id} tracks=1",
+    ]
+    assert not any(record.levelno == logging.INFO for record in caplog.records)
+    if is_artist_playlist:
+        assert "Last.fm artist tracks build started seed=Seed artist=Seed quota=50" in caplog.text
+        assert "Last.fm artist tracks build completed seed=Seed artist=Seed" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("prefix", "artist_limit"),
     [
@@ -829,6 +890,7 @@ async def test_artist_playlist_identity_survives_a_display_name_change(
 async def test_personal_and_popular_albums_use_the_same_limit_constants(
     collections: LastFMCollections,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Both album paths honor changes to the shared seed and random pool limits."""
     monkeypatch.setattr(collections_module, "ALBUM_SEED_LIMIT", 2)
@@ -856,9 +918,27 @@ async def test_personal_and_popular_albums_use_the_same_limit_constants(
         return [LastFMItem(f"{name} {rank}", name) for rank in range(50)]
 
     collections.provider.api.get_items.side_effect = get_items
-    await collections.get_personal_albums()
-    collections.discovery.get_seeds.assert_awaited_once_with(MediaType.ARTIST, limit=2)
-    await collections.get_folder_items("global_popular_artist_albums")
+    collections.provider.logger = logging.getLogger("lastfm_album_logging_test")
+    with caplog.at_level(logging.DEBUG, logger=collections.provider.logger.name):
+        await collections.get_personal_albums()
+        collections.discovery.get_seeds.assert_awaited_once_with(MediaType.ARTIST, limit=2)
+        await collections.get_folder_items("global_popular_artist_albums")
+    source_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Last.fm album source build ")
+    ]
+    assert len(source_messages) == 8
+    for index, (artist, personal) in enumerate(
+        [("First", True), ("Second", True), ("First", False), ("Second", False)]
+    ):
+        assert source_messages[index * 2] == (
+            f"Last.fm album source build started artist={artist} personal={personal} quota=18"
+        )
+        assert source_messages[index * 2 + 1].startswith(
+            f"Last.fm album source build completed artist={artist} personal={personal} "
+        )
+        assert "elapsed=" in source_messages[index * 2 + 1]
     calls = collections.provider.api.get_items.await_args_list
     assert [call.args[1]["artist"] for call in calls if call.args[0] == "artist.getTopAlbums"] == [
         "First",

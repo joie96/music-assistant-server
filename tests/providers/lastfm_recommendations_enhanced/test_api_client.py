@@ -11,6 +11,7 @@ import pytest
 from aiohttp import ClientResponseError
 from music_assistant_models.errors import InvalidDataError, RateLimited
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers import throttle_retry
 from music_assistant.helpers.throttle_retry import ThrottlerManager
 from music_assistant.providers.lastfm_recommendations_enhanced import api_client as client_module
@@ -181,6 +182,34 @@ async def test_removed_album_information_is_rejected_without_http(
     with pytest.raises(InvalidDataError):
         await client.get_items("album.getInfo", {"artist": "Artist", "album": "Album"})
     session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("log_level", [logging.DEBUG, VERBOSE_LOG_LEVEL])
+async def test_individual_http_and_cache_details_are_only_logged_at_trace(
+    cached_client: tuple[LastFMAPIClient, MagicMock, Mock],
+    caplog: pytest.LogCaptureFixture,
+    log_level: int,
+) -> None:
+    """Successful request/cache details do not add noise to Debug build progress."""
+    client, session, cache = cached_client
+    with caplog.at_level(log_level, logger=client.logger.name):
+        first = await client.get_items("chart.getTopArtists")
+        cache.get.return_value = cache.set.call_args.args[1]
+        second = await client.get_items("chart.getTopArtists")
+    assert first == second
+    session.get.assert_called_once()
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith(("Last.fm cache ", "Last.fm HTTP GET "))
+    ]
+    if log_level == logging.DEBUG:
+        assert records == []
+    else:
+        assert len(records) == 5
+        assert all(record.levelno == VERBOSE_LOG_LEVEL for record in records)
+        assert "Last.fm cache hit method=chart.getTopArtists" in caplog.text
+    assert "private-key" not in caplog.text
 
 
 @pytest.fixture

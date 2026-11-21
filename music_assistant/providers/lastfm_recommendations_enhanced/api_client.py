@@ -20,6 +20,7 @@ from music_assistant_models.errors import (
     ResourceTemporarilyUnavailable,
 )
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.throttle_retry import ThrottlerManager, parse_retry_after
 
 if TYPE_CHECKING:
@@ -186,9 +187,9 @@ class LastFMAPIClient:
             cached = await self._cache.get(slot, provider=CACHE_NAMESPACE)
             if isinstance(cached, dict) and cached.get("request") == fingerprint:
                 if isinstance(cached.get("data"), dict):
-                    self.logger.debug("Last.fm cache hit method=%s", method)
+                    self.logger.log(VERBOSE_LOG_LEVEL, "Last.fm cache hit method=%s", method)
                     return cached["data"]
-        self.logger.debug("Last.fm cache miss method=%s", method)
+        self.logger.log(VERBOSE_LOG_LEVEL, "Last.fm cache miss method=%s", method)
         started = perf_counter()
         retry_after = 0
         ttl = ITEM_METHODS[method][2]
@@ -207,7 +208,8 @@ class LastFMAPIClient:
                 ) as response:
                     retry_after = parse_retry_after(response.headers.get("Retry-After"))
                     ttl = self._cache_ttl(response.headers, ttl)
-                    self.logger.debug(
+                    self.logger.log(
+                        VERBOSE_LOG_LEVEL,
                         "Last.fm HTTP GET response method=%s status=%s",
                         method,
                         response.status,
@@ -215,21 +217,28 @@ class LastFMAPIClient:
                     response.raise_for_status()
                     data = await response.json()
         except ClientResponseError as err:
-            self.logger.debug("Last.fm HTTP GET failed method=%s status=%s", method, err.status)
+            self.logger.debug(
+                "Last.fm HTTP GET failed method=%s status=%s elapsed=%.3fs",
+                method,
+                err.status,
+                perf_counter() - started,
+            )
             if err.status == 429:
                 self._raise_rate_limited(retry_after)
             raise ResourceTemporarilyUnavailable("Last.fm request failed") from None
         except (ClientError, TimeoutError) as err:
             self.logger.debug(
-                "Last.fm HTTP GET failed method=%s error_type=%s",
+                "Last.fm HTTP GET failed method=%s error_type=%s elapsed=%.3fs",
                 method,
                 type(err).__name__,
+                perf_counter() - started,
             )
             raise ResourceTemporarilyUnavailable("Last.fm request failed") from None
         except ValueError:
             raise InvalidDataError("Last.fm returned invalid JSON") from None
         finally:
-            self.logger.debug(
+            self.logger.log(
+                VERBOSE_LOG_LEVEL,
                 "Last.fm HTTP GET finished method=%s elapsed=%.3fs (includes throttle wait)",
                 method,
                 perf_counter() - started,
@@ -243,9 +252,13 @@ class LastFMAPIClient:
             entry = {"request": fingerprint, "data": data}
             if len(orjson.dumps(entry)) <= MAX_CACHE_ENTRY_BYTES:
                 await self._cache.set(slot, entry, expiration=ttl, provider=CACHE_NAMESPACE)
-                self.logger.debug("Last.fm cache stored method=%s ttl=%ds", method, ttl)
+                self.logger.log(
+                    VERBOSE_LOG_LEVEL, "Last.fm cache stored method=%s ttl=%ds", method, ttl
+                )
             else:
-                self.logger.debug("Last.fm cache skipped method=%s reason=size_limit", method)
+                self.logger.log(
+                    VERBOSE_LOG_LEVEL, "Last.fm cache skipped method=%s reason=size_limit", method
+                )
         return data
 
     def _validate_response(self, data: Any, method: str, retry_after: int) -> dict[str, Any]:

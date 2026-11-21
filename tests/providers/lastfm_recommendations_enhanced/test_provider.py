@@ -14,6 +14,7 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.media_items import Album, Artist, ProviderMapping, Track
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.controllers.webserver.helpers import auth_middleware
 from music_assistant.helpers.throttle_retry import ThrottlerManager
 from music_assistant.providers import lastfm_recommendations_enhanced as provider_module
@@ -266,11 +267,11 @@ async def test_atomic_statistics_rows_do_not_wrap_media_in_containers(
     assert items[0] is item
 
 
-async def test_initialization_debug_log_uses_provider_logger(
+async def test_initialization_logs_use_provider_logger(
     provider: LastFMRecommendationsEnhancedProvider, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Trace initialization and request timing through the configured instance logger."""
-    with caplog.at_level(logging.DEBUG, logger=provider.logger.name):
+    with caplog.at_level(VERBOSE_LOG_LEVEL, logger=provider.logger.name):
         await provider.handle_async_init()
         await provider._get_recommendation_folders(genre_profile=GenreProfile(()))
         await provider._build_recommendation_items("unknown_folder")

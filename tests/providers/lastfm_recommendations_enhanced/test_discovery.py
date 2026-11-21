@@ -15,6 +15,7 @@ from music_assistant_models.errors import RateLimited, ResourceTemporarilyUnavai
 from music_assistant_models.media_items import Album, Artist, ItemMapping, Track, UniqueList
 from music_assistant_models.statistics import TopItemResult
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.throttle_retry import ThrottlerManager
 from music_assistant.providers.lastfm_recommendations_enhanced import (
     recommendations as recommendations_module,
@@ -264,6 +265,50 @@ async def test_refresh_reuses_results_without_sharing_between_users(
     assert controller.search.await_count == 1
     assert await LastFMDiscovery(discovery.provider).resolve_items([candidate], MediaType.ARTIST)
     assert controller.search.await_count == 2
+
+
+@pytest.mark.parametrize("log_level", [logging.DEBUG, VERBOSE_LOG_LEVEL])
+async def test_individual_source_search_details_are_only_logged_at_trace(
+    discovery: LastFMDiscovery, caplog: pytest.LogCaptureFixture, log_level: int
+) -> None:
+    """Per-search result details stay below Debug while resolution summaries remain visible."""
+    source = Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
+    source.supported_features = {ProviderFeature.SEARCH}
+    discovery.provider.mass.music.providers = [source]
+    artist = Artist(item_id="a", provider="stream--1", name="Artist", provider_mappings=set())
+    track = Track(
+        item_id="t",
+        provider="stream--1",
+        name="Song",
+        provider_mappings=set(),
+        artists=UniqueList([artist]),
+    )
+    controller = discovery.provider.mass.music.get_controller.return_value
+    controller.search = AsyncMock(return_value=[track])
+
+    with caplog.at_level(log_level, logger=discovery.provider.logger.name):
+        result = await discovery.resolve_items([LastFMItem("Song", "Artist")], MediaType.TRACK)
+
+    assert [item.uri for item in result] == [track.uri]
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Last.fm source search ")
+    ]
+    if log_level == logging.DEBUG:
+        assert records == []
+    else:
+        assert all(record.levelno == VERBOSE_LOG_LEVEL for record in records)
+        assert [record.getMessage() for record in records] == [
+            "Last.fm source search started media_type=track source=stream--1 query=Artist - Song",
+            "Last.fm source search completed media_type=track source=stream--1 "
+            "query=Artist - Song results=1 reusable=1",
+        ]
+    assert any(
+        record.levelno == logging.DEBUG
+        and record.getMessage().startswith("Last.fm resolution candidates=")
+        for record in caplog.records
+    )
 
 
 async def test_streaming_search_matches_normalized_version_titles(

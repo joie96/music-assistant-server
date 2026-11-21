@@ -347,6 +347,80 @@ async def test_folder_contents_are_prebuilt_and_do_not_query_history_on_read(
     assert provider.mass.statistics.get_top_items.await_count == 1
 
 
+@pytest.mark.parametrize("fails", [False, True])
+async def test_refresh_info_logs_only_folder_start_and_completed_summary(
+    provider: LastFMRecommendationsEnhancedProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fails: bool,
+) -> None:
+    """Folder completion follows track resolution; failed folders have no success summary."""
+    provider.mass.webserver.auth.get_user = AsyncMock(
+        return_value=Mock(user_id="DEBUG", enabled=True)
+    )
+    monkeypatch.setattr(
+        LastFMCollections, "get_genre_profile", AsyncMock(return_value=GENRE_PROFILE)
+    )
+    monkeypatch.setattr(LastFMCollections, "get_explore_genres", AsyncMock(return_value=()))
+    folder_ids = ["user_top_artists_monthly", "global_mood_playlists"]
+    folders = [
+        RecommendationFolder(item_id=folder_id, provider=provider.instance_id, name=folder_id)
+        for folder_id in folder_ids
+    ]
+    monkeypatch.setattr(provider, "_get_recommendation_folders", AsyncMock(return_value=folders))
+    playlist = provider._playlist(PlaylistSpec("global_mood_playlist_chill", "Chill", tag="chill"))
+    tracks = [
+        Track(
+            item_id=str(index), provider="library", name=f"Track {index}", provider_mappings=set()
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(
+        provider,
+        "_build_recommendation_items",
+        AsyncMock(side_effect=[UniqueList(), UniqueList([playlist])]),
+    )
+    monkeypatch.setattr(provider, "_set_playlist_cover", AsyncMock())
+    monkeypatch.setattr(provider, "_remove_obsolete_covers", AsyncMock())
+    monkeypatch.setattr(provider, "_schedule_refresh_retry", Mock())
+
+    async def resolve_tracks(_item_id: str) -> list[Track]:
+        assert "Last.fm folder build started folder=global_mood_playlists" in caplog.text
+        assert "Last.fm folder build completed folder=global_mood_playlists" not in caplog.text
+        if fails:
+            raise ResourceTemporarilyUnavailable("Source unavailable")
+        return tracks
+
+    monkeypatch.setattr(
+        LastFMCollections, "get_playlist_tracks", AsyncMock(side_effect=resolve_tracks)
+    )
+    with caplog.at_level(logging.INFO, logger=provider.logger.name):
+        if fails:
+            with pytest.raises(ResourceTemporarilyUnavailable):
+                await provider._refresh_recommendations()
+        else:
+            await provider._refresh_recommendations()
+    messages = [
+        record.getMessage().split(" elapsed=")[0]
+        for record in caplog.records
+        if record.name == provider.logger.name and record.levelno == logging.INFO
+    ]
+    expected = [
+        "Last.fm folder build started folder=user_top_artists_monthly",
+        "Last.fm folder build completed folder=user_top_artists_monthly "
+        "items=0 playlists=0 playlist_tracks=0",
+        "Last.fm folder build started folder=global_mood_playlists",
+    ]
+    if not fails:
+        expected.extend(
+            [
+                "Last.fm folder build completed folder=global_mood_playlists "
+                "items=1 playlists=1 playlist_tracks=2",
+            ]
+        )
+    assert messages == expected
+
+
 async def test_refresh_changes_random_selection_but_opening_keeps_the_generation(
     provider: LastFMRecommendationsEnhancedProvider,
     monkeypatch: pytest.MonkeyPatch,
@@ -526,10 +600,10 @@ async def test_refresh_uses_selected_user_and_restores_request_context(
     [
         ("user_genre_playlists_monthly", "Jazz", "Genre", "Jazz"),
         ("global_genre_playlists", "Rock", "Genre", "Rock"),
-        ("user_artist_playlists_monthly", "Featuring Radiohead", "K\u00fcnstler", "Radiohead"),
-        ("global_artist_radio_playlists", "Radiohead & similar artists", "Radio", "Radiohead"),
-        ("global_mood_playlists", "Party", "Stimmung", "Party"),
-        ("global_decade_playlists", "1980s", "Jahrzehnt", "1980s"),
+        ("user_artist_playlists_monthly", "Featuring Radiohead", "Feat.", "Radiohead"),
+        ("global_artist_radio_playlists", "Featuring Radiohead", "Feat.", "Radiohead"),
+        ("global_mood_playlists", "Party", "Mood", "Party"),
+        ("global_decade_playlists", "1980s", "Decade", "1980s"),
     ],
 )
 async def test_playlist_cover_titles_and_cached_image_reads(
