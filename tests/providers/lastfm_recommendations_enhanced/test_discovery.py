@@ -12,7 +12,14 @@ from music_assistant_models.enums import (
     ProviderStatus,
 )
 from music_assistant_models.errors import RateLimited, ResourceTemporarilyUnavailable
-from music_assistant_models.media_items import Album, Artist, ItemMapping, Track, UniqueList
+from music_assistant_models.media_items import (
+    Album,
+    Artist,
+    ItemMapping,
+    ProviderMapping,
+    Track,
+    UniqueList,
+)
 from music_assistant_models.statistics import TopItemResult
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
@@ -462,6 +469,115 @@ async def test_artist_seed_limit_retains_unmapped_streaming_history(
     calls = discovery.provider.mass.music.get_controller.return_value.get_library_items_by_query.await_args_list
     assert len(calls) == 1
     assert calls[0].kwargs == {"favorite": True, "limit": 50}
+
+
+@pytest.mark.parametrize("matching_source_index", [0, 1, 2])
+async def test_track_resolution_searches_all_music_sources_until_first_match(
+    discovery: LastFMDiscovery, matching_source_index: int
+) -> None:
+    """Search local and streaming sources in order, skipping unavailable or unsupported sources."""
+    sources = [
+        Mock(
+            instance_id=instance_id,
+            available=True,
+            is_streaming_provider=is_streaming,
+            supported_features={ProviderFeature.SEARCH},
+        )
+        for instance_id, is_streaming in [
+            ("stream--1", True),
+            ("local--1", False),
+            ("stream--2", True),
+        ]
+    ]
+    discovery.provider.mass.music.providers = [
+        Mock(
+            instance_id="unavailable--1",
+            available=False,
+            is_streaming_provider=False,
+            supported_features={ProviderFeature.SEARCH},
+        ),
+        Mock(
+            instance_id="unsupported--1",
+            available=True,
+            is_streaming_provider=False,
+            supported_features=set(),
+        ),
+        *sources,
+    ]
+    matched_source = sources[matching_source_index].instance_id
+    artist = Artist(
+        item_id="artist", provider=matched_source, name="Artist", provider_mappings=set()
+    )
+    track = Track(
+        item_id="track",
+        provider=matched_source,
+        name="Song",
+        artists=UniqueList([artist]),
+        provider_mappings=set(),
+    )
+    controller = discovery.provider.mass.music.get_controller.return_value
+    controller.search = AsyncMock(side_effect=[[]] * matching_source_index + [[track]])
+    result = await discovery.resolve_items([LastFMItem("Song", "Artist")], MediaType.TRACK)
+    assert [item.uri for item in result] == [track.uri]
+    assert [call.args for call in controller.search.await_args_list] == [
+        ("Artist - Song", source.instance_id) for source in sources[: matching_source_index + 1]
+    ]
+    assert all(call.kwargs == {"limit": 2} for call in controller.search.await_args_list)
+
+
+@pytest.mark.parametrize("is_library_item", [False, True])
+async def test_local_music_source_resolution_cache_avoids_repeated_searches(
+    discovery: LastFMDiscovery, is_library_item: bool
+) -> None:
+    """Reuse visible local tracks and library tracks mapped to a visible local source."""
+    discovery.provider.mass.music.providers = [
+        Mock(
+            instance_id="local--1",
+            available=True,
+            is_streaming_provider=False,
+            supported_features={ProviderFeature.SEARCH},
+        )
+    ]
+    track = Track(
+        item_id="track",
+        provider="library" if is_library_item else "local--1",
+        name="Song",
+        artists=UniqueList(
+            [Artist(item_id="artist", provider="local--1", name="Artist", provider_mappings=set())]
+        ),
+        provider_mappings={
+            ProviderMapping(
+                item_id="source-track",
+                provider_domain="local",
+                provider_instance="local--1",
+            )
+        },
+    )
+    discovery.provider.mass.cache.get.return_value = track
+    controller = discovery.provider.mass.music.get_controller.return_value
+    controller.search = AsyncMock()
+    result = await discovery.resolve_items([LastFMItem("Song", "Artist")], MediaType.TRACK)
+    assert [item.uri for item in result] == [track.uri]
+    controller.search.assert_not_awaited()
+    discovery.provider.mass.cache.set.assert_not_awaited()
+
+
+def test_resolution_cache_identity_includes_local_music_sources(
+    discovery: LastFMDiscovery,
+) -> None:
+    """Adding a visible local source invalidates misses recorded for streaming sources alone."""
+    discovery.provider.mass.music.providers = [
+        Mock(instance_id="stream--1", available=True, is_streaming_provider=True)
+    ]
+    candidate = LastFMItem("Song", "Artist")
+    streaming_key = discovery._resolution_cache_key(candidate, MediaType.TRACK)
+    discovery.provider.mass.music.providers.append(
+        Mock(instance_id="local--1", available=True, is_streaming_provider=False)
+    )
+    local_key = discovery._resolution_cache_key(candidate, MediaType.TRACK)
+    assert local_key != streaming_key
+    discovery.provider.mass.music.providers[-1].available = False
+    assert discovery._resolution_cache_key(candidate, MediaType.TRACK) != local_key
 
 
 @pytest.mark.parametrize("error_type", [RateLimited, ResourceTemporarilyUnavailable])

@@ -1,4 +1,4 @@
-"""User-scoped discovery and streaming resolution through the shared MA cache."""
+"""User-scoped discovery and music-source resolution through the shared MA cache."""
 
 from __future__ import annotations
 
@@ -495,7 +495,7 @@ class LastFMDiscovery:
     async def _resolve_missing(
         self, candidate: LastFMItem, media_type: MediaType
     ) -> Artist | Album | Track | None:
-        """Search each eligible streaming source until it returns a verified match."""
+        """Search each eligible music source until it returns a verified match."""
         controller = self.provider.mass.music.get_controller(media_type)
         if media_type != MediaType.ARTIST and not candidate.artist:
             return None
@@ -504,7 +504,6 @@ class LastFMDiscovery:
             for source in self.provider.mass.music.providers
             if source.instance_id != self.provider.instance_id
             and source.available
-            and source.is_streaming_provider
             and ProviderFeature.SEARCH in source.supported_features
         ]
         linked_item, lookup_failed = await self._resolve_via_musicbrainz(candidate, media_type)
@@ -642,7 +641,7 @@ class LastFMDiscovery:
     async def _get_cached_resolution(
         self, candidate: LastFMItem, media_type: MediaType
     ) -> tuple[Artist | Album | Track | None, bool]:
-        """Return a still-visible cached match or a confirmed, unexpired streaming miss."""
+        """Return a still-visible cached match or a confirmed, unexpired music-source miss."""
         cache_key = self._resolution_cache_key(candidate, media_type)
         base_class = {MediaType.ARTIST: Artist, MediaType.ALBUM: Album, MediaType.TRACK: Track}[
             media_type
@@ -656,7 +655,6 @@ class LastFMDiscovery:
         if isinstance(cached, base_class) and self._matches(candidate, cached):
             if any(
                 source.available
-                and source.is_streaming_provider
                 and (
                     source.instance_id == cached.provider
                     or (
@@ -684,7 +682,6 @@ class LastFMDiscovery:
             [
                 (source.instance_id, source.available)
                 for source in self.provider.mass.music.providers
-                if source.is_streaming_provider
             ],
             media_type.value,
             candidate.mbid or (candidate.artist.casefold(), candidate.name.casefold()),

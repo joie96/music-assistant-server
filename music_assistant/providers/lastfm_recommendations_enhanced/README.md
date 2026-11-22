@@ -26,6 +26,10 @@ Bibliothek, Favoriten und Hoerverlauf werden nicht veraendert.
 - Nur ueber die sichtbaren MA-Musikquellen aufloesbare Medien werden ausgegeben.
   Begrenzte Kandidatenlisten, Verfuegbarkeit und Filter koennen zu kuerzeren
   oder leeren Reihen fuehren; es gibt keine Katalogdurchlaeufe.
+- Die Aufloesung nutzt zuerst passende Cache- oder MusicBrainz-/Bibliothekstreffer.
+  Danach werden verfuegbare Musikquellen mit Suchfunktion in der von MA gelieferten
+  Reihenfolge durchsucht, einschliesslich lokaler Provider. Der erste passende
+  Treffer beendet die Suche; es gibt keine gleichmaessige Verteilung auf Quellen.
 - Alle Instanzen teilen ein Limit von 5 Last.fm-Anfragen pro Sekunde.
   Bei Rate Limits gilt ein gemeinsamer Cooldown von mindestens 60 Sekunden;
   ein laengeres `Retry-After` hat Vorrang, auch bei Wiederholungen.
